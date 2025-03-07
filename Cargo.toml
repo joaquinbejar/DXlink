@@ -1,0 +1,49 @@
+[package]
+name = "dxlink"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "Library for trading through tastytrade's API"
+repository = "https://github.com/joaquinbejar/DXlink"
+
+include = [
+	"benches/**/*",
+	"src/**/*",
+	"Cargo.toml",
+	"README.md",
+	"LICENSE",
+	"examples/**/*.rs",
+	"tests/**/*.rs",
+	"Makefile",
+	"rust-toolchain.toml",
+	"Draws/**/*.png",
+	"Docker/**/*.Dockerfile",
+	"Docker/**/*.yml",
+]
+
+[dependencies]
+rust_decimal = { version = "1.29.1", features = [
+	"serde-with-arbitrary-precision",
+	"serde-with-float",
+] }
+serde = { version = "1.0.163", features = ["derive"] }
+serde_json = "1.0.96"
+tokio-tungstenite = { version = "0.26.2", features = ["native-tls"] }
+tokio = { version = "1.28.1", features = ["full"] }
+futures-util = "0.3.28"
+tracing = "0.1.41"
+
+
+
+
+[[test]]
+name = "tests"
+path = "tests/integration/mod.rs"
+
+[workspace]
+members = [
+	"examples/miscellaneous",
+]
+
+[workspace.dependencies]
+dxlink = { path = "." }

@@ -1,0 +1,17 @@
+[package]
+name = "miscellaneous"
+version = "0.1.0"
+edition = "2024"
+
+
+[dependencies]
+dxlink = { path = "../.." }
+tokio = { version = "1.28.1", features = ["full"] }
+tracing = "0.1.41"
+chrono = "0.4.40"
+rust_decimal = { version = "1.29.1", features = [
+    "serde-with-arbitrary-precision",
+    "serde-with-float",
+] }
+derive_builder = "0.20.2"
+tracing-subscriber = "0.3.19"
