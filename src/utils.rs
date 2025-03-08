@@ -121,7 +121,6 @@ pub fn parse_compact_data(data: &[CompactData]) -> Vec<MarketEvent> {
     events
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -140,12 +139,12 @@ mod tests {
         let data = vec![
             CompactData::EventType("Quote".to_string()),
             CompactData::Values(vec![
-                json!("AAPL"),    // symbol
-                json!("Quote"),   // event_type
-                json!(150.25),    // bid_price
-                json!(150.50),    // ask_price
-                json!(100.0),     // bid_size
-                json!(150.0),     // ask_size
+                json!("AAPL"),  // symbol
+                json!("Quote"), // event_type
+                json!(150.25),  // bid_price
+                json!(150.50),  // ask_price
+                json!(100.0),   // bid_size
+                json!(150.0),   // ask_size
             ]),
         ];
 
@@ -160,7 +159,7 @@ mod tests {
                 assert_eq!(quote.ask_price, 150.50);
                 assert_eq!(quote.bid_size, 100.0);
                 assert_eq!(quote.ask_size, 150.0);
-            },
+            }
             _ => panic!("Expected QuoteEvent"),
         }
     }
@@ -171,20 +170,19 @@ mod tests {
             CompactData::EventType("Quote".to_string()),
             CompactData::Values(vec![
                 // Primer Quote
-                json!("AAPL"),    // symbol
-                json!("Quote"),   // event_type
-                json!(150.25),    // bid_price
-                json!(150.50),    // ask_price
-                json!(100.0),     // bid_size
-                json!(150.0),     // ask_size
-
+                json!("AAPL"),  // symbol
+                json!("Quote"), // event_type
+                json!(150.25),  // bid_price
+                json!(150.50),  // ask_price
+                json!(100.0),   // bid_size
+                json!(150.0),   // ask_size
                 // Segundo Quote
-                json!("MSFT"),    // symbol
-                json!("Quote"),   // event_type
-                json!(280.75),    // bid_price
-                json!(281.00),    // ask_price
-                json!(80.0),      // bid_size
-                json!(120.0),     // ask_size
+                json!("MSFT"),  // symbol
+                json!("Quote"), // event_type
+                json!(280.75),  // bid_price
+                json!(281.00),  // ask_price
+                json!(80.0),    // bid_size
+                json!(120.0),   // ask_size
             ]),
         ];
 
@@ -199,7 +197,7 @@ mod tests {
                 assert_eq!(quote.ask_price, 150.50);
                 assert_eq!(quote.bid_size, 100.0);
                 assert_eq!(quote.ask_size, 150.0);
-            },
+            }
             _ => panic!("Expected QuoteEvent for AAPL"),
         }
 
@@ -211,7 +209,7 @@ mod tests {
                 assert_eq!(quote.ask_price, 281.00);
                 assert_eq!(quote.bid_size, 80.0);
                 assert_eq!(quote.ask_size, 120.0);
-            },
+            }
             _ => panic!("Expected QuoteEvent for MSFT"),
         }
     }
@@ -239,7 +237,7 @@ mod tests {
                 assert_eq!(trade.price, 280.75);
                 assert_eq!(trade.size, 50.0);
                 assert_eq!(trade.day_volume, 5000000.0);
-            },
+            }
             _ => panic!("Expected TradeEvent"),
         }
     }
@@ -255,7 +253,6 @@ mod tests {
                 json!(280.75),    // price
                 json!(50.0),      // size
                 json!(5000000.0), // day_volume
-
                 // Segundo Trade
                 json!("AAPL"),    // symbol
                 json!("Trade"),   // event_type
@@ -276,7 +273,7 @@ mod tests {
                 assert_eq!(trade.price, 280.75);
                 assert_eq!(trade.size, 50.0);
                 assert_eq!(trade.day_volume, 5000000.0);
-            },
+            }
             _ => panic!("Expected TradeEvent for MSFT"),
         }
 
@@ -287,7 +284,7 @@ mod tests {
                 assert_eq!(trade.price, 150.25);
                 assert_eq!(trade.size, 100.0);
                 assert_eq!(trade.day_volume, 8000000.0);
-            },
+            }
             _ => panic!("Expected TradeEvent for AAPL"),
         }
     }
@@ -298,14 +295,14 @@ mod tests {
         let data = vec![
             CompactData::EventType("Greeks".to_string()),
             CompactData::Values(vec![
-                json!("AAPL230519C00160000"),  // symbol
-                json!("Greeks"),               // event_type
-                json!(0.65),                   // delta
-                json!(0.05),                   // gamma
-                json!(-0.15),                  // theta
-                json!(0.10),                   // vega
-                json!(0.03),                   // rho
-                json!(0.25),                   // volatility
+                json!("AAPL230519C00160000"), // symbol
+                json!("Greeks"),              // event_type
+                json!(0.65),                  // delta
+                json!(0.05),                  // gamma
+                json!(-0.15),                 // theta
+                json!(0.10),                  // vega
+                json!(0.03),                  // rho
+                json!(0.25),                  // volatility
             ]),
         ];
 
@@ -322,7 +319,7 @@ mod tests {
                 assert_eq!(greeks.vega, 0.10);
                 assert_eq!(greeks.rho, 0.03);
                 assert_eq!(greeks.volatility, 0.25);
-            },
+            }
             _ => panic!("Expected GreeksEvent"),
         }
     }
