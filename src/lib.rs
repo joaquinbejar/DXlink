@@ -14,7 +14,7 @@
 //! - Callback and stream-based APIs for event processing
 //! - Robust error handling and reconnection logic
 //!
-//! ref: <https://raw.githubusercontent.com/dxFeed/dxLink/refs/heads/main/dxlink-specification/asyncapi.yml?
+//! ref: <https://raw.githubusercontent.com/dxFeed/dxLink/refs/heads/main/dxlink-specification/asyncapi.yml>
 //!
 //! ## Example
 //!
