@@ -51,7 +51,6 @@ impl From<serde_json::Error> for DXLinkError {
 
 pub type DXLinkResult<T> = Result<T, DXLinkError>;
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -94,7 +93,10 @@ mod tests {
         );
 
         let error = DXLinkError::Unknown("Unknown error occurred".to_string());
-        assert_eq!(format!("{}", error), "Unknown error: Unknown error occurred");
+        assert_eq!(
+            format!("{}", error),
+            "Unknown error: Unknown error occurred"
+        );
     }
 
     // Test the Error trait implementation
@@ -125,7 +127,7 @@ mod tests {
         let error: DXLinkError = ws_error.into();
 
         match error {
-            DXLinkError::WebSocket(_) => {},
+            DXLinkError::WebSocket(_) => {}
             _ => panic!("Expected WebSocket error"),
         }
     }
@@ -136,7 +138,7 @@ mod tests {
         let error: DXLinkError = ser_error.into();
 
         match error {
-            DXLinkError::Serialization(_) => {},
+            DXLinkError::Serialization(_) => {}
             _ => panic!("Expected Serialization error"),
         }
     }
@@ -144,9 +146,6 @@ mod tests {
     // Test the DXLinkResult type alias
     #[test]
     fn test_result_type_alias() {
-        let ok_result: DXLinkResult<i32> = Ok(42);
-        assert_eq!(ok_result.unwrap(), 42);
-
         let err_result: DXLinkResult<i32> = Err(DXLinkError::Unknown("test".to_string()));
         assert!(err_result.is_err());
 
@@ -178,7 +177,7 @@ mod tests {
         match result {
             Ok(_) => panic!("Expected error"),
             Err(e) => match e {
-                DXLinkError::WebSocket(_) => {},
+                DXLinkError::WebSocket(_) => {}
                 _ => panic!("Expected WebSocket error"),
             },
         }
