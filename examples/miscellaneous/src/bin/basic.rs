@@ -2,13 +2,14 @@ use dxlink::{DXLinkClient, EventType, FeedSubscription, MarketEvent};
 use std::error::Error;
 use std::time::Duration;
 use tokio::time::sleep;
+use tracing::info;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
     // Configure logging
     tracing_subscriber::fmt::init();
 
-    println!("Starting DXLink client...");
+    info!("Starting DXLink client...");
 
     // DXFeed demo server
     let url = "wss://demo.dxfeed.com/dxlink-ws";
@@ -16,25 +17,25 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     let mut client = DXLinkClient::new(url, token);
 
-    println!("Connecting to DXLink server...");
+    info!("Connecting to DXLink server...");
     client.connect().await?;
-    println!("Connection successful!");
+    info!("Connection successful!");
 
     // Create channel for feed
-    println!("Creating channel...");
+    info!("Creating channel...");
     let channel_id = client.create_feed_channel("AUTO").await?;
-    println!("Channel created: {}", channel_id);
+    info!("Channel created: {}", channel_id);
 
     // Setup channel - IMPORTANT: Include all event fields you need
-    println!("Setting up channel...");
+    info!("Setting up channel...");
     client
         .setup_feed(channel_id, &[EventType::Quote, EventType::Trade])
         .await?;
-    println!("Channel setup complete");
+    info!("Channel setup complete");
 
     // Register callback for events
     client.on_event("AAPL", |event| {
-        println!("AAPL event received: {:?}", event);
+        info!("AAPL event received: {:?}", event);
     });
 
     // Get stream for all events
@@ -42,11 +43,11 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     // Process events in a separate task
     tokio::spawn(async move {
-        println!("Waiting for events...");
+        info!("Waiting for events...");
         while let Some(event) = event_stream.recv().await {
             match &event {
                 MarketEvent::Quote(quote) => {
-                    println!(
+                    info!(
                         "Quote: {} - Bid: {} x {}, Ask: {} x {}",
                         quote.event_symbol,
                         quote.bid_price,
@@ -56,18 +57,18 @@ async fn main() -> Result<(), Box<dyn Error>> {
                     );
                 }
                 MarketEvent::Trade(trade) => {
-                    println!(
+                    info!(
                         "Trade: {} - Price: {}, Size: {}, Volume: {}",
                         trade.event_symbol, trade.price, trade.size, trade.day_volume
                     );
                 }
-                _ => println!("Other event type: {:?}", event),
+                _ => info!("Other event type: {:?}", event),
             }
         }
     });
 
     // Subscribe to symbols
-    println!("Subscribing to symbols...");
+    info!("Subscribing to symbols...");
     let subscriptions = vec![
         FeedSubscription {
             event_type: "Quote".to_string(),
@@ -97,16 +98,16 @@ async fn main() -> Result<(), Box<dyn Error>> {
     ];
 
     client.subscribe(channel_id, subscriptions).await?;
-    println!("Subscription successful");
+    info!("Subscription successful");
 
     // Keep connection active for 2 minutes
-    println!("Receiving data for 2 minutes...");
+    info!("Receiving data for 2 minutes...");
     sleep(Duration::from_secs(120)).await;
 
     // Cleanup
-    println!("Disconnecting...");
+    info!("Disconnecting...");
     client.disconnect().await?;
-    println!("Disconnection successful");
+    info!("Disconnection successful");
 
     Ok(())
 }
