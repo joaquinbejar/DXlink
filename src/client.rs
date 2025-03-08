@@ -812,8 +812,8 @@ impl DXLinkClient {
 
 #[cfg(test)]
 mod tests {
-    use crate::events::QuoteEvent;
     use super::*;
+    use crate::events::QuoteEvent;
 
     // Basic test for client creation
     #[test]
