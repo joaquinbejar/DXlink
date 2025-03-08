@@ -7,22 +7,38 @@
 use serde::{Deserialize, Serialize};
 use std::fmt;
 
+/// Represents different types of events.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum EventType {
+    /// Quote event.
     Quote,
+    /// Trade event.
     Trade,
+    /// Summary event.
     Summary,
+    /// Profile event.
     Profile,
+    /// Order event.
     Order,
+    /// Time and Sale event.
     TimeAndSale,
+    /// Candle event.
     Candle,
+    /// TradeETH event.
     TradeETH,
+    /// Spread Order event.
     SpreadOrder,
+    /// Greeks event.
     Greeks,
+    /// Theoretical Price event.
     TheoPrice,
+    /// Underlying event.
     Underlying,
+    /// Series event.
     Series,
+    /// Configuration event.
     Configuration,
+    /// Message event.
     Message,
 }
 
@@ -71,71 +87,211 @@ impl From<&str> for EventType {
     }
 }
 
+/// Represents a quote event for a financial instrument.
+///
+/// This structure holds information about a specific quote event, including the type of event,
+/// the symbol it relates to, and the bid and ask prices and sizes.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct QuoteEvent {
+    /// The type of the event.  For example, "QUOTE".
     #[serde(rename = "eventType")]
     pub event_type: String,
+
+    /// The symbol the quote relates to. For example, "MSFT".
     #[serde(rename = "eventSymbol")]
     pub event_symbol: String,
+
+    /// The bid price for the instrument.
     #[serde(rename = "bidPrice")]
     pub bid_price: f64,
+
+    /// The ask price for the instrument.
     #[serde(rename = "askPrice")]
     pub ask_price: f64,
+
+    /// The size of the bid.
     #[serde(rename = "bidSize")]
     pub bid_size: f64,
+
+    /// The size of the ask.
     #[serde(rename = "askSize")]
     pub ask_size: f64,
 }
 
+/// Represents a trade event with details like event type, symbol, price, size, and day volume.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TradeEvent {
+    /// The type of the event (e.g., "trade").
     #[serde(rename = "eventType")]
     pub event_type: String,
+    /// The symbol of the traded asset (e.g., "BTCUSD").
     #[serde(rename = "eventSymbol")]
     pub event_symbol: String,
+    /// The price of the trade.
     #[serde(rename = "price")]
     pub price: f64,
+    /// The size or quantity of the trade.
     #[serde(rename = "size")]
     pub size: f64,
+    /// The total trading volume for the day.
     #[serde(rename = "dayVolume")]
     pub day_volume: f64,
 }
 
+/// Represents Greek values for a specific event.  Provides data for various risk measures
+/// related to option pricing.  Serializes and deserializes to JSON using `serde`.
+///
+/// # Examples
+///
+/// ```
+/// use serde::{Serialize, Deserialize};
+/// use dxlink::events::GreeksEvent;
+///
+/// let greeks_event = GreeksEvent {
+///     event_type: "example_type".to_string(),
+///     event_symbol: "example_symbol".to_string(),
+///     delta: 0.5,
+///     gamma: 0.2,
+///     theta: -0.1,
+///     vega: 0.8,
+///     rho: 0.05,
+///     volatility: 0.25,
+/// };
+///
+/// let json_string = serde_json::to_string(&greeks_event).unwrap();
+/// println!("{}", json_string);
+/// ```
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GreeksEvent {
+    /// The type of the event.  This field is serialized as `eventType`.
     #[serde(rename = "eventType")]
     pub event_type: String,
+
+    /// The symbol associated with the event. This field is serialized as `eventSymbol`.
     #[serde(rename = "eventSymbol")]
     pub event_symbol: String,
+
+    /// The delta value. This field is serialized as `delta`.
     #[serde(rename = "delta")]
     pub delta: f64,
+
+    /// The gamma value. This field is serialized as `gamma`.
     #[serde(rename = "gamma")]
     pub gamma: f64,
+
+    /// The theta value. This field is serialized as `theta`.
     #[serde(rename = "theta")]
     pub theta: f64,
+
+    /// The vega value. This field is serialized as `vega`.
     #[serde(rename = "vega")]
     pub vega: f64,
+
+    /// The rho value. This field is serialized as `rho`.
     #[serde(rename = "rho")]
     pub rho: f64,
+
+    /// The volatility value. This field is serialized as `volatility`.
     #[serde(rename = "volatility")]
     pub volatility: f64,
 }
 
+/// Represents a market event, which can be a quote, trade, or greeks event.
+///
+/// This enum uses `serde`'s untagged enum serialization, meaning that the serialized
+/// representation will be the same as the serialized representation of the contained
+/// variant.  This allows for flexible handling of different event types in a
+/// single stream or data structure.
+///
+/// # Examples
+///
+/// ```
+/// use serde::{Serialize, Deserialize};
+/// use dxlink::events::{GreeksEvent, QuoteEvent, TradeEvent};
+/// use dxlink::MarketEvent;
+///
+/// // Create a QuoteEvent
+/// let quote_event = MarketEvent::Quote(QuoteEvent {
+///     event_type: "QUOTE".to_string(),
+///     event_symbol: "MSFT".to_string(),
+///     bid_price: 150.00,
+///     ask_price: 150.05,
+///     bid_size: 1000.0,
+///     ask_size: 500.0,
+/// });
+///
+/// // Create a TradeEvent
+/// let trade_event = MarketEvent::Trade(TradeEvent {
+///     event_type: "TRADE".to_string(),
+///     event_symbol: "AAPL".to_string(),
+///     price: 175.50,
+///     size: 100.0,
+///     day_volume: 1000000.0,
+/// });
+///
+/// // Create a GreeksEvent
+/// let greeks_event = MarketEvent::Greeks(GreeksEvent {
+///     event_type: "GREEKS".to_string(),
+///     event_symbol: "TSLA".to_string(),
+///     delta: 0.5,
+///     gamma: 0.2,
+///     theta: -0.1,
+///     vega: 0.8,
+///     rho: 0.05,
+///     volatility: 0.25,
+/// });
+///
+/// // Serialize the events to JSON
+/// let quote_json = serde_json::to_string(&quote_event).unwrap();
+/// let trade_json = serde_json::to_string(&trade_event).unwrap();
+/// let greeks_json = serde_json::to_string(&greeks_event).unwrap();
+///
+/// println!("Quote Event JSON: {}", quote_json);
+/// println!("Trade Event JSON: {}", trade_json);
+/// println!("Greeks Event JSON: {}", greeks_json);
+/// ```
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum MarketEvent {
+    /// Represents a Quote event. This enum variant holds a `QuoteEvent` struct,
+    /// which contains details about a specific quote event, including the type of event,
+    /// the symbol it relates to, and the bid and ask prices and sizes.
     Quote(QuoteEvent),
+    /// Represents a Trade event. This is typically a market trade that has occurred.
     Trade(TradeEvent),
+    /// Represents a Greeks event, containing Greek values (delta, gamma, theta, vega, rho)
+    /// for a specific financial instrument.
     Greeks(GreeksEvent),
 }
 
+/// Represents compact data, which can be either an event type (string) or a vector of JSON values.
+///
+/// This enum uses `serde`'s `untagged` attribute, allowing it to serialize and deserialize
+/// without an explicit tag.  This means the serialized representation will be either a string
+/// (for `EventType`) or an array (for `Values`).
+///
+/// # Examples
+///
+/// ```rust
+/// use serde_json::{json, Value};
+/// use dxlink::events::CompactData;
+///
+/// let event_type = CompactData::EventType("page_load".to_string());
+/// let serialized_event_type = serde_json::to_string(&event_type).unwrap();
+/// assert_eq!(serialized_event_type, "\"page_load\"");
+///
+/// let values = CompactData::Values(vec![json!(1), json!("hello")]);
+/// let serialized_values = serde_json::to_string(&values).unwrap();
+/// assert_eq!(serialized_values, "[1,\"hello\"]");
+/// ```
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum CompactData {
+    /// Represents the type of event.  Currently, only "message" is supported.
     EventType(String),
+    /// Represents a collection of JSON values.  This can be used to hold an array
     Values(Vec<serde_json::Value>),
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;

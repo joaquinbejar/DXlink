@@ -17,6 +17,26 @@ use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::{WebSocketStream, connect_async};
 use tracing::{debug, error};
 
+/// Represents a WebSocket connection.
+///
+/// This struct holds the read and write components of a WebSocket connection,
+/// allowing for bidirectional communication.  It uses Arc and Mutex to enable
+/// shared, thread-safe access to the underlying streams.
+///
+/// # Fields
+///
+/// * `write`:  An `Arc<Mutex>` wrapping the write sink of the WebSocket.  This allows
+///    sending messages over the connection.  The sink is of type
+///    `futures_util::stream::SplitSink<WebSocketStream<MaybeTlsStream<TcpStream>>, Message>`,
+///    meaning it accepts `Message` objects and writes them to a potentially TLS-secured
+///    TCP stream wrapped in a WebSocket.
+///
+/// * `read`: An `Arc<Mutex>` wrapping the read stream of the WebSocket.  This allows
+///    receiving messages from the connection.  The stream is of type
+///    `futures_util::stream::SplitStream<WebSocketStream<MaybeTlsStream<TcpStream>>>`,
+///    meaning it yields `Message` objects read from a potentially TLS-secured
+///    TCP stream wrapped in a WebSocket.
+///
 pub struct WebSocketConnection {
     write: Arc<
         Mutex<futures_util::stream::SplitSink<WebSocketStream<MaybeTlsStream<TcpStream>>, Message>>,
@@ -25,6 +45,23 @@ pub struct WebSocketConnection {
 }
 
 impl WebSocketConnection {
+    /// Establishes a WebSocket connection to the specified URL.
+    ///
+    /// This function attempts to create a new WebSocket connection to the provided URL.  It uses
+    /// `tokio_tungstenite` to handle the connection process. Upon successful connection, it splits
+    /// the stream into read and write components, wrapping them in `Arc<Mutex>` for thread-safe
+    /// shared access.  If any error occurs during the connection process, a `DXLinkError::Connection`
+    /// error is returned.
+    ///
+    /// # Arguments
+    ///
+    /// * `url`: A string slice representing the URL of the WebSocket server.
+    ///
+    /// # Returns
+    ///
+    /// A `DXLinkResult` containing a `WebSocketConnection` if the connection is successful, or a
+    /// `DXLinkError` if an error occurs.
+    ///
     pub async fn connect(url: &str) -> DXLinkResult<Self> {
         debug!("Connecting to WebSocket at: {}", url);
 
@@ -42,6 +79,20 @@ impl WebSocketConnection {
         })
     }
 
+    /// Sends a serialized message over the WebSocket connection.
+    ///
+    /// This function serializes the given message into a JSON string and sends it over the WebSocket connection.
+    /// It acquires a lock on the write portion of the connection before sending the message.
+    ///
+    /// # Arguments
+    ///
+    /// * `message` - A reference to the message to be sent.  The message must implement the `Serialize` trait from the `serde` crate.
+    ///
+    /// # Returns
+    ///
+    /// * `Ok(())` if the message was successfully sent.
+    /// * `Err(DXLinkError)` if an error occurred during serialization or sending.
+    ///
     pub async fn send<T: Serialize>(&self, message: &T) -> DXLinkResult<()> {
         let json = serde_json::to_string(message)?;
         debug!("Sending message: {}", json);
@@ -51,6 +102,19 @@ impl WebSocketConnection {
         Ok(())
     }
 
+    /// Receives a text message from the WebSocket connection.
+    ///
+    /// This function attempts to read the next message from the WebSocket stream.
+    /// It expects the message to be a text message. If a non-text message or an error
+    /// is encountered, an appropriate error is returned.  If the connection is closed
+    /// unexpectedly, an error is also returned.
+    ///
+    /// # Returns
+    ///
+    /// * `Ok(String)`:  A string containing the received text message if successful.
+    /// * `Err(DXLinkError)`:  A `DXLinkError` indicating the type of error encountered.
+    ///     This could be a WebSocket error, an unexpected message type, or a connection error.
+    ///
     pub async fn receive(&self) -> DXLinkResult<String> {
         let mut read = self.read.lock().await;
 
@@ -78,6 +142,21 @@ impl WebSocketConnection {
         }
     }
 
+    /// Receives a text message from the WebSocket connection with a timeout.
+    ///
+    /// This function attempts to read the next message from the WebSocket stream within the specified duration.
+    /// It behaves like [`receive`](WebSocketConnection::receive), but returns `Ok(None)` if the timeout is reached before a message is received.
+    ///
+    /// # Arguments
+    ///
+    /// * `duration`: The maximum time to wait for a message.
+    ///
+    /// # Returns
+    ///
+    /// * `Ok(Some(String))`: A string containing the received text message if successful.
+    /// * `Ok(None)`: If the timeout is reached before a message is received.
+    /// * `Err(DXLinkError)`: A `DXLinkError` indicating the type of error encountered.  This could be a WebSocket error, an unexpected message type, or a connection error.
+    ///
     pub async fn receive_with_timeout(&self, duration: Duration) -> DXLinkResult<Option<String>> {
         let read_future = self.receive();
 
@@ -87,6 +166,17 @@ impl WebSocketConnection {
         }
     }
 
+    /// Creates a new `KeepAliveSender` instance.
+    ///
+    /// This function returns a `KeepAliveSender` that can be used to send
+    /// keep-alive messages over the WebSocket connection.  The returned sender
+    /// is a clone of the underlying connection, allowing multiple parts of the
+    /// application to share the responsibility of sending keep-alives without
+    /// needing to manage the underlying connection directly.
+    ///
+    /// # Returns
+    ///
+    /// A new `KeepAliveSender` instance.
     pub fn create_keepalive_sender(&self) -> KeepAliveSender {
         KeepAliveSender {
             connection: self.clone(),
@@ -94,6 +184,15 @@ impl WebSocketConnection {
     }
 }
 
+/// Implements the `Clone` trait for `WebSocketConnection`.
+///
+/// This allows creating a new `WebSocketConnection` instance that shares the underlying
+/// read and write streams with the original connection.  The cloning process uses
+/// `Arc::clone` to increment the reference count of the shared `Arc` pointers, ensuring
+/// that the underlying streams are not closed until all cloned instances are dropped.
+///
+/// This is useful for sharing a single WebSocket connection across multiple parts
+/// of an application without needing to establish multiple separate connections.
 impl Clone for WebSocketConnection {
     fn clone(&self) -> Self {
         Self {
@@ -103,20 +202,41 @@ impl Clone for WebSocketConnection {
     }
 }
 
+/**
+Sends keep-alive messages over a WebSocket connection.
+
+This struct holds a `WebSocketConnection` and is used to send keep-alive messages
+to maintain the connection.  It is cloneable to allow multiple parts of the
+application to share the responsibility of sending keep-alives.
+*/
 #[derive(Clone)]
 pub struct KeepAliveSender {
+    /// The underlying WebSocket connection used for sending keep-alive messages.
     connection: WebSocketConnection,
 }
 
 impl KeepAliveSender {
+    /// Sends a keep-alive message over the WebSocket connection.
+    ///
+    /// This function sends a "KEEPALIVE" message to the specified channel.  Keep-alive messages
+    /// are used to maintain the connection and prevent timeouts.
+    ///
+    /// # Arguments
+    ///
+    /// * `channel` - The channel ID to send the keep-alive message to.
+    ///
+    /// # Returns
+    ///
+    /// * `Ok(())` if the message was sent successfully.
+    /// * `Err(DXLinkError)` if there was an error sending the message.  This can occur if
+    ///   there is a problem with the WebSocket connection or serializing the message.
+    ///
     pub async fn send_keepalive(&self, channel: u32) -> DXLinkResult<()> {
         use crate::messages::KeepaliveMessage;
-
         let keepalive_msg = KeepaliveMessage {
             channel,
             message_type: "KEEPALIVE".to_string(),
         };
-
         self.connection.send(&keepalive_msg).await
     }
 }

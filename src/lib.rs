@@ -14,6 +14,8 @@
 //! - Callback and stream-based APIs for event processing
 //! - Robust error handling and reconnection logic
 //!
+//! ref: https://raw.githubusercontent.com/dxFeed/dxLink/refs/heads/main/dxlink-specification/asyncapi.yml
+//!
 //! ## Example
 //!
 //! Here's a basic example of using the library to connect to a DXLink server
@@ -268,11 +270,70 @@
 //!  We appreciate your interest and look forward to your contributions!
 //!  
 
+/// Client module for the DXLink WebSocket library.
+///
+/// This module provides the main `DXLinkClient` struct, which handles WebSocket connections,
+/// authentication, event subscriptions, and message processing for the DXLink protocol.
+///
+/// Key features include:
+/// - Establishing and managing WebSocket connections
+/// - Authenticating with the DXLink server
+/// - Creating and managing communication channels
+/// - Subscribing to market data feeds
+/// - Processing real-time market events
+/// - Handling connection lifecycle (connect, disconnect)
 pub mod client;
+
+/// WebSocket connection management module.
+///
+/// This module defines the `WebSocketConnection` struct, which provides low-level
+/// WebSocket communication capabilities. It handles:
+/// - Establishing secure WebSocket connections
+/// - Sending and receiving messages
+/// - Managing read and write streams
+/// - Implementing keep-alive mechanisms
+/// - Thread-safe connection handling
 pub mod connection;
+
+/// Error handling module for the DXLink WebSocket library.
+///
+/// Defines a comprehensive error enum `DXLinkError` that covers various potential
+/// error conditions during DXLink interactions, including:
+/// - WebSocket connection errors
+/// - Serialization/deserialization failures
+/// - Authentication issues
+/// - Connection problems
+/// - Protocol violations
+/// - Timeout scenarios
+/// - Unexpected message handling
 pub mod error;
+
+/// Event types and structures for market data.
+///
+/// This module provides:
+/// - Enum and structs representing different market event types
+/// - Support for Quote, Trade, and Greeks events
+/// - Serialization and deserialization of market events
+/// - Flexible event handling with a unified `MarketEvent` enum
 pub mod events;
+
+/// Message structures for the DXLink protocol.
+///
+/// Contains serializable structs representing various message types used in
+/// DXLink communication, including:
+/// - Authentication messages
+/// - Channel management messages
+/// - Feed subscription messages
+/// - Setup and configuration messages
+/// - Error messages
 pub mod messages;
+
+/// Utility functions for parsing and processing market data.
+///
+/// Provides helper functions for:
+/// - Parsing compact data formats
+/// - Converting raw data into structured market events
+/// - Supporting efficient event processing
 mod utils;
 
 pub use client::DXLinkClient;

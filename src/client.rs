@@ -22,45 +22,155 @@ use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 use tracing::{debug, error, info, warn};
 
+/// Default timeout for keep-alive messages in seconds.  If no keep-alive
+/// message is received within this timeframe, the connection is considered closed.
 const DEFAULT_KEEPALIVE_TIMEOUT: u32 = 60;
+
+/// Default interval for sending keep-alive messages in seconds.  Clients should
+/// send a keep-alive message at least this often to maintain the connection.
 const DEFAULT_KEEPALIVE_INTERVAL: u32 = 15;
+
+/// Default client version string.  This is used to identify the client
+/// software version to the server.
 const DEFAULT_CLIENT_VERSION: &str = "1.0.2-dxlink-0.1.1";
+
+/// The main communication channel identifier. This is likely used for
+/// primary message exchange between client and server.
 const MAIN_CHANNEL: u32 = 0;
 
+/// Type alias for a callback function that handles market events.
+///
+/// This type alias represents a boxed dynamic function that takes a `MarketEvent`
+/// as an argument.  The function is required to be `Send`, `Sync`, and have a
+/// static lifetime (`'static`).
+///
+/// `Send` and `Sync` ensure that the callback can be safely used in concurrent contexts.
+/// The `'static` lifetime requirement means the callback doesn't borrow any data
+/// that could outlive its use.
+///
 pub type EventCallback = Box<dyn Fn(MarketEvent) + Send + Sync + 'static>;
 
+/// Represents the different types of responses that can be received.
+/// Each variant of the enum carries specific data related to the response type:
 enum ResponseType {
+    /// Indicates a channel has been opened. The `u32` value represents the channel identifier.
     ChannelOpened(u32),
+    /// Indicates a feed configuration has been received.  The `u32` value represents the channel identifier.
     FeedConfig(u32),
+    /// Indicates a channel has been closed. The `u32` value represents the channel identifier.
     ChannelClosed(u32),
+    /// Indicates an error has occurred. The `String` value contains the error message.
     Error(String),
+    /// A generic response type for other cases. The `String` value contains the response data.  This variant is currently unused (`#[allow(dead_code)]`).
     #[allow(dead_code)]
     Other(String),
 }
 
+/// Represents a request for a specific response from a WebSocket stream.  This struct is used to await a particular
+/// response type, optionally filtered by channel ID.  It includes a `oneshot::Sender` to send the
+/// response back to the requester.
 struct ResponseRequest {
-    expected_type: String, // Tipo de mensaje esperado ("CHANNEL_OPENED", "FEED_CONFIG", etc.)
-    channel_id: Option<u32>, // Canal esperado (None si no importa)
+    /// The expected type of the response message (e.g., "CHANNEL_OPENED", "FEED_CONFIG", etc.).  This string should match the expected
+    /// response message type.
+    expected_type: String,
+    /// The expected channel ID for the response.  If `None`, the channel ID is not considered when matching responses.
+    channel_id: Option<u32>,
+    /// A `oneshot::Sender` used to send the `ResponseType` back to the requester once the expected response is received.
     response_sender: oneshot::Sender<ResponseType>,
 }
 
+/// Represents a client for interacting with the DXLink service.
+///
+/// The `DXLinkClient` provides methods for connecting to a DXLink WebSocket server,
+/// subscribing to market data feeds, and receiving real-time market events.
+///
+/// # Fields
+///
+/// * `url`: The URL of the DXLink WebSocket server.
+/// * `token`: The authentication token for accessing the DXLink service.
+/// * `connection`: The active WebSocket connection, if established.  This is represented
+///    as an `Option<WebSocketConnection>`, where `None` indicates no active connection.
+/// * `keepalive_timeout`: The timeout for keepalive messages in seconds.
+/// * `next_channel_id`: A thread-safe counter for generating unique channel IDs.  It's
+///    wrapped in an `Arc<Mutex>` to allow shared access across multiple threads.
+/// * `channels`: A thread-safe map that stores the association between channel IDs and
+///    the services they are subscribed to.  This is also wrapped in an `Arc<Mutex>`
+///    for thread safety.
+/// * `callbacks`: A thread-safe map that stores callback functions associated with
+///    specific market data symbols.  The callbacks are of type `EventCallback`,
+///    which are functions that process incoming `MarketEvent` data.  An `Arc<Mutex>`
+///    is used for thread safety.
+/// * `subscriptions`: A thread-safe set that keeps track of active subscriptions,
+///    identified by pairs of `EventType` and the corresponding market data symbol.
+///    This ensures that duplicate subscriptions are avoided and allows for efficient
+///    management of subscriptions.  It uses `Arc<Mutex>` for thread safety.
+/// * `event_sender`: A sender for transmitting `MarketEvent` instances.  This is
+///    optional (`Option<Sender<MarketEvent>>`) and is used to relay events to
+///    internal processing or external consumers.
+/// * `keepalive_handle`: A handle to the keepalive task.  The keepalive task
+///    periodically sends messages to the server to maintain the connection.
+///    This is an `Option<JoinHandle<()>>` which represents a potentially running
+///    background task.
+/// * `message_handle`: A handle to the message processing task. The message
+///    processing task is responsible for receiving and handling incoming WebSocket
+///    messages.  This is stored as an `Option<JoinHandle<()>>` to manage the
+///    background task's lifecycle.
+/// * `keepalive_sender`:  A channel sender used to signal the keepalive task.
+///    This is of type `Option<Sender<()>>`, which may be used to control
+///    or stop the keepalive task.
+/// * `response_requests`: A thread-safe vector that holds pending response requests.
+///    This is used to manage asynchronous responses from the server and is wrapped
+///    in an `Arc<Mutex>` for thread safety.
 pub struct DXLinkClient {
+    /// The URL of the DXLink WebSocket server.
     url: String,
+    /// The authentication token for accessing the DXLink service.
     token: String,
+    /// The active WebSocket connection, if established.  `None` indicates no active connection.
     connection: Option<WebSocketConnection>,
+    /// The timeout for keepalive messages in seconds.
     keepalive_timeout: u32,
+    /// A thread-safe counter for generating unique channel IDs.
     next_channel_id: Arc<Mutex<u32>>,
+    /// A thread-safe map storing the association between channel IDs and the services they are subscribed to.
     channels: Arc<Mutex<HashMap<u32, String>>>, // channel_id -> service
+    /// A thread-safe map storing callback functions associated with specific market data symbols.
     callbacks: Arc<Mutex<HashMap<String, EventCallback>>>, // symbol -> callback
+    /// A thread-safe set keeping track of active subscriptions, identified by `(EventType, String)`.
     subscriptions: Arc<Mutex<HashSet<(EventType, String)>>>, // (event_type, symbol)
+    /// A sender for transmitting `MarketEvent` instances.
     event_sender: Option<Sender<MarketEvent>>,
+    /// A handle to the keepalive task.
     keepalive_handle: Option<JoinHandle<()>>,
+    /// A handle to the message processing task.
     message_handle: Option<JoinHandle<()>>,
+    /// A channel sender used to signal the keepalive task.
     keepalive_sender: Option<Sender<()>>,
+    /// A thread-safe vector that holds pending response requests.
     response_requests: Arc<Mutex<Vec<ResponseRequest>>>,
 }
 
 impl DXLinkClient {
+    /// Creates a new instance of the `DXLinkClient`.
+    ///
+    /// This function initializes a new `DXLinkClient` with the provided URL and token.  The client is not connected
+    /// to the server at this point; a separate call to the `connect` method is required to establish a connection.
+    ///
+    /// # Arguments
+    ///
+    /// * `url`: The URL of the DXLink WebSocket server.  This should be a valid WebSocket URL.
+    /// * `token`: The authentication token required to access the DXLink service.
+    ///
+    /// # Returns
+    ///
+    /// A new instance of the `DXLinkClient`.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use dxlink::DXLinkClient;
+    /// let client = DXLinkClient::new("wss://example.com/dxlink", "YOUR_TOKEN");
+    /// ```
     pub fn new(url: &str, token: &str) -> Self {
         Self {
             url: url.to_string(),
@@ -79,7 +189,42 @@ impl DXLinkClient {
         }
     }
 
-    /// Connect to the DXLink server and perform the setup and authentication
+    /// Establishes a connection to the DXLink server.
+    ///
+    /// This function performs the following steps to connect to the server:
+    ///
+    /// 1. **Connects to WebSocket:** Establishes a WebSocket connection to the URL specified in the `self.url` field.
+    /// 2. **Sends SETUP Message:** Sends a `SetupMessage` to the server, initiating the setup process.  This message includes the channel, message type, keepalive timeout, and client version.
+    /// 3. **Receives SETUP Response:** Waits for and receives a `SetupMessage` response from the server, confirming the setup parameters.
+    /// 4. **Receives AUTH_STATE Message:** Receives an `AuthStateMessage` to check the current authentication status.
+    /// 5. **Handles Authentication:**
+    ///    - If the `AuthStateMessage` indicates "AUTHORIZED", the client is already authorized and no further action is taken.
+    ///    - If the `AuthStateMessage` indicates "UNAUTHORIZED", the client sends an `AuthMessage` containing the authentication token. It then waits for an `AuthStateMessage` response and checks if the state has changed to "AUTHORIZED".  If not, an authentication error is returned.
+    ///    - If the `AuthStateMessage` indicates an unexpected state, a protocol error is returned.
+    /// 6. **Starts Message Processing:**  Starts a separate task to handle incoming messages from the server.
+    /// 7. **Starts Keepalive:** Starts a keepalive task to maintain the connection by sending periodic keepalive messages.
+    ///
+    /// # Errors
+    ///
+    /// This function can return several errors:
+    ///
+    /// * `DXLinkError::WebSocket`: If there is an error establishing or maintaining the WebSocket connection.
+    /// * `DXLinkError::Serialization`: If there is an error serializing or deserializing messages.
+    /// * `DXLinkError::Authentication`: If the authentication process fails.
+    /// * `DXLinkError::Protocol`: If an unexpected message or state is encountered during the connection process.
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// # use dxlink::client::DXLinkClient;
+    /// # use dxlink::error::DXLinkResult;
+    /// # #[tokio::main]
+    /// # async fn main() -> DXLinkResult<()> {
+    /// let mut client = DXLinkClient::new("ws://your_dxlink_server_url", "YOUR_TOKEN", 30000)?;
+    /// client.connect().await?;
+    /// # Ok(())
+    /// # }
+    /// ```
     pub async fn connect(&mut self) -> DXLinkResult<()> {
         // Connect to WebSocket
         let connection = WebSocketConnection::connect(&self.url).await?;
@@ -148,6 +293,23 @@ impl DXLinkClient {
         Ok(())
     }
 
+    /// Waits for a specific response type from the DXLink device, optionally filtered by channel ID.
+    ///
+    /// This function registers a request for a specific response type and then waits for the corresponding
+    /// response to be received from the DXLink device.  The wait is subject to a timeout.
+    ///
+    /// # Arguments
+    ///
+    /// * `expected_type` - The expected type of the response message (e.g., "CHANNEL_OPENED", "FEED_CONFIG", etc.).
+    /// * `channel_id` - The expected channel ID for the response.  If `None`, any channel ID is accepted.
+    /// * `timeout` - The maximum time to wait for the response.
+    ///
+    /// # Returns
+    ///
+    /// * `Ok(ResponseType)` - If the expected response is received within the timeout period.
+    /// * `Err(DXLinkError::Timeout)` - If the timeout period expires before the expected response is received.
+    /// * `Err(DXLinkError::Protocol)` - If the response channel is closed unexpectedly.
+    ///
     #[allow(dead_code)]
     async fn wait_for_response(
         &self,
@@ -179,6 +341,20 @@ impl DXLinkClient {
         }
     }
 
+    /// Starts the keepalive task.
+    ///
+    /// This function spawns a new tokio task that periodically sends keepalive messages
+    /// to the DXLink device.  The interval between keepalive messages is defined by
+    /// the `DEFAULT_KEEPALIVE_INTERVAL` constant.
+    ///
+    /// The keepalive task runs in an infinite loop until either the connection is
+    /// dropped or a shutdown signal is received through the `keepalive_sender` channel.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if no connection is established or if sending a keepalive
+    /// message fails.
+    ///
     fn start_keepalive(&mut self) -> DXLinkResult<()> {
         // Asegurarnos de que tenemos una conexión
         if self.connection.is_none() {

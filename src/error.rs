@@ -6,16 +6,30 @@
 use std::error::Error;
 use std::fmt::{Display, Formatter};
 
+/**
+Errors that can occur when interacting with a DXLink device.
+
+This enum represents various error conditions that might arise during communication with a DXLink device, including WebSocket errors, serialization issues, authentication failures, connection problems, channel issues, protocol violations, timeouts, unexpected messages, and unknown errors.
+*/
 #[derive(Debug)]
 pub enum DXLinkError {
+    /// Represents an error originating from the underlying WebSocket connection.
     WebSocket(tokio_tungstenite::tungstenite::Error),
+    /// Represents an error that occurred during serialization or deserialization of JSON data.
     Serialization(serde_json::Error),
+    /// Represents an authentication failure, such as invalid credentials.
     Authentication(String),
+    /// Represents an error related to the connection, such as a failure to establish or maintain a connection.
     Connection(String),
+    /// Represents an error specific to a channel, such as an invalid channel ID.
     Channel(String),
+    /// Represents an error due to a violation of the DXLink protocol.
     Protocol(String),
+    /// Represents a timeout error, such as a failure to receive a response within a specified time.
     Timeout(String),
+    /// Represents the reception of an unexpected message from the DXLink device.
     UnexpectedMessage(String),
+    /// Represents an unknown error that does not fit into any of the other categories.
     Unknown(String),
 }
 
@@ -49,6 +63,21 @@ impl From<serde_json::Error> for DXLinkError {
     }
 }
 
+/// A type alias for `Result<T, DXLinkError>`.
+///
+/// This type is used as a return type for functions that can return a `DXLinkError`.
+/// It represents the result of a DXLink operation, which can either be successful (returning a value of type `T`)
+/// or an error (returning a `DXLinkError`).
+///
+/// # Example
+///
+/// ```rust
+///  use dxlink::error::DXLinkResult;fn example_function() -> DXLinkResult<String> {
+///      // ... some code that might return a DXLinkError ...
+///  
+///      Ok("Success!".to_string())
+///  }
+///  ```
 pub type DXLinkResult<T> = Result<T, DXLinkError>;
 
 #[cfg(test)]

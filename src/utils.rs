@@ -6,6 +6,55 @@
 use crate::MarketEvent;
 use crate::events::{CompactData, GreeksEvent, QuoteEvent, TradeEvent};
 
+/// Parses a vector of `CompactData` and returns a vector of `MarketEvent`s.
+///
+/// The function iterates through the `data` vector, expecting pairs of `CompactData`
+/// elements. The first element of the pair should be a `CompactData::EventType`
+/// containing the event type as a string. The second element should be a
+/// `CompactData::Values` containing a vector of `serde_json::Value`s representing
+/// the event data.
+///
+/// The function supports three event types: "Quote", "Trade", and "Greeks".  For each
+/// recognized event type, it attempts to parse the corresponding data values and
+/// create a `MarketEvent` variant. If the data for an event is incomplete or in an
+/// unexpected format, the event is skipped.
+///
+/// # Arguments
+///
+/// * `data` - A slice of `CompactData` to parse.
+///
+/// # Returns
+///
+/// A vector of `MarketEvent`s successfully parsed from the input data.
+///
+/// # Example
+///
+/// ```rust,no_run
+/// use serde_json::Value;
+/// use dxlink::events::CompactData;
+/// use dxlink::{parse_compact_data, MarketEvent};
+///
+/// let data = vec![
+///     CompactData::EventType("Quote".to_string()),
+///     CompactData::Values(vec![
+///         Value::from("AAPL"),
+///         Value::from("Quote"),
+///         Value::from(150.25),
+///         Value::from(150.35),
+///         Value::from(1000.0),
+///         Value::from(2000.0),
+///     ]),
+/// ];
+///
+/// let events = parse_compact_data(&data);
+///
+/// assert_eq!(events.len(), 1);
+///
+/// if let MarketEvent::Quote(quote) = &events[0] {
+///     assert_eq!(quote.event_symbol, "AAPL");
+///     assert_eq!(quote.bid_price, 150.25);
+/// }
+/// ```
 pub fn parse_compact_data(data: &[CompactData]) -> Vec<MarketEvent> {
     let mut events = Vec::new();
     let mut i = 0;
