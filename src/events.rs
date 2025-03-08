@@ -161,18 +161,10 @@ pub fn parse_compact_data(data: &[CompactData]) -> Vec<MarketEvent> {
                                 ) = (
                                     values.get(j).and_then(|v| v.as_str()),
                                     values.get(j + 1).and_then(|v| v.as_str()),
-                                    values
-                                        .get(j + 2)
-                                        .and_then(|v| v.as_f64()),
-                                    values
-                                        .get(j + 3)
-                                        .and_then(|v| v.as_f64()),
-                                    values
-                                        .get(j + 4)
-                                        .and_then(|v| v.as_f64()),
-                                    values
-                                        .get(j + 5)
-                                        .and_then(|v| v.as_f64()),
+                                    values.get(j + 2).and_then(|v| v.as_f64()),
+                                    values.get(j + 3).and_then(|v| v.as_f64()),
+                                    values.get(j + 4).and_then(|v| v.as_f64()),
+                                    values.get(j + 5).and_then(|v| v.as_f64()),
                                 ) {
                                     events.push(MarketEvent::Quote(QuoteEvent {
                                         event_type: "Quote".to_string(),
@@ -199,15 +191,9 @@ pub fn parse_compact_data(data: &[CompactData]) -> Vec<MarketEvent> {
                                 ) = (
                                     values.get(j).and_then(|v| v.as_str()),
                                     values.get(j + 1).and_then(|v| v.as_str()),
-                                    values
-                                        .get(j + 2)
-                                        .and_then(|v| v.as_f64()),
-                                    values
-                                        .get(j + 3)
-                                        .and_then(|v| v.as_f64()),
-                                    values
-                                        .get(j + 4)
-                                        .and_then(|v| v.as_f64()),
+                                    values.get(j + 2).and_then(|v| v.as_f64()),
+                                    values.get(j + 3).and_then(|v| v.as_f64()),
+                                    values.get(j + 4).and_then(|v| v.as_f64()),
                                 ) {
                                     events.push(MarketEvent::Trade(TradeEvent {
                                         event_type: "Trade".to_string(),
@@ -236,24 +222,12 @@ pub fn parse_compact_data(data: &[CompactData]) -> Vec<MarketEvent> {
                                 ) = (
                                     values.get(j).and_then(|v| v.as_str()),
                                     values.get(j + 1).and_then(|v| v.as_str()),
-                                    values
-                                        .get(j + 2)
-                                        .and_then(|v| v.as_f64()),
-                                    values
-                                        .get(j + 3)
-                                        .and_then(|v| v.as_f64()),
-                                    values
-                                        .get(j + 4)
-                                        .and_then(|v| v.as_f64()),
-                                    values
-                                        .get(j + 5)
-                                        .and_then(|v| v.as_f64()),
-                                    values
-                                        .get(j + 6)
-                                        .and_then(|v| v.as_f64()),
-                                    values
-                                        .get(j + 7)
-                                        .and_then(|v| v.as_f64()),
+                                    values.get(j + 2).and_then(|v| v.as_f64()),
+                                    values.get(j + 3).and_then(|v| v.as_f64()),
+                                    values.get(j + 4).and_then(|v| v.as_f64()),
+                                    values.get(j + 5).and_then(|v| v.as_f64()),
+                                    values.get(j + 6).and_then(|v| v.as_f64()),
+                                    values.get(j + 7).and_then(|v| v.as_f64()),
                                 ) {
                                     events.push(MarketEvent::Greeks(GreeksEvent {
                                         event_type: "Greeks".to_string(),

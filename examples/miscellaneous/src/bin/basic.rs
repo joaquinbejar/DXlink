@@ -1,7 +1,7 @@
 use dxlink::{DXLinkClient, EventType, FeedSubscription, MarketEvent};
-use tokio::time::sleep;
-use std::time::Duration;
 use std::error::Error;
+use std::time::Duration;
+use tokio::time::sleep;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
@@ -27,7 +27,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     // Setup channel - IMPORTANT: Include all event fields you need
     println!("Setting up channel...");
-    client.setup_feed(channel_id, &[EventType::Quote, EventType::Trade]).await?;
+    client
+        .setup_feed(channel_id, &[EventType::Quote, EventType::Trade])
+        .await?;
     println!("Channel setup complete");
 
     // Register callback for events
@@ -52,16 +54,13 @@ async fn main() -> Result<(), Box<dyn Error>> {
                         quote.ask_price,
                         quote.ask_size
                     );
-                },
+                }
                 MarketEvent::Trade(trade) => {
                     println!(
                         "Trade: {} - Price: {}, Size: {}, Volume: {}",
-                        trade.event_symbol,
-                        trade.price,
-                        trade.size,
-                        trade.day_volume
+                        trade.event_symbol, trade.price, trade.size, trade.day_volume
                     );
-                },
+                }
                 _ => println!("Other event type: {:?}", event),
             }
         }

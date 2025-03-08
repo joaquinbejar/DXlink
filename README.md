@@ -3,7 +3,7 @@
 ## dxlink
 
 `dxlink` is a Rust client library for the DXLink WebSocket protocol used by tastytrade
-for real-time market data. This library provides a clean and typesafe API for connecting
+for real-time market data. This library provides a clean and type-safe API for connecting
 to DXLink servers, subscribing to market events, and processing real-time market data.
 
 ### Features
@@ -14,6 +14,7 @@ to DXLink servers, subscribing to market events, and processing real-time market
 - Automatic handling of authentication and connection maintenance
 - Support for multiple subscription channels
 - Callback and stream-based APIs for event processing
+- Robust error handling and reconnection logic
 
 ### Example
 
@@ -28,8 +29,6 @@ use std::time::Duration;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
-    // Configure logging if needed
-    // tracing_subscriber::fmt::init();
 
     // Create a new DXLink client with the API token
     // (typically obtained from tastytrade API)
@@ -138,18 +137,6 @@ let candle_subscription = FeedSubscription {
 };
 ```
 
-### Available Event Types
-
-The library supports the following event types:
-
-- `Quote` - Current bid/ask prices and sizes
-- `Trade` - Last trade information
-- `Greeks` - Option greeks data (delta, gamma, theta, etc.)
-- `Summary` - Daily summary information
-- `Profile` - Instrument profile information
-- `Candle` - OHLC (Open, High, Low, Close) data for time periods
-- And more!
-
 ### Error Handling
 
 The library uses a custom error type `DXLinkError` that encompasses
@@ -169,27 +156,18 @@ async fn example_error_handling() {
 }
 ```
 
-### Implementing a new event type
+### Available Event Types
 
-If you need to support a new event type that isn't already included,
-you can extend the library by adding a new event structure and updating
-the parser:
+The library supports the following event types:
 
-```rust
-use serde::{Deserialize, Serialize};
+- `Quote` - Current bid/ask prices and sizes
+- `Trade` - Last trade information
+- `Greeks` - Option greeks data (delta, gamma, theta, etc.)
+- `Summary` - Daily summary information
+- `Profile` - Instrument profile information
+- `Candle` - OHLC (Open, High, Low, Close) data for time periods
+- And more!
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct NewEvent {
-    #[serde(rename = "eventType")]
-    pub event_type: String,
-    #[serde(rename = "eventSymbol")]
-    pub event_symbol: String,
-    // Add your event-specific fields here
-    pub some_field: f64,
-}
-
-// Then update MarketEvent enum to include your new event type
-```
 
 ### License
 
@@ -199,8 +177,8 @@ This project is licensed under the MIT License. See the LICENSE file for details
 
  1. Clone the repository:
  ```shell
- git clone https://github.com/joaquinbejar/tastytrade-rs
- cd tastytrade-rs
+ git clone https://github.com/joaquinbejar/dxlink
+ cd dxlink
  ```
 
  2. Build the project:

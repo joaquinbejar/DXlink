@@ -9,8 +9,8 @@ use crate::error::{DXLinkError, DXLinkResult};
 use crate::events::{CompactData, EventType, MarketEvent, parse_compact_data};
 use crate::messages::{
     AuthMessage, AuthStateMessage, BaseMessage, ChannelRequestMessage, ErrorMessage,
-    FeedDataMessage, FeedSetupMessage, FeedSubscription,
-    FeedSubscriptionMessage, KeepaliveMessage, SetupMessage,
+    FeedDataMessage, FeedSetupMessage, FeedSubscription, FeedSubscriptionMessage, KeepaliveMessage,
+    SetupMessage,
 };
 
 use std::collections::{HashMap, HashSet};
@@ -178,7 +178,6 @@ impl DXLinkClient {
         }
     }
 
-    // Actualizar el método start_keepalive
     fn start_keepalive(&mut self) -> DXLinkResult<()> {
         // Asegurarnos de que tenemos una conexión
         if self.connection.is_none() {
@@ -236,7 +235,6 @@ impl DXLinkClient {
         Ok(())
     }
 
-    // Modificación del método start_message_processing
     fn start_message_processing(&mut self) -> DXLinkResult<()> {
         // Asegurarnos de que tenemos una conexión
         if self.connection.is_none() {
