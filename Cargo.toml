@@ -7,18 +7,18 @@ description = "Library for trading through tastytrade's API"
 repository = "https://github.com/joaquinbejar/DXlink"
 
 include = [
-	"benches/**/*",
-	"src/**/*",
-	"Cargo.toml",
-	"README.md",
-	"LICENSE",
-	"examples/**/*.rs",
-	"tests/**/*.rs",
-	"Makefile",
-	"rust-toolchain.toml",
-	"Draws/**/*.png",
-	"Docker/**/*.Dockerfile",
-	"Docker/**/*.yml",
+    "benches/**/*",
+    "src/**/*",
+    "Cargo.toml",
+    "README.md",
+    "LICENSE",
+    "examples/**/*.rs",
+    "tests/**/*.rs",
+    "Makefile",
+    "rust-toolchain.toml",
+    "Draws/**/*.png",
+    "Docker/**/*.Dockerfile",
+    "Docker/**/*.yml",
 ]
 
 [dependencies]
@@ -29,10 +29,9 @@ tokio = { version = "1.28.1", features = ["full"] }
 futures-util = "0.3.28"
 tracing = "0.1.41"
 
-
-
 [dev-dependencies]
 warp = "0.3.7"
+chrono = "0.4.40"
 
 [[test]]
 name = "tests"
@@ -40,7 +39,7 @@ path = "tests/integration/mod.rs"
 
 [workspace]
 members = [
-	"examples/miscellaneous",
+    "examples/miscellaneous",
 ]
 
 [workspace.dependencies]
