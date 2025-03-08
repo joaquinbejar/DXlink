@@ -321,7 +321,7 @@ mod additional_tests {
         // Task to send binary messages to client
         let binary_to_client = tokio::spawn(async move {
             let mut rx = binary_rx.lock().await;
-            while let Some(_) = rx.recv().await {
+            while rx.recv().await.is_some() {
                 // Send a binary message
                 let mut tx = ws_tx.lock().await;
                 tx.send(WarpMessage::binary(vec![1, 2, 3]))
