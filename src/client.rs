@@ -6,13 +6,14 @@
 
 use crate::connection::WebSocketConnection;
 use crate::error::{DXLinkError, DXLinkResult};
-use crate::events::{CompactData, EventType, MarketEvent, parse_compact_data};
+use crate::events::{CompactData, EventType, MarketEvent};
 use crate::messages::{
     AuthMessage, AuthStateMessage, BaseMessage, ChannelRequestMessage, ErrorMessage,
     FeedDataMessage, FeedSetupMessage, FeedSubscription, FeedSubscriptionMessage, KeepaliveMessage,
     SetupMessage,
 };
 
+use crate::parse_compact_data;
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -805,6 +806,165 @@ impl DXLinkClient {
                 "Channel {} not found",
                 channel_id
             ))),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::events::QuoteEvent;
+    use super::*;
+
+    // Basic test for client creation
+    #[test]
+    fn test_new_client() {
+        let client = DXLinkClient::new("wss://test.url", "test_token");
+
+        assert_eq!(client.url, "wss://test.url");
+        assert_eq!(client.token, "test_token");
+        assert_eq!(client.keepalive_timeout, DEFAULT_KEEPALIVE_TIMEOUT);
+        assert!(client.connection.is_none());
+        assert!(client.event_sender.is_none());
+        assert!(client.keepalive_handle.is_none());
+        assert!(client.message_handle.is_none());
+        assert!(client.keepalive_sender.is_none());
+    }
+
+    // Test next_channel_id
+    #[test]
+    fn test_next_channel_id() {
+        let client = DXLinkClient::new("wss://test.url", "test_token");
+
+        // Get the first channel ID
+        let id1 = client.next_channel_id().unwrap();
+
+        // Get the second channel ID
+        let id2 = client.next_channel_id().unwrap();
+
+        // Check that IDs are incrementing
+        assert_eq!(id2, id1 + 1);
+    }
+
+    // Test validate_channel
+    #[test]
+    fn test_validate_channel() {
+        let client = DXLinkClient::new("wss://test.url", "test_token");
+
+        // Add some channels
+        {
+            let mut channels = client.channels.lock().unwrap();
+            channels.insert(1, "FEED".to_string());
+            channels.insert(2, "OTHER".to_string());
+        }
+
+        // Test validating an existing channel with correct service
+        let result = client.validate_channel(1, "FEED");
+        assert!(result.is_ok());
+
+        // Test validating an existing channel with wrong service
+        let result = client.validate_channel(1, "OTHER");
+        assert!(result.is_err());
+        match result {
+            Err(DXLinkError::Channel(_)) => {}
+            _ => panic!("Expected Channel error"),
+        }
+
+        // Test validating a non-existent channel
+        let result = client.validate_channel(3, "FEED");
+        assert!(result.is_err());
+        match result {
+            Err(DXLinkError::Channel(_)) => {}
+            _ => panic!("Expected Channel error"),
+        }
+    }
+
+    // Test on_event
+    #[test]
+    fn test_on_event() {
+        let client = DXLinkClient::new("wss://test.url", "test_token");
+
+        // Use a flag to check if callback was called
+        let called = Arc::new(Mutex::new(false));
+        let called_clone = called.clone();
+
+        // Register a callback
+        client.on_event("AAPL", move |_| {
+            let mut called = called_clone.lock().unwrap();
+            *called = true;
+        });
+
+        // Check that callback was registered
+        let callbacks = client.callbacks.lock().unwrap();
+        assert!(callbacks.contains_key("AAPL"));
+
+        // Test the callback
+        if let Some(callback) = callbacks.get("AAPL") {
+            let quote_event = QuoteEvent {
+                event_type: "Quote".to_string(),
+                event_symbol: "AAPL".to_string(),
+                bid_price: 150.25,
+                ask_price: 150.50,
+                bid_size: 100.0,
+                ask_size: 150.0,
+            };
+
+            callback(MarketEvent::Quote(quote_event));
+
+            // Check that callback was called
+            let called = called.lock().unwrap();
+            assert!(*called);
+        } else {
+            panic!("Callback was not registered");
+        }
+    }
+
+    // Test event_stream
+    #[test]
+    fn test_event_stream() {
+        let mut client = DXLinkClient::new("wss://test.url", "test_token");
+
+        // Check that we can get an event stream
+        let result = client.event_stream();
+        assert!(result.is_ok());
+
+        // Check that we can't get a second event stream
+        let result = client.event_stream();
+        assert!(result.is_err());
+        match result {
+            Err(DXLinkError::Protocol(msg)) => {
+                assert!(msg.contains("Event stream already created"));
+            }
+            _ => panic!("Expected Protocol error"),
+        }
+    }
+
+    // Test error cases for connection
+    #[test]
+    fn test_connection_errors() {
+        let mut client = DXLinkClient::new("wss://test.url", "test_token");
+
+        // Test starting keepalive without connection
+        let result = client.start_keepalive();
+        assert!(result.is_err());
+        match result {
+            Err(DXLinkError::Connection(_)) => {}
+            _ => panic!("Expected Connection error"),
+        }
+
+        // Test starting message processing without connection
+        let result = client.start_message_processing();
+        assert!(result.is_err());
+        match result {
+            Err(DXLinkError::Connection(_)) => {}
+            _ => panic!("Expected Connection error"),
+        }
+
+        // Test getting connection without having one
+        let result = client.get_connection_mut();
+        assert!(result.is_err());
+        match result {
+            Err(DXLinkError::Connection(_)) => {}
+            _ => panic!("Expected Connection error"),
         }
     }
 }

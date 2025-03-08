@@ -175,8 +175,8 @@
 //!  
 //!  1. Clone the repository:
 //!  ```shell
-//!  git clone https://github.com/joaquinbejar/dxlink
-//!  cd dxlink
+//!  git clone https://github.com/joaquinbejar/DXlink
+//!  cd DXlink
 //!  ```
 //!  
 //!  2. Build the project:
@@ -271,8 +271,10 @@ pub mod connection;
 pub mod error;
 pub mod events;
 pub mod messages;
+mod utils;
 
 pub use client::DXLinkClient;
 pub use error::DXLinkError;
 pub use events::{EventType, MarketEvent};
 pub use messages::FeedSubscription;
+pub use utils::parse_compact_data;
