@@ -32,7 +32,7 @@ const DEFAULT_KEEPALIVE_INTERVAL: u32 = 15;
 
 /// Default client version string.  This is used to identify the client
 /// software version to the server.
-const DEFAULT_CLIENT_VERSION: &str = "1.0.2-dxlink-0.1.1";
+const DEFAULT_CLIENT_VERSION: &str = "1.0.2-dxlink-0.1.2";
 
 /// The main communication channel identifier. This is likely used for
 /// primary message exchange between client and server.
