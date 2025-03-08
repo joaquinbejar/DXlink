@@ -1,47 +1,46 @@
 use dxlink::{DXLinkClient, EventType, FeedSubscription, MarketEvent};
-use std::error::Error;
-use std::time::Duration;
 use tokio::time::sleep;
+use std::time::Duration;
+use std::error::Error;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
-    // Configurar logging
+    // Configure logging
     tracing_subscriber::fmt::init();
 
-    // Obtener token (normalmente lo obtendrías de la API de tastytrade)
-    let token = "tu_token_api_aquí";
-    let url = "wss://tasty-openapi-ws.dxfeed.com/realtime";
+    println!("Starting DXLink client...");
 
-    // Crear cliente DXLink
+    // DXFeed demo server
+    let url = "wss://demo.dxfeed.com/dxlink-ws";
+    let token = "";
+
     let mut client = DXLinkClient::new(url, token);
 
-    // Conectar y autenticar
-    println!("Conectando a DXLink...");
+    println!("Connecting to DXLink server...");
     client.connect().await?;
-    println!("Conexión exitosa!");
+    println!("Connection successful!");
 
-    // Crear canal de feed
-    println!("Creando canal...");
+    // Create channel for feed
+    println!("Creating channel...");
     let channel_id = client.create_feed_channel("AUTO").await?;
-    println!("Canal creado: {}", channel_id);
+    println!("Channel created: {}", channel_id);
 
-    // Configurar canal
-    println!("Configurando canal...");
-    client
-        .setup_feed(channel_id, &[EventType::Quote, EventType::Trade])
-        .await?;
-    println!("Canal configurado");
+    // Setup channel - IMPORTANT: Include all event fields you need
+    println!("Setting up channel...");
+    client.setup_feed(channel_id, &[EventType::Quote, EventType::Trade]).await?;
+    println!("Channel setup complete");
 
-    // Registrar callback para SPY
-    client.on_event("SPY", |event| {
-        println!("Evento recibido para SPY: {:?}", event);
+    // Register callback for events
+    client.on_event("AAPL", |event| {
+        println!("AAPL event received: {:?}", event);
     });
 
-    // Obtener stream para todos los eventos
+    // Get stream for all events
     let mut event_stream = client.event_stream()?;
 
-    // Spawn task para procesar eventos
+    // Process events in a separate task
     tokio::spawn(async move {
+        println!("Waiting for events...");
         while let Some(event) = event_stream.recv().await {
             match &event {
                 MarketEvent::Quote(quote) => {
@@ -53,52 +52,62 @@ async fn main() -> Result<(), Box<dyn Error>> {
                         quote.ask_price,
                         quote.ask_size
                     );
-                }
+                },
                 MarketEvent::Trade(trade) => {
                     println!(
                         "Trade: {} - Price: {}, Size: {}, Volume: {}",
-                        trade.event_symbol, trade.price, trade.size, trade.day_volume
+                        trade.event_symbol,
+                        trade.price,
+                        trade.size,
+                        trade.day_volume
                     );
-                }
-                _ => println!("Otro tipo de evento: {:?}", event),
+                },
+                _ => println!("Other event type: {:?}", event),
             }
         }
     });
 
-    // Suscribirse a símbolos
-    println!("Suscribiéndose a SPY y AAPL...");
+    // Subscribe to symbols
+    println!("Subscribing to symbols...");
     let subscriptions = vec![
-        FeedSubscription {
-            event_type: "Quote".to_string(),
-            symbol: "SPY".to_string(),
-            from_time: None,
-            source: None,
-        },
-        FeedSubscription {
-            event_type: "Trade".to_string(),
-            symbol: "SPY".to_string(),
-            from_time: None,
-            source: None,
-        },
         FeedSubscription {
             event_type: "Quote".to_string(),
             symbol: "AAPL".to_string(),
             from_time: None,
             source: None,
         },
+        FeedSubscription {
+            event_type: "Trade".to_string(),
+            symbol: "AAPL".to_string(),
+            from_time: None,
+            source: None,
+        },
+        // Additional popular symbols
+        FeedSubscription {
+            event_type: "Quote".to_string(),
+            symbol: "MSFT".to_string(),
+            from_time: None,
+            source: None,
+        },
+        FeedSubscription {
+            event_type: "Quote".to_string(),
+            symbol: "BTC/USD:GDAX".to_string(),
+            from_time: None,
+            source: None,
+        },
     ];
 
     client.subscribe(channel_id, subscriptions).await?;
-    println!("Suscripción exitosa");
+    println!("Subscription successful");
 
-    // Mantener la conexión activa por un tiempo
-    println!("Recibiendo datos durante 2 minutos...");
+    // Keep connection active for 2 minutes
+    println!("Receiving data for 2 minutes...");
     sleep(Duration::from_secs(120)).await;
 
-    // Desconectar
-    println!("Desconectando...");
+    // Cleanup
+    println!("Disconnecting...");
     client.disconnect().await?;
-    println!("Desconexión exitosa");
+    println!("Disconnection successful");
 
     Ok(())
 }

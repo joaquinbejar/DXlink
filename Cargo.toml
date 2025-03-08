@@ -1,6 +1,6 @@
 [package]
 name = "dxlink"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 license = "MIT"
 description = "Library for trading through tastytrade's API"
@@ -22,19 +22,12 @@ include = [
 ]
 
 [dependencies]
-rust_decimal = { version = "1.29.1", features = [
-	"serde-with-arbitrary-precision",
-	"serde-with-float",
-] }
 serde = { version = "1.0.163", features = ["derive"] }
 serde_json = "1.0.96"
 tokio-tungstenite = { version = "0.26.2", features = ["native-tls"] }
 tokio = { version = "1.28.1", features = ["full"] }
 futures-util = "0.3.28"
 tracing = "0.1.41"
-
-
-
 
 [[test]]
 name = "tests"

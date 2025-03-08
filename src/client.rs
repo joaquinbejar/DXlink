@@ -7,24 +7,18 @@
 use crate::connection::WebSocketConnection;
 use crate::error::{DXLinkError, DXLinkResult};
 use crate::events::{CompactData, EventType, MarketEvent, parse_compact_data};
-use crate::messages::{
-    AuthMessage, AuthStateMessage, BaseMessage, ChannelOpenedMessage, ChannelRequestMessage,
-    ErrorMessage, FeedConfigMessage, FeedDataMessage, FeedSetupMessage, FeedSubscription,
-    FeedSubscriptionMessage, KeepaliveMessage, SetupMessage,
-};
-use rust_decimal::Decimal;
-use rust_decimal::prelude::FromPrimitive;
+use crate::messages::{AuthMessage, AuthStateMessage, BaseMessage, ChannelOpenedMessage, ChannelRequestMessage, ErrorMessage, FeedConfigMessage, FeedDataMessage, FeedSetupMessage, FeedSubscription, FeedSubscriptionMessage, KeepaliveMessage, SetupMessage};
+
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::mpsc::{self, Receiver, Sender};
 use tokio::task::JoinHandle;
-use tokio::time::sleep;
 use tracing::{debug, error, info, warn};
 
 const DEFAULT_KEEPALIVE_TIMEOUT: u32 = 60;
-const DEFAULT_KEEPALIVE_INTERVAL: u32 = 30;
-const DEFAULT_CLIENT_VERSION: &str = "2.4.0-dxlink-0.1.0";
+const DEFAULT_KEEPALIVE_INTERVAL: u32 = 15;
+const DEFAULT_CLIENT_VERSION: &str = "1.0.2-dxlink-0.1.1";
 const MAIN_CHANNEL: u32 = 0;
 
 pub type EventCallback = Box<dyn Fn(MarketEvent) + Send + Sync + 'static>;
@@ -41,6 +35,7 @@ pub struct DXLinkClient {
     event_sender: Option<Sender<MarketEvent>>,
     keepalive_handle: Option<JoinHandle<()>>,
     message_handle: Option<JoinHandle<()>>,
+    keepalive_sender: Option<Sender<()>>,
 }
 
 impl DXLinkClient {
@@ -57,13 +52,14 @@ impl DXLinkClient {
             event_sender: None,
             keepalive_handle: None,
             message_handle: None,
+            keepalive_sender: None, // Inicialmente None
         }
     }
 
     /// Connect to the DXLink server and perform the setup and authentication
     pub async fn connect(&mut self) -> DXLinkResult<()> {
         // Connect to WebSocket
-        let mut connection = WebSocketConnection::connect(&self.url).await?;
+        let connection = WebSocketConnection::connect(&self.url).await?;
 
         // Send SETUP message
         let setup_msg = SetupMessage {
@@ -80,47 +76,145 @@ impl DXLinkClient {
         let response = connection.receive().await?;
         let _: SetupMessage = serde_json::from_str(&response)?;
 
-        // Check for AUTH_STATE message, should receive UNAUTHORIZED
+        // Check for AUTH_STATE message
         let response = connection.receive().await?;
         let auth_state: AuthStateMessage = serde_json::from_str(&response)?;
 
-        if auth_state.state != "UNAUTHORIZED" {
+        // Si ya estamos autorizados, podemos omitir el proceso de autenticación
+        if auth_state.state == "AUTHORIZED" {
+            info!("Already authorized to DXLink server");
+        } else if auth_state.state == "UNAUTHORIZED" {
+            // Send AUTH message
+            let auth_msg = AuthMessage {
+                channel: MAIN_CHANNEL,
+                message_type: "AUTH".to_string(),
+                token: self.token.clone(),
+            };
+
+            connection.send(&auth_msg).await?;
+
+            // Receive AUTH_STATE response, should be AUTHORIZED
+            let response = connection.receive().await?;
+            let auth_state: AuthStateMessage = serde_json::from_str(&response)?;
+
+            if auth_state.state != "AUTHORIZED" {
+                return Err(DXLinkError::Authentication(format!(
+                    "Authentication failed. State: {}", auth_state.state
+                )));
+            }
+
+            info!("Successfully authenticated to DXLink server");
+        } else {
             return Err(DXLinkError::Protocol(format!(
-                "Expected UNAUTHORIZED state, got: {}",
-                auth_state.state
+                "Unexpected authentication state: {}", auth_state.state
             )));
         }
 
-        // Send AUTH message
-        let auth_msg = AuthMessage {
-            channel: MAIN_CHANNEL,
-            message_type: "AUTH".to_string(),
-            token: self.token.clone(),
-        };
-
-        connection.send(&auth_msg).await?;
-
-        // Receive AUTH_STATE response, should be AUTHORIZED
-        let response = connection.receive().await?;
-        let auth_state: AuthStateMessage = serde_json::from_str(&response)?;
-
-        if auth_state.state != "AUTHORIZED" {
-            return Err(DXLinkError::Authentication(format!(
-                "Authentication failed. State: {}",
-                auth_state.state
-            )));
-        }
-
-        info!("Successfully connected and authenticated to DXLink");
+        info!("Successfully connected to DXLink server");
 
         self.connection = Some(connection);
 
-        // Start keepalive task
-        let handle = self.start_keepalive()?;
-        self.keepalive_handle = Some(handle);
+        // Start keepalive task with a channel
+        self.start_keepalive()?;
 
         // Start message processing task
         self.start_message_processing()?;
+
+        Ok(())
+    }
+
+    fn start_keepalive(&mut self) -> DXLinkResult<()> {
+        // Asegurarnos de que tenemos una conexión
+        if self.connection.is_none() {
+            return Err(DXLinkError::Connection(
+                "Cannot start keepalive without a connection".to_string(),
+            ));
+        }
+
+        // Crear un canal para señales de cierre
+        let (tx, mut rx) = mpsc::channel::<()>(1);
+        self.keepalive_sender = Some(tx);
+
+        // Obtener un keepalive sender (la misma conexión que usamos para todo lo demás)
+        let connection = self.connection.as_ref().unwrap().clone();
+
+        // Usar la constante para el intervalo de keepalive
+        let keepalive_interval = Duration::from_secs(DEFAULT_KEEPALIVE_INTERVAL as u64);
+
+        let keepalive_handle = tokio::spawn(async move {
+            let mut interval = tokio::time::interval(keepalive_interval);
+
+            loop {
+                tokio::select! {
+                _ = interval.tick() => {
+                    // Es hora de enviar un keepalive
+                    let keepalive_msg = KeepaliveMessage {
+                        channel: MAIN_CHANNEL,
+                        message_type: "KEEPALIVE".to_string(),
+                    };
+                    
+                    match connection.send(&keepalive_msg).await {
+                        Ok(_) => {
+                            debug!("Sent keepalive message");
+                        },
+                        Err(e) => {
+                            error!("Failed to send keepalive: {}", e);
+                            // Salir del bucle en caso de error para que la tarea termine
+                            break;
+                        }
+                    }
+                }
+                _ = rx.recv() => {
+                    // Recibimos una señal para terminar
+                    debug!("Keepalive task received shutdown signal");
+                    break;
+                }
+            }
+            }
+
+            debug!("Keepalive task terminated");
+        });
+
+        self.keepalive_handle = Some(keepalive_handle);
+
+        Ok(())
+    }
+
+    pub async fn disconnect(&mut self) -> DXLinkResult<()> {
+        // Señalizar a la tarea de keepalive que termine
+        if let Some(sender) = &self.keepalive_sender {
+            // Intentar enviar la señal, pero no bloquear si el receptor ya no existe
+            let _ = sender.send(()).await;
+            self.keepalive_sender = None;
+        }
+
+        // Esperar a que la tarea de keepalive termine
+        if let Some(handle) = self.keepalive_handle.take() {
+            handle.abort();
+        }
+
+        // Terminar la tarea de procesamiento de mensajes
+        if let Some(handle) = self.message_handle.take() {
+            handle.abort();
+        }
+
+        // Cerrar todos los canales
+        let channels_to_close = {
+            let channels = self.channels.lock().unwrap();
+            channels.keys().cloned().collect::<Vec<_>>()
+        };
+
+        for channel_id in channels_to_close {
+            if let Err(e) = self.close_channel(channel_id).await {
+                warn!("Error closing channel {}: {}", channel_id, e);
+                // Continue with other channels
+            }
+        }
+
+        // Cerrar la conexión
+        self.connection = None;
+
+        info!("Disconnected from DXLink server");
 
         Ok(())
     }
@@ -170,12 +264,13 @@ impl DXLinkClient {
         channel_id: u32,
         event_types: &[EventType],
     ) -> DXLinkResult<()> {
+        
         // Validate channel exists and is a FEED channel
         self.validate_channel(channel_id, "FEED")?;
 
         // Create event fields
         let mut accept_event_fields = HashMap::new();
-
+        
         for event_type in event_types {
             let fields = match event_type {
                 EventType::Quote => vec![
@@ -213,10 +308,13 @@ impl DXLinkClient {
         let feed_setup = FeedSetupMessage {
             channel: channel_id,
             message_type: "FEED_SETUP".to_string(),
-            accept_aggregation_period: Decimal::from_f64(0.1).unwrap(),
+            accept_aggregation_period: 0.1,
             accept_data_format: "COMPACT".to_string(),
             accept_event_fields,
         };
+
+        let json = serde_json::to_string(&feed_setup)?;
+        println!("Sending FEED_SETUP: {}", json);
 
         let conn = self.get_connection_mut()?;
         conn.send(&feed_setup).await?;
@@ -392,38 +490,6 @@ impl DXLinkClient {
         }
     }
 
-    /// Disconnect from the DXLink server
-    pub async fn disconnect(&mut self) -> DXLinkResult<()> {
-        // Stop background tasks
-        if let Some(handle) = self.keepalive_handle.take() {
-            handle.abort();
-        }
-
-        if let Some(handle) = self.message_handle.take() {
-            handle.abort();
-        }
-
-        // Close all channels
-        let channels_to_close = {
-            let channels = self.channels.lock().unwrap();
-            channels.keys().cloned().collect::<Vec<_>>()
-        };
-
-        for channel_id in channels_to_close {
-            if let Err(e) = self.close_channel(channel_id).await {
-                warn!("Error closing channel {}: {}", channel_id, e);
-                // Continue with other channels
-            }
-        }
-
-        // Connection will close when dropped
-        self.connection = None;
-
-        info!("Disconnected from DXLink server");
-
-        Ok(())
-    }
-
     // Helper methods
     fn next_channel_id(&self) -> DXLinkResult<u32> {
         let mut id = self.next_channel_id.lock().unwrap();
@@ -453,90 +519,49 @@ impl DXLinkClient {
         }
     }
 
-    fn start_keepalive(&self) -> DXLinkResult<JoinHandle<()>> {
-        // Ensure we have a connection
+    pub fn start_message_processing(&mut self) -> DXLinkResult<()> {
+        // Asegurarnos de que tenemos una conexión
         if self.connection.is_none() {
             return Err(DXLinkError::Connection(
-                "Cannot start keepalive without a connection".to_string(),
+                "Cannot start message processing without a connection".to_string()
             ));
         }
 
-        let url = self.url.clone();
-        // let token = self.token.clone();
-        let keepalive_interval = Duration::from_secs(DEFAULT_KEEPALIVE_INTERVAL as u64);
+        // Crear un canal para comunicarse con la tarea
+        let (tx, mut rx) = mpsc::channel::<String>(100);
 
-        let keepalive_handle = tokio::spawn(async move {
-            loop {
-                // Sleep for the keepalive interval
-                sleep(keepalive_interval).await;
-
-                // Create a new connection for the keepalive message to avoid
-                // interfering with the main connection
-                match WebSocketConnection::connect(&url).await {
-                    Ok(mut conn) => {
-                        let keepalive_msg = KeepaliveMessage {
-                            channel: MAIN_CHANNEL,
-                            message_type: "KEEPALIVE".to_string(),
-                        };
-
-                        if let Err(e) = conn.send(&keepalive_msg).await {
-                            error!("Failed to send keepalive: {}", e);
-                        } else {
-                            debug!("Sent keepalive message");
-                        }
-                    }
-                    Err(e) => {
-                        error!("Failed to connect for keepalive: {}", e);
-                    }
-                }
-            }
-        });
-
-        Ok(keepalive_handle)
-    }
-
-    fn start_message_processing(&mut self) -> DXLinkResult<()> {
-        if self.connection.is_none() {
-            return Err(DXLinkError::Connection(
-                "Cannot start message processing without a connection".to_string(),
-            ));
-        }
-
-        let mut connection = self.connection.take().unwrap();
+        // Clonar las referencias que necesitamos para el procesamiento
         let callbacks = self.callbacks.clone();
         let event_sender = self.event_sender.clone();
 
-        // Canal para mensajes WebSocket (raw)
-        let (ws_tx, mut ws_rx) = mpsc::channel::<String>(100);
+        // Clonar la conexión para usar en la tarea
+        let connection = self.connection.as_ref().unwrap().clone();
 
-        // Tarea 1: Lee de WebSocket y envía al canal
-        let ws_task = tokio::spawn(async move {
+        // Crear una tarea para recibir mensajes usando la misma conexión
+        let receiver_handle = tokio::spawn(async move {
             loop {
                 match connection.receive().await {
                     Ok(msg) => {
-                        if ws_tx.send(msg).await.is_err() {
-                            error!("Channel closed, stopping receiver task");
+                        if tx.send(msg).await.is_err() {
                             break;
                         }
-                    }
+                    },
                     Err(e) => {
-                        error!("WebSocket error: {}", e);
+                        error!("Error receiving message: {}", e);
                         break;
                     }
                 }
             }
         });
 
-        // Tarea 2: Procesa mensajes del canal
-        let process_task = tokio::spawn(async move {
-            while let Some(msg) = ws_rx.recv().await {
-                // Procesar mensaje
+        // Tarea para procesar los mensajes recibidos
+        let process_handle = tokio::spawn(async move {
+            while let Some(msg) = rx.recv().await {
+                // Intentar parsearlo como un mensaje base
                 if let Ok(base_msg) = serde_json::from_str::<BaseMessage>(&msg) {
                     match base_msg.message_type.as_str() {
                         "FEED_DATA" => {
-                            if let Ok(data_msg) =
-                                serde_json::from_str::<FeedDataMessage<Vec<CompactData>>>(&msg)
-                            {
+                            if let Ok(data_msg) = serde_json::from_str::<FeedDataMessage<Vec<CompactData>>>(&msg) {
                                 let events = parse_compact_data(&data_msg.data);
 
                                 for event in events {
@@ -546,14 +571,14 @@ impl DXLinkClient {
                                         MarketEvent::Greeks(e) => &e.event_symbol,
                                     };
 
-                                    // Enviar a callbacks
+                                    // Enviarlo a los callbacks
                                     if let Ok(callbacks) = callbacks.lock() {
                                         if let Some(callback) = callbacks.get(symbol) {
                                             callback(event.clone());
                                         }
                                     }
 
-                                    // Enviar al canal de eventos
+                                    // Enviarlo al canal de eventos
                                     if let Some(tx) = &event_sender {
                                         if let Err(e) = tx.send(event.clone()).await {
                                             error!("Failed to send event to channel: {}", e);
@@ -561,15 +586,13 @@ impl DXLinkClient {
                                     }
                                 }
                             }
-                        }
+                        },
                         "ERROR" => {
                             if let Ok(error_msg) = serde_json::from_str::<ErrorMessage>(&msg) {
-                                error!(
-                                    "Received error from server: {} - {}",
-                                    error_msg.error, error_msg.message
-                                );
+                                error!("Received error from server: {} - {}", 
+                               error_msg.error, error_msg.message);
                             }
-                        }
+                        },
                         _ => {
                             debug!("Received message of type: {}", base_msg.message_type);
                         }
@@ -578,17 +601,16 @@ impl DXLinkClient {
             }
         });
 
-        // Combinar las dos tareas en una sola
+        // Combinar ambas tareas
         let message_handle = tokio::spawn(async move {
             tokio::select! {
-                _ = ws_task => debug!("WebSocket receiver task completed"),
-                _ = process_task => debug!("Message processor task completed"),
-            }
+            _ = receiver_handle => debug!("Receiver task completed"),
+            _ = process_handle => debug!("Processor task completed"),
+        }
         });
 
+        // Guardar el handle
         self.message_handle = Some(message_handle);
-
-        // Ya no necesitamos restaurar self.connection porque el WebSocket se maneja en la tarea
 
         Ok(())
     }

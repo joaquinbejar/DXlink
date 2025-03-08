@@ -12,7 +12,6 @@
 //! - Automatic handling of authentication and connection maintenance
 //! - Support for multiple subscription channels
 //! - Callback and stream-based APIs for event processing
-//! - Decimal precision for financial values using rust_decimal
 //!
 //! ## Example
 //!

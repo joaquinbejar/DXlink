@@ -4,8 +4,6 @@
    Date: 7/3/25
 ******************************************************************************/
 
-use rust_decimal::Decimal;
-use rust_decimal::prelude::FromPrimitive;
 use serde::{Deserialize, Serialize};
 use std::fmt;
 
@@ -81,13 +79,13 @@ pub struct QuoteEvent {
     #[serde(rename = "eventSymbol")]
     pub event_symbol: String,
     #[serde(rename = "bidPrice")]
-    pub bid_price: Decimal,
+    pub bid_price: f64,
     #[serde(rename = "askPrice")]
-    pub ask_price: Decimal,
+    pub ask_price: f64,
     #[serde(rename = "bidSize")]
-    pub bid_size: Decimal,
+    pub bid_size: f64,
     #[serde(rename = "askSize")]
-    pub ask_size: Decimal,
+    pub ask_size: f64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -97,11 +95,11 @@ pub struct TradeEvent {
     #[serde(rename = "eventSymbol")]
     pub event_symbol: String,
     #[serde(rename = "price")]
-    pub price: Decimal,
+    pub price: f64,
     #[serde(rename = "size")]
-    pub size: Decimal,
+    pub size: f64,
     #[serde(rename = "dayVolume")]
-    pub day_volume: Decimal,
+    pub day_volume: f64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -111,17 +109,17 @@ pub struct GreeksEvent {
     #[serde(rename = "eventSymbol")]
     pub event_symbol: String,
     #[serde(rename = "delta")]
-    pub delta: Decimal,
+    pub delta: f64,
     #[serde(rename = "gamma")]
-    pub gamma: Decimal,
+    pub gamma: f64,
     #[serde(rename = "theta")]
-    pub theta: Decimal,
+    pub theta: f64,
     #[serde(rename = "vega")]
-    pub vega: Decimal,
+    pub vega: f64,
     #[serde(rename = "rho")]
-    pub rho: Decimal,
+    pub rho: f64,
     #[serde(rename = "volatility")]
-    pub volatility: Decimal,
+    pub volatility: f64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -165,20 +163,16 @@ pub fn parse_compact_data(data: &[CompactData]) -> Vec<MarketEvent> {
                                     values.get(j + 1).and_then(|v| v.as_str()),
                                     values
                                         .get(j + 2)
-                                        .and_then(|v| v.as_f64())
-                                        .and_then(Decimal::from_f64),
+                                        .and_then(|v| v.as_f64()),
                                     values
                                         .get(j + 3)
-                                        .and_then(|v| v.as_f64())
-                                        .and_then(Decimal::from_f64),
+                                        .and_then(|v| v.as_f64()),
                                     values
                                         .get(j + 4)
-                                        .and_then(|v| v.as_f64())
-                                        .and_then(Decimal::from_f64),
+                                        .and_then(|v| v.as_f64()),
                                     values
                                         .get(j + 5)
-                                        .and_then(|v| v.as_f64())
-                                        .and_then(Decimal::from_f64),
+                                        .and_then(|v| v.as_f64()),
                                 ) {
                                     events.push(MarketEvent::Quote(QuoteEvent {
                                         event_type: "Quote".to_string(),
@@ -207,16 +201,13 @@ pub fn parse_compact_data(data: &[CompactData]) -> Vec<MarketEvent> {
                                     values.get(j + 1).and_then(|v| v.as_str()),
                                     values
                                         .get(j + 2)
-                                        .and_then(|v| v.as_f64())
-                                        .and_then(Decimal::from_f64),
+                                        .and_then(|v| v.as_f64()),
                                     values
                                         .get(j + 3)
-                                        .and_then(|v| v.as_f64())
-                                        .and_then(Decimal::from_f64),
+                                        .and_then(|v| v.as_f64()),
                                     values
                                         .get(j + 4)
-                                        .and_then(|v| v.as_f64())
-                                        .and_then(Decimal::from_f64),
+                                        .and_then(|v| v.as_f64()),
                                 ) {
                                     events.push(MarketEvent::Trade(TradeEvent {
                                         event_type: "Trade".to_string(),
@@ -247,28 +238,22 @@ pub fn parse_compact_data(data: &[CompactData]) -> Vec<MarketEvent> {
                                     values.get(j + 1).and_then(|v| v.as_str()),
                                     values
                                         .get(j + 2)
-                                        .and_then(|v| v.as_f64())
-                                        .and_then(Decimal::from_f64),
+                                        .and_then(|v| v.as_f64()),
                                     values
                                         .get(j + 3)
-                                        .and_then(|v| v.as_f64())
-                                        .and_then(Decimal::from_f64),
+                                        .and_then(|v| v.as_f64()),
                                     values
                                         .get(j + 4)
-                                        .and_then(|v| v.as_f64())
-                                        .and_then(Decimal::from_f64),
+                                        .and_then(|v| v.as_f64()),
                                     values
                                         .get(j + 5)
-                                        .and_then(|v| v.as_f64())
-                                        .and_then(Decimal::from_f64),
+                                        .and_then(|v| v.as_f64()),
                                     values
                                         .get(j + 6)
-                                        .and_then(|v| v.as_f64())
-                                        .and_then(Decimal::from_f64),
+                                        .and_then(|v| v.as_f64()),
                                     values
                                         .get(j + 7)
-                                        .and_then(|v| v.as_f64())
-                                        .and_then(Decimal::from_f64),
+                                        .and_then(|v| v.as_f64()),
                                 ) {
                                     events.push(MarketEvent::Greeks(GreeksEvent {
                                         event_type: "Greeks".to_string(),

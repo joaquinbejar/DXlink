@@ -14,7 +14,6 @@ to DXLink servers, subscribing to market events, and processing real-time market
 - Automatic handling of authentication and connection maintenance
 - Support for multiple subscription channels
 - Callback and stream-based APIs for event processing
-- Decimal precision for financial values using rust_decimal
 
 ### Example
 
@@ -178,7 +177,6 @@ the parser:
 
 ```rust
 use serde::{Deserialize, Serialize};
-use rust_decimal::Decimal;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NewEvent {
@@ -187,7 +185,7 @@ pub struct NewEvent {
     #[serde(rename = "eventSymbol")]
     pub event_symbol: String,
     // Add your event-specific fields here
-    pub some_field: Decimal,
+    pub some_field: f64,
 }
 
 // Then update MarketEvent enum to include your new event type

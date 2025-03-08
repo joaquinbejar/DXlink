@@ -4,7 +4,6 @@
    Date: 7/3/25
 ******************************************************************************/
 
-use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
@@ -143,7 +142,7 @@ pub struct FeedSetupMessage {
     pub channel: u32,
     #[serde(rename = "type")]
     pub message_type: String,
-    pub accept_aggregation_period: Decimal,
+    pub accept_aggregation_period: f64,
     pub accept_data_format: String,
     pub accept_event_fields: HashMap<String, Vec<String>>,
 }
@@ -155,9 +154,10 @@ pub struct FeedConfigMessage {
     pub channel: u32,
     #[serde(rename = "type")]
     pub message_type: String,
-    pub aggregation_period: Decimal,
+    pub aggregation_period: f64,
     pub data_format: String,
-    pub event_fields: HashMap<String, Vec<String>>,
+    #[serde(default)]
+    pub event_fields: Option<HashMap<String, Vec<String>>>,
 }
 
 // FEED_DATA
