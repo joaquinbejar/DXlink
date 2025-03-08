@@ -30,7 +30,8 @@
 //!     
 //!     // Create a new DXLink client with the API token
 //!     // (typically obtained from tastytrade API)
-//!     let token = "your_api_token_here";
+//!     use tracing::info;
+//! let token = "your_api_token_here";
 //!     let url = "wss://tasty-openapi-ws.dxfeed.com/realtime";
 //!     let mut client = DXLinkClient::new(url, token);
 //!     
@@ -45,7 +46,7 @@
 //!     
 //!     // Register a callback for specific symbol
 //!     client.on_event("SPY", |event| {
-//!         println!("Event received for SPY: {:?}", event);
+//!         info!("Event received for SPY: {:?}", event);
 //!     });
 //!     
 //!     // Get a stream for all events
@@ -56,7 +57,7 @@
 //!         while let Some(event) = event_stream.recv().await {
 //!             match &event {
 //!                 MarketEvent::Quote(quote) => {
-//!                     println!(
+//!                     info!(
 //!                         "Quote: {} - Bid: {} x {}, Ask: {} x {}",
 //!                         quote.event_symbol,
 //!                         quote.bid_price,
@@ -66,7 +67,7 @@
 //!                     );
 //!                 },
 //!                 MarketEvent::Trade(trade) => {
-//!                     println!(
+//!                     info!(
 //!                         "Trade: {} - Price: {}, Size: {}, Volume: {}",
 //!                         trade.event_symbol,
 //!                         trade.price,
@@ -74,7 +75,7 @@
 //!                         trade.day_volume
 //!                     );
 //!                 },
-//!                 _ => println!("Other event type: {:?}", event),
+//!                 _ => info!("Other event type: {:?}", event),
 //!             }
 //!         }
 //!     });
@@ -141,15 +142,16 @@
 //! various error cases that can occur when interacting with the DXLink API:
 //!
 //! ```rust,no_run
+//! use tracing::{error, info};
 //! use dxlink::{DXLinkClient, DXLinkError};
 //!
 //! async fn example_error_handling() {
 //!     let mut client = DXLinkClient::new("wss://example.com", "token");
 //!     match client.connect().await {
-//!         Ok(_) => println!("Connected successfully!"),
-//!         Err(DXLinkError::Authentication(e)) => eprintln!("Authentication failed: {}", e),
-//!         Err(DXLinkError::Connection(e)) => eprintln!("Connection error: {}", e),
-//!         Err(e) => eprintln!("Other error: {}", e),
+//!         Ok(_) => info!("Connected successfully!"),
+//!         Err(DXLinkError::Authentication(e)) => error!("Authentication failed: {}", e),
+//!         Err(DXLinkError::Connection(e)) => error!("Connection error: {}", e),
+//!         Err(e) => error!("Other error: {}", e),
 //!     }
 //! }
 //! ```
