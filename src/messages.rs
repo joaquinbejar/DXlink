@@ -75,7 +75,9 @@ pub struct ChannelOpenedMessage {
     pub channel: u32,
     #[serde(rename = "type")]
     pub message_type: String,
-    pub service: String,
+    #[serde(default)]
+    pub service: Option<String>,
+    #[serde(default)]
     pub parameters: HashMap<String, String>,
 }
 

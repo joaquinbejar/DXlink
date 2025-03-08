@@ -7,12 +7,17 @@
 use crate::connection::WebSocketConnection;
 use crate::error::{DXLinkError, DXLinkResult};
 use crate::events::{CompactData, EventType, MarketEvent, parse_compact_data};
-use crate::messages::{AuthMessage, AuthStateMessage, BaseMessage, ChannelOpenedMessage, ChannelRequestMessage, ErrorMessage, FeedConfigMessage, FeedDataMessage, FeedSetupMessage, FeedSubscription, FeedSubscriptionMessage, KeepaliveMessage, SetupMessage};
+use crate::messages::{
+    AuthMessage, AuthStateMessage, BaseMessage, ChannelRequestMessage, ErrorMessage,
+    FeedDataMessage, FeedSetupMessage, FeedSubscription,
+    FeedSubscriptionMessage, KeepaliveMessage, SetupMessage,
+};
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::mpsc::{self, Receiver, Sender};
+use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 use tracing::{debug, error, info, warn};
 
@@ -22,6 +27,21 @@ const DEFAULT_CLIENT_VERSION: &str = "1.0.2-dxlink-0.1.1";
 const MAIN_CHANNEL: u32 = 0;
 
 pub type EventCallback = Box<dyn Fn(MarketEvent) + Send + Sync + 'static>;
+
+enum ResponseType {
+    ChannelOpened(u32),
+    FeedConfig(u32),
+    ChannelClosed(u32),
+    Error(String),
+    #[allow(dead_code)]
+    Other(String),
+}
+
+struct ResponseRequest {
+    expected_type: String, // Tipo de mensaje esperado ("CHANNEL_OPENED", "FEED_CONFIG", etc.)
+    channel_id: Option<u32>, // Canal esperado (None si no importa)
+    response_sender: oneshot::Sender<ResponseType>,
+}
 
 pub struct DXLinkClient {
     url: String,
@@ -36,6 +56,7 @@ pub struct DXLinkClient {
     keepalive_handle: Option<JoinHandle<()>>,
     message_handle: Option<JoinHandle<()>>,
     keepalive_sender: Option<Sender<()>>,
+    response_requests: Arc<Mutex<Vec<ResponseRequest>>>,
 }
 
 impl DXLinkClient {
@@ -52,7 +73,8 @@ impl DXLinkClient {
             event_sender: None,
             keepalive_handle: None,
             message_handle: None,
-            keepalive_sender: None, // Inicialmente None
+            keepalive_sender: None,
+            response_requests: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
@@ -99,14 +121,16 @@ impl DXLinkClient {
 
             if auth_state.state != "AUTHORIZED" {
                 return Err(DXLinkError::Authentication(format!(
-                    "Authentication failed. State: {}", auth_state.state
+                    "Authentication failed. State: {}",
+                    auth_state.state
                 )));
             }
 
             info!("Successfully authenticated to DXLink server");
         } else {
             return Err(DXLinkError::Protocol(format!(
-                "Unexpected authentication state: {}", auth_state.state
+                "Unexpected authentication state: {}",
+                auth_state.state
             )));
         }
 
@@ -114,15 +138,47 @@ impl DXLinkClient {
 
         self.connection = Some(connection);
 
+        // Start message processing task first so it puede capturar todos los mensajes
+        self.start_message_processing()?;
+
         // Start keepalive task with a channel
         self.start_keepalive()?;
-
-        // Start message processing task
-        self.start_message_processing()?;
 
         Ok(())
     }
 
+    #[allow(dead_code)]
+    async fn wait_for_response(
+        &self,
+        expected_type: &str,
+        channel_id: Option<u32>,
+        timeout: Duration,
+    ) -> DXLinkResult<ResponseType> {
+        let (tx, rx) = oneshot::channel();
+
+        // Registrar nuestra solicitud de respuesta
+        {
+            let mut requests = self.response_requests.lock().unwrap();
+            requests.push(ResponseRequest {
+                expected_type: expected_type.to_string(),
+                channel_id,
+                response_sender: tx,
+            });
+        }
+
+        // Esperar la respuesta con timeout
+        match tokio::time::timeout(timeout, rx).await {
+            Ok(Ok(response)) => Ok(response),
+            Ok(Err(_)) => Err(DXLinkError::Protocol("Response channel closed".to_string())),
+            Err(_) => Err(DXLinkError::Timeout(format!(
+                "Timed out waiting for {} message{}",
+                expected_type,
+                channel_id.map_or("".to_string(), |id| format!(" for channel {}", id))
+            ))),
+        }
+    }
+
+    // Actualizar el método start_keepalive
     fn start_keepalive(&mut self) -> DXLinkResult<()> {
         // Asegurarnos de que tenemos una conexión
         if self.connection.is_none() {
@@ -135,7 +191,7 @@ impl DXLinkClient {
         let (tx, mut rx) = mpsc::channel::<()>(1);
         self.keepalive_sender = Some(tx);
 
-        // Obtener un keepalive sender (la misma conexión que usamos para todo lo demás)
+        // Obtener la conexión
         let connection = self.connection.as_ref().unwrap().clone();
 
         // Usar la constante para el intervalo de keepalive
@@ -146,30 +202,30 @@ impl DXLinkClient {
 
             loop {
                 tokio::select! {
-                _ = interval.tick() => {
-                    // Es hora de enviar un keepalive
-                    let keepalive_msg = KeepaliveMessage {
-                        channel: MAIN_CHANNEL,
-                        message_type: "KEEPALIVE".to_string(),
-                    };
-                    
-                    match connection.send(&keepalive_msg).await {
-                        Ok(_) => {
-                            debug!("Sent keepalive message");
-                        },
-                        Err(e) => {
-                            error!("Failed to send keepalive: {}", e);
-                            // Salir del bucle en caso de error para que la tarea termine
-                            break;
+                    _ = interval.tick() => {
+                        // Es hora de enviar un keepalive
+                        let keepalive_msg = KeepaliveMessage {
+                            channel: MAIN_CHANNEL,
+                            message_type: "KEEPALIVE".to_string(),
+                        };
+
+                        match connection.send(&keepalive_msg).await {
+                            Ok(_) => {
+                                debug!("Sent keepalive message");
+                            },
+                            Err(e) => {
+                                error!("Failed to send keepalive: {}", e);
+                                // Salir del bucle en caso de error para que la tarea termine
+                                break;
+                            }
                         }
                     }
+                    _ = rx.recv() => {
+                        // Recibimos una señal para terminar
+                        debug!("Keepalive task received shutdown signal");
+                        break;
+                    }
                 }
-                _ = rx.recv() => {
-                    // Recibimos una señal para terminar
-                    debug!("Keepalive task received shutdown signal");
-                    break;
-                }
-            }
             }
 
             debug!("Keepalive task terminated");
@@ -180,6 +236,148 @@ impl DXLinkClient {
         Ok(())
     }
 
+    // Modificación del método start_message_processing
+    fn start_message_processing(&mut self) -> DXLinkResult<()> {
+        // Asegurarnos de que tenemos una conexión
+        if self.connection.is_none() {
+            return Err(DXLinkError::Connection(
+                "Cannot start message processing without a connection".to_string(),
+            ));
+        }
+
+        // Clonar la conexión para usar en la tarea
+        let connection = self.connection.as_ref().unwrap().clone();
+
+        // Clonar referencias que necesitamos
+        let callbacks = self.callbacks.clone();
+        let event_sender = self.event_sender.clone();
+        let response_requests = self.response_requests.clone();
+
+        // Iniciar la tarea de procesamiento de mensajes
+        let message_handle = tokio::spawn(async move {
+            loop {
+                match connection.receive().await {
+                    Ok(msg) => {
+                        debug!("Received message: {}", msg);
+
+                        // Procesar el mensaje
+                        if let Ok(value) = serde_json::from_str::<serde_json::Value>(&msg) {
+                            // Identificar el tipo de mensaje
+                            let msg_type = value.get("type").and_then(|v| v.as_str()).unwrap_or("");
+                            let channel = value
+                                .get("channel")
+                                .and_then(|v| v.as_u64())
+                                .map(|c| c as u32);
+
+                            // Primero, comprobar si alguien está esperando este mensaje
+                            {
+                                let mut requests = response_requests.lock().unwrap();
+                                if let Some(idx) = requests.iter().position(|req| {
+                                    req.expected_type == msg_type
+                                        && (req.channel_id.is_none() || req.channel_id == channel)
+                                }) {
+                                    // Encontramos alguien esperando este mensaje
+                                    let request = requests.remove(idx);
+
+                                    // Crear la respuesta apropiada
+                                    let response = match msg_type {
+                                        "CHANNEL_OPENED" => {
+                                            ResponseType::ChannelOpened(channel.unwrap_or(0))
+                                        }
+                                        "FEED_CONFIG" => {
+                                            ResponseType::FeedConfig(channel.unwrap_or(0))
+                                        }
+                                        "CHANNEL_CLOSED" => {
+                                            ResponseType::ChannelClosed(channel.unwrap_or(0))
+                                        }
+                                        "ERROR" => {
+                                            let error = value
+                                                .get("error")
+                                                .and_then(|v| v.as_str())
+                                                .unwrap_or("unknown");
+                                            let message = value
+                                                .get("message")
+                                                .and_then(|v| v.as_str())
+                                                .unwrap_or("");
+                                            ResponseType::Error(format!("{} - {}", error, message))
+                                        }
+                                        _ => ResponseType::Other(msg.clone()),
+                                    };
+
+                                    // Enviar la respuesta (ignorando errores si el receptor ya no existe)
+                                    let _ = request.response_sender.send(response);
+                                    continue; // Pasar al siguiente mensaje
+                                }
+                            }
+
+                            // Si nadie esperaba este mensaje específicamente, procesarlo normalmente
+                            match msg_type {
+                                "FEED_DATA" => {
+                                    if let Ok(data_msg) = serde_json::from_str::<
+                                        FeedDataMessage<Vec<CompactData>>,
+                                    >(&msg)
+                                    {
+                                        let events = parse_compact_data(&data_msg.data);
+                                        for event in events {
+                                            let symbol = match &event {
+                                                MarketEvent::Quote(e) => &e.event_symbol,
+                                                MarketEvent::Trade(e) => &e.event_symbol,
+                                                MarketEvent::Greeks(e) => &e.event_symbol,
+                                            };
+
+                                            // Enviarlo a los callbacks
+                                            if let Ok(callbacks) = callbacks.lock() {
+                                                if let Some(callback) = callbacks.get(symbol) {
+                                                    callback(event.clone());
+                                                }
+                                            }
+
+                                            // Enviarlo al canal de eventos
+                                            if let Some(tx) = &event_sender {
+                                                if let Err(e) = tx.send(event.clone()).await {
+                                                    error!(
+                                                        "Failed to send event to channel: {}",
+                                                        e
+                                                    );
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                                "ERROR" => {
+                                    if let Ok(error_msg) =
+                                        serde_json::from_str::<ErrorMessage>(&msg)
+                                    {
+                                        error!(
+                                            "Received error from server: {} - {}",
+                                            error_msg.error, error_msg.message
+                                        );
+                                    }
+                                }
+                                "KEEPALIVE" => {
+                                    // Simplemente registrar keepalives
+                                    debug!("Received KEEPALIVE message");
+                                }
+                                _ => {
+                                    debug!("Received unhandled message type: {}", msg_type);
+                                }
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        error!("Error receiving message: {}", e);
+                        // Una pequeña pausa para no saturar logs en caso de errores repetidos
+                        tokio::time::sleep(Duration::from_millis(100)).await;
+                    }
+                }
+            }
+        });
+
+        self.message_handle = Some(message_handle);
+        Ok(())
+    }
+
+    /// Close the connection and clean up resources
     pub async fn disconnect(&mut self) -> DXLinkResult<()> {
         // Señalizar a la tarea de keepalive que termine
         if let Some(sender) = &self.keepalive_sender {
@@ -233,29 +431,60 @@ impl DXLinkClient {
             parameters: params,
         };
 
+        // Registrar nuestra expectativa de respuesta
+        let (tx, rx) = oneshot::channel();
+        {
+            let mut requests = self.response_requests.lock().unwrap();
+            requests.push(ResponseRequest {
+                expected_type: "CHANNEL_OPENED".to_string(),
+                channel_id: Some(channel_id),
+                response_sender: tx,
+            });
+        }
+
+        // Enviar la solicitud
         let conn = self.get_connection_mut()?;
         conn.send(&channel_request).await?;
 
-        // Wait for CHANNEL_OPENED response
-        let response = conn.receive().await?;
-        let channel_opened: ChannelOpenedMessage = serde_json::from_str(&response)?;
+        // Esperar la respuesta
+        let response = match tokio::time::timeout(Duration::from_secs(10), rx).await {
+            Ok(Ok(response)) => response,
+            Ok(Err(_)) => return Err(DXLinkError::Protocol("Response channel closed".to_string())),
+            Err(_) => {
+                return Err(DXLinkError::Timeout(format!(
+                    "Timed out waiting for CHANNEL_OPENED message for channel {}",
+                    channel_id
+                )));
+            }
+        };
 
-        if channel_opened.channel != channel_id {
-            return Err(DXLinkError::Channel(format!(
-                "Expected channel ID {}, got {}",
-                channel_id, channel_opened.channel
-            )));
+        // Procesar la respuesta
+        match response {
+            ResponseType::ChannelOpened(received_channel) => {
+                if received_channel != channel_id {
+                    return Err(DXLinkError::Channel(format!(
+                        "Expected channel ID {}, got {}",
+                        channel_id, received_channel
+                    )));
+                }
+
+                // Agregar canal a la lista
+                {
+                    let mut channels = self.channels.lock().unwrap();
+                    channels.insert(channel_id, "FEED".to_string());
+                }
+
+                info!("Feed channel {} created successfully", channel_id);
+                Ok(channel_id)
+            }
+            ResponseType::Error(error) => Err(DXLinkError::Protocol(format!(
+                "Server returned error: {}",
+                error
+            ))),
+            _ => Err(DXLinkError::Protocol(
+                "Unexpected response type".to_string(),
+            )),
         }
-
-        // Add channel to list
-        {
-            let mut channels = self.channels.lock().unwrap();
-            channels.insert(channel_id, "FEED".to_string());
-        }
-
-        info!("Feed channel {} created successfully", channel_id);
-
-        Ok(channel_id)
     }
 
     /// Setup a feed channel with desired configuration
@@ -264,13 +493,12 @@ impl DXLinkClient {
         channel_id: u32,
         event_types: &[EventType],
     ) -> DXLinkResult<()> {
-        
         // Validate channel exists and is a FEED channel
         self.validate_channel(channel_id, "FEED")?;
 
         // Create event fields
         let mut accept_event_fields = HashMap::new();
-        
+
         for event_type in event_types {
             let fields = match event_type {
                 EventType::Quote => vec![
@@ -314,25 +542,56 @@ impl DXLinkClient {
         };
 
         let json = serde_json::to_string(&feed_setup)?;
-        println!("Sending FEED_SETUP: {}", json);
+        debug!("Sending FEED_SETUP: {}", json);
 
+        // Registrar nuestra expectativa de respuesta
+        let (tx, rx) = oneshot::channel();
+        {
+            let mut requests = self.response_requests.lock().unwrap();
+            requests.push(ResponseRequest {
+                expected_type: "FEED_CONFIG".to_string(),
+                channel_id: Some(channel_id),
+                response_sender: tx,
+            });
+        }
+
+        // Enviar la solicitud
         let conn = self.get_connection_mut()?;
         conn.send(&feed_setup).await?;
 
-        // Wait for FEED_CONFIG response
-        let response = conn.receive().await?;
-        let feed_config: FeedConfigMessage = serde_json::from_str(&response)?;
+        // Esperar la respuesta
+        let response = match tokio::time::timeout(Duration::from_secs(10), rx).await {
+            Ok(Ok(response)) => response,
+            Ok(Err(_)) => return Err(DXLinkError::Protocol("Response channel closed".to_string())),
+            Err(_) => {
+                return Err(DXLinkError::Timeout(format!(
+                    "Timed out waiting for FEED_CONFIG message for channel {}",
+                    channel_id
+                )));
+            }
+        };
 
-        if feed_config.channel != channel_id {
-            return Err(DXLinkError::Channel(format!(
-                "Expected config for channel {}, got {}",
-                channel_id, feed_config.channel
-            )));
+        // Procesar la respuesta
+        match response {
+            ResponseType::FeedConfig(received_channel) => {
+                if received_channel != channel_id {
+                    return Err(DXLinkError::Channel(format!(
+                        "Expected config for channel {}, got {}",
+                        channel_id, received_channel
+                    )));
+                }
+
+                info!("Feed channel {} setup completed successfully", channel_id);
+                Ok(())
+            }
+            ResponseType::Error(error) => Err(DXLinkError::Protocol(format!(
+                "Server returned error: {}",
+                error
+            ))),
+            _ => Err(DXLinkError::Protocol(
+                "Unexpected response type".to_string(),
+            )),
         }
-
-        info!("Feed channel {} setup completed successfully", channel_id);
-
-        Ok(())
     }
 
     /// Subscribe to market events for specific symbols
@@ -441,34 +700,66 @@ impl DXLinkClient {
             }
         }
 
+        // Crear el mensaje de cancelación
         let cancel_msg = BaseMessage {
             channel: channel_id,
             message_type: "CHANNEL_CANCEL".to_string(),
         };
 
+        // Registrar nuestra expectativa de respuesta (sin retener un futuro todavía)
+        let (tx, rx) = oneshot::channel();
+        {
+            let mut requests = self.response_requests.lock().unwrap();
+            requests.push(ResponseRequest {
+                expected_type: "CHANNEL_CLOSED".to_string(),
+                channel_id: Some(channel_id),
+                response_sender: tx,
+            });
+        }
+
+        // Ahora podemos obtener la conexión mutable y enviar
         let conn = self.get_connection_mut()?;
         conn.send(&cancel_msg).await?;
 
-        // Wait for CHANNEL_CLOSED response
-        let response = conn.receive().await?;
-        let base_msg: BaseMessage = serde_json::from_str(&response)?;
+        // Esperar la respuesta con timeout
+        let response = match tokio::time::timeout(Duration::from_secs(5), rx).await {
+            Ok(Ok(response)) => response,
+            Ok(Err(_)) => return Err(DXLinkError::Protocol("Response channel closed".to_string())),
+            Err(_) => {
+                return Err(DXLinkError::Timeout(format!(
+                    "Timed out waiting for CHANNEL_CLOSED message for channel {}",
+                    channel_id
+                )));
+            }
+        };
 
-        if base_msg.message_type != "CHANNEL_CLOSED" || base_msg.channel != channel_id {
-            return Err(DXLinkError::Channel(format!(
-                "Expected CHANNEL_CLOSED for channel {}, got {} for channel {}",
-                channel_id, base_msg.message_type, base_msg.channel
-            )));
+        // Procesar la respuesta
+        match response {
+            ResponseType::ChannelClosed(received_channel) => {
+                if received_channel != channel_id {
+                    return Err(DXLinkError::Channel(format!(
+                        "Expected CHANNEL_CLOSED for channel {}, got {}",
+                        channel_id, received_channel
+                    )));
+                }
+
+                // Remove channel from list
+                {
+                    let mut channels = self.channels.lock().unwrap();
+                    channels.remove(&channel_id);
+                }
+
+                info!("Channel {} closed successfully", channel_id);
+                Ok(())
+            }
+            ResponseType::Error(error) => Err(DXLinkError::Protocol(format!(
+                "Server returned error: {}",
+                error
+            ))),
+            _ => Err(DXLinkError::Protocol(
+                "Unexpected response type".to_string(),
+            )),
         }
-
-        // Remove channel from list
-        {
-            let mut channels = self.channels.lock().unwrap();
-            channels.remove(&channel_id);
-        }
-
-        info!("Channel {} closed successfully", channel_id);
-
-        Ok(())
     }
 
     /// Register a callback function for a specific symbol
@@ -517,101 +808,5 @@ impl DXLinkClient {
                 channel_id
             ))),
         }
-    }
-
-    pub fn start_message_processing(&mut self) -> DXLinkResult<()> {
-        // Asegurarnos de que tenemos una conexión
-        if self.connection.is_none() {
-            return Err(DXLinkError::Connection(
-                "Cannot start message processing without a connection".to_string()
-            ));
-        }
-
-        // Crear un canal para comunicarse con la tarea
-        let (tx, mut rx) = mpsc::channel::<String>(100);
-
-        // Clonar las referencias que necesitamos para el procesamiento
-        let callbacks = self.callbacks.clone();
-        let event_sender = self.event_sender.clone();
-
-        // Clonar la conexión para usar en la tarea
-        let connection = self.connection.as_ref().unwrap().clone();
-
-        // Crear una tarea para recibir mensajes usando la misma conexión
-        let receiver_handle = tokio::spawn(async move {
-            loop {
-                match connection.receive().await {
-                    Ok(msg) => {
-                        if tx.send(msg).await.is_err() {
-                            break;
-                        }
-                    },
-                    Err(e) => {
-                        error!("Error receiving message: {}", e);
-                        break;
-                    }
-                }
-            }
-        });
-
-        // Tarea para procesar los mensajes recibidos
-        let process_handle = tokio::spawn(async move {
-            while let Some(msg) = rx.recv().await {
-                // Intentar parsearlo como un mensaje base
-                if let Ok(base_msg) = serde_json::from_str::<BaseMessage>(&msg) {
-                    match base_msg.message_type.as_str() {
-                        "FEED_DATA" => {
-                            if let Ok(data_msg) = serde_json::from_str::<FeedDataMessage<Vec<CompactData>>>(&msg) {
-                                let events = parse_compact_data(&data_msg.data);
-
-                                for event in events {
-                                    let symbol = match &event {
-                                        MarketEvent::Quote(e) => &e.event_symbol,
-                                        MarketEvent::Trade(e) => &e.event_symbol,
-                                        MarketEvent::Greeks(e) => &e.event_symbol,
-                                    };
-
-                                    // Enviarlo a los callbacks
-                                    if let Ok(callbacks) = callbacks.lock() {
-                                        if let Some(callback) = callbacks.get(symbol) {
-                                            callback(event.clone());
-                                        }
-                                    }
-
-                                    // Enviarlo al canal de eventos
-                                    if let Some(tx) = &event_sender {
-                                        if let Err(e) = tx.send(event.clone()).await {
-                                            error!("Failed to send event to channel: {}", e);
-                                        }
-                                    }
-                                }
-                            }
-                        },
-                        "ERROR" => {
-                            if let Ok(error_msg) = serde_json::from_str::<ErrorMessage>(&msg) {
-                                error!("Received error from server: {} - {}", 
-                               error_msg.error, error_msg.message);
-                            }
-                        },
-                        _ => {
-                            debug!("Received message of type: {}", base_msg.message_type);
-                        }
-                    }
-                }
-            }
-        });
-
-        // Combinar ambas tareas
-        let message_handle = tokio::spawn(async move {
-            tokio::select! {
-            _ = receiver_handle => debug!("Receiver task completed"),
-            _ = process_handle => debug!("Processor task completed"),
-        }
-        });
-
-        // Guardar el handle
-        self.message_handle = Some(message_handle);
-
-        Ok(())
     }
 }
