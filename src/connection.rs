@@ -37,6 +37,7 @@ use tracing::{debug, error};
 ///    meaning it yields `Message` objects read from a potentially TLS-secured
 ///    TCP stream wrapped in a WebSocket.
 ///
+#[derive(Debug)]
 pub struct WebSocketConnection {
     write: Arc<
         Mutex<futures_util::stream::SplitSink<WebSocketStream<MaybeTlsStream<TcpStream>>, Message>>,

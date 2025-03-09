@@ -15,6 +15,7 @@ use crate::messages::{
 
 use crate::parse_compact_data;
 use std::collections::{HashMap, HashSet};
+use std::fmt;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::mpsc::{self, Receiver, Sender};
@@ -32,7 +33,7 @@ const DEFAULT_KEEPALIVE_INTERVAL: u32 = 15;
 
 /// Default client version string.  This is used to identify the client
 /// software version to the server.
-const DEFAULT_CLIENT_VERSION: &str = "1.0.2-dxlink-0.1.2";
+const DEFAULT_CLIENT_VERSION: &str = "1.0.2-dxlink-0.1.3";
 
 /// The main communication channel identifier. This is likely used for
 /// primary message exchange between client and server.
@@ -52,6 +53,7 @@ pub type EventCallback = Box<dyn Fn(MarketEvent) + Send + Sync + 'static>;
 
 /// Represents the different types of responses that can be received.
 /// Each variant of the enum carries specific data related to the response type:
+#[derive(Debug)]
 enum ResponseType {
     /// Indicates a channel has been opened. The `u32` value represents the channel identifier.
     ChannelOpened(u32),
@@ -69,6 +71,7 @@ enum ResponseType {
 /// Represents a request for a specific response from a WebSocket stream.  This struct is used to await a particular
 /// response type, optionally filtered by channel ID.  It includes a `oneshot::Sender` to send the
 /// response back to the requester.
+#[derive(Debug)]
 struct ResponseRequest {
     /// The expected type of the response message (e.g., "CHANNEL_OPENED", "FEED_CONFIG", etc.).  This string should match the expected
     /// response message type.
@@ -983,6 +986,90 @@ impl DXLinkClient {
                 channel_id
             ))),
         }
+    }
+}
+
+impl fmt::Debug for DXLinkClient {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let mut debug_struct = f.debug_struct("DXLinkClient");
+
+        debug_struct.field("url", &self.url);
+        debug_struct.field("has_token", &(!self.token.is_empty()));
+        debug_struct.field("connected", &self.connection.is_some());
+        debug_struct.field("keepalive_timeout", &self.keepalive_timeout);
+        let channel_count = if let Ok(channels) = self.channels.lock() {
+            channels.len()
+        } else {
+            0
+        };
+        debug_struct.field("channel_count", &channel_count);
+
+        let callback_count = if let Ok(callbacks) = self.callbacks.lock() {
+            callbacks.len()
+        } else {
+            0
+        };
+        debug_struct.field("callback_count", &callback_count);
+
+        let subscription_count = if let Ok(subscriptions) = self.subscriptions.lock() {
+            subscriptions.len()
+        } else {
+            0
+        };
+        debug_struct.field("subscription_count", &subscription_count);
+        debug_struct.field("has_event_sender", &self.event_sender.is_some());
+        debug_struct.field("keepalive_active", &self.keepalive_handle.is_some());
+        debug_struct.field("message_handler_active", &self.message_handle.is_some());
+
+        let pending_responses = if let Ok(requests) = self.response_requests.lock() {
+            requests.len()
+        } else {
+            0
+        };
+        debug_struct.field("pending_responses", &pending_responses);
+        debug_struct.finish()
+    }
+}
+
+impl fmt::Display for DXLinkClient {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // Start with basic connection information
+        write!(
+            f,
+            "DXLink Client [{}]",
+            if self.connection.is_some() {
+                "Connected"
+            } else {
+                "Disconnected"
+            }
+        )?;
+
+        // Show server URL
+        write!(f, " to {}", self.url)?;
+
+        // Add summary of active channels and subscriptions
+        let channel_count = self.channels.lock().map(|c| c.len()).unwrap_or(0);
+        let subscription_count = self.subscriptions.lock().map(|s| s.len()).unwrap_or(0);
+
+        // Display active resources
+        write!(
+            f,
+            " | Channels: {}, Subscriptions: {}",
+            channel_count, subscription_count
+        )?;
+
+        // Show active tasks status
+        let tasks_status = match (
+            self.message_handle.is_some(),
+            self.keepalive_handle.is_some(),
+        ) {
+            (true, true) => "All tasks running",
+            (true, false) => "Message handler only",
+            (false, true) => "Keepalive only",
+            (false, false) => "No tasks running",
+        };
+
+        write!(f, " | {}", tasks_status)
     }
 }
 
