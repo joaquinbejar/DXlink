@@ -14,7 +14,7 @@ This enum represents various error conditions that might arise during communicat
 #[derive(Debug)]
 pub enum DXLinkError {
     /// Represents an error originating from the underlying WebSocket connection.
-    WebSocket(tokio_tungstenite::tungstenite::Error),
+    WebSocket(Box<tokio_tungstenite::tungstenite::Error>),
     /// Represents an error that occurred during serialization or deserialization of JSON data.
     Serialization(serde_json::Error),
     /// Represents an authentication failure, such as invalid credentials.
@@ -53,7 +53,7 @@ impl Error for DXLinkError {}
 
 impl From<tokio_tungstenite::tungstenite::Error> for DXLinkError {
     fn from(e: tokio_tungstenite::tungstenite::Error) -> Self {
-        DXLinkError::WebSocket(e)
+        DXLinkError::WebSocket(Box::new(e))
     }
 }
 
@@ -91,7 +91,7 @@ mod tests {
     fn test_error_display() {
         // Test WebSocket error display
         let ws_error = tungstenite::Error::ConnectionClosed;
-        let error = DXLinkError::WebSocket(ws_error);
+        let error = DXLinkError::WebSocket(Box::new(ws_error));
         assert!(format!("{}", error).starts_with("WebSocket error:"));
 
         // Test Serialization error display
@@ -135,7 +135,7 @@ mod tests {
         fn assert_error<T: StdError>(_: T) {}
 
         let ws_error = tungstenite::Error::ConnectionClosed;
-        assert_error(DXLinkError::WebSocket(ws_error));
+        assert_error(DXLinkError::WebSocket(Box::new(ws_error)));
 
         let ser_error = serde_json::from_str::<serde_json::Value>("invalid json").unwrap_err();
         assert_error(DXLinkError::Serialization(ser_error));

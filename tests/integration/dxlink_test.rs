@@ -179,8 +179,8 @@ mod mock_server {
                                                         },
                                                         "FEED_SUBSCRIPTION" => {
                                                             // This is the critical message we need to handle properly
-                                                            if let Some(add) = value.get("add") {
-                                                                if let Some(subscriptions) = add.as_array() {
+                                                            if let Some(add) = value.get("add")
+                                                                && let Some(subscriptions) = add.as_array() {
                                                                     for sub in subscriptions {
                                                                         let event_type = sub["type"].as_str().unwrap_or("");
                                                                         let symbol = sub["symbol"].as_str().unwrap_or("");
@@ -224,7 +224,6 @@ mod mock_server {
                                                                         }
                                                                     }
                                                                 }
-                                                            }
                                                         },
                                                         "CHANNEL_CANCEL" => {
                                                             // Remove this channel from tracked sinks

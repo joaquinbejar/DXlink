@@ -92,38 +92,38 @@ struct ResponseRequest {
 /// * `url`: The URL of the DXLink WebSocket server.
 /// * `token`: The authentication token for accessing the DXLink service.
 /// * `connection`: The active WebSocket connection, if established.  This is represented
-///    as an `Option<WebSocketConnection>`, where `None` indicates no active connection.
+///   as an `Option<WebSocketConnection>`, where `None` indicates no active connection.
 /// * `keepalive_timeout`: The timeout for keepalive messages in seconds.
 /// * `next_channel_id`: A thread-safe counter for generating unique channel IDs.  It's
-///    wrapped in an `Arc<Mutex>` to allow shared access across multiple threads.
+///   wrapped in an `Arc<Mutex>` to allow shared access across multiple threads.
 /// * `channels`: A thread-safe map that stores the association between channel IDs and
-///    the services they are subscribed to.  This is also wrapped in an `Arc<Mutex>`
-///    for thread safety.
+///   the services they are subscribed to.  This is also wrapped in an `Arc<Mutex>`
+///   for thread safety.
 /// * `callbacks`: A thread-safe map that stores callback functions associated with
-///    specific market data symbols.  The callbacks are of type `EventCallback`,
-///    which are functions that process incoming `MarketEvent` data.  An `Arc<Mutex>`
-///    is used for thread safety.
+///   specific market data symbols.  The callbacks are of type `EventCallback`,
+///   which are functions that process incoming `MarketEvent` data.  An `Arc<Mutex>`
+///   is used for thread safety.
 /// * `subscriptions`: A thread-safe set that keeps track of active subscriptions,
-///    identified by pairs of `EventType` and the corresponding market data symbol.
-///    This ensures that duplicate subscriptions are avoided and allows for efficient
-///    management of subscriptions.  It uses `Arc<Mutex>` for thread safety.
+///   identified by pairs of `EventType` and the corresponding market data symbol.
+///   This ensures that duplicate subscriptions are avoided and allows for efficient
+///   management of subscriptions.  It uses `Arc<Mutex>` for thread safety.
 /// * `event_sender`: A sender for transmitting `MarketEvent` instances.  This is
-///    optional (`Option<Sender<MarketEvent>>`) and is used to relay events to
-///    internal processing or external consumers.
+///   optional (`Option<Sender<MarketEvent>>`) and is used to relay events to
+///   internal processing or external consumers.
 /// * `keepalive_handle`: A handle to the keepalive task.  The keepalive task
-///    periodically sends messages to the server to maintain the connection.
-///    This is an `Option<JoinHandle<()>>` which represents a potentially running
-///    background task.
+///   periodically sends messages to the server to maintain the connection.
+///   This is an `Option<JoinHandle<()>>` which represents a potentially running
+///   background task.
 /// * `message_handle`: A handle to the message processing task. The message
-///    processing task is responsible for receiving and handling incoming WebSocket
-///    messages.  This is stored as an `Option<JoinHandle<()>>` to manage the
-///    background task's lifecycle.
+///   processing task is responsible for receiving and handling incoming WebSocket
+///   messages.  This is stored as an `Option<JoinHandle<()>>` to manage the
+///   background task's lifecycle.
 /// * `keepalive_sender`:  A channel sender used to signal the keepalive task.
-///    This is of type `Option<Sender<()>>`, which may be used to control
-///    or stop the keepalive task.
+///   This is of type `Option<Sender<()>>`, which may be used to control
+///   or stop the keepalive task.
 /// * `response_requests`: A thread-safe vector that holds pending response requests.
-///    This is used to manage asynchronous responses from the server and is wrapped
-///    in an `Arc<Mutex>` for thread safety.
+///   This is used to manage asynchronous responses from the server and is wrapped
+///   in an `Arc<Mutex>` for thread safety.
 pub struct DXLinkClient {
     /// The URL of the DXLink WebSocket server.
     url: String,
@@ -504,20 +504,17 @@ impl DXLinkClient {
                                             };
 
                                             // Enviarlo a los callbacks
-                                            if let Ok(callbacks) = callbacks.lock() {
-                                                if let Some(callback) = callbacks.get(symbol) {
-                                                    callback(event.clone());
-                                                }
+                                            if let Ok(callbacks) = callbacks.lock()
+                                                && let Some(callback) = callbacks.get(symbol)
+                                            {
+                                                callback(event.clone());
                                             }
 
                                             // Enviarlo al canal de eventos
-                                            if let Some(tx) = &event_sender {
-                                                if let Err(e) = tx.send(event.clone()).await {
-                                                    error!(
-                                                        "Failed to send event to channel: {}",
-                                                        e
-                                                    );
-                                                }
+                                            if let Some(tx) = &event_sender
+                                                && let Err(e) = tx.send(event.clone()).await
+                                            {
+                                                error!("Failed to send event to channel: {}", e);
                                             }
                                         }
                                     }

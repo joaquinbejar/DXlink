@@ -194,8 +194,8 @@ mod mock_server {
                                                             info!("Received FEED_SUBSCRIPTION: channel={}, content={}",
                                                                 channel_id, value.to_string());
 
-                                                            if let Some(add) = value.get("add") {
-                                                                if let Some(subscriptions) = add.as_array() {
+                                                            if let Some(add) = value.get("add")
+                                                                && let Some(subscriptions) = add.as_array() {
                                                                     for sub in subscriptions {
                                                                         let event_type = sub["type"].as_str().unwrap_or("");
                                                                         let symbol = sub["symbol"].as_str().unwrap_or("");
@@ -260,7 +260,6 @@ mod mock_server {
                                                                         }
                                                                     }
                                                                 }
-                                                            }
                                                         },
                                                         "CHANNEL_CANCEL" => {
                                                             // Remove this channel from tracked sinks
@@ -319,10 +318,10 @@ mod mock_server {
                 );
 
                 // Special debug for subscription-related messages
-                if let Some(msg_type) = msg.get("type") {
-                    if msg_type == "FEED_SUBSCRIPTION" {
-                        info!("  Subscription details: {:?}", msg);
-                    }
+                if let Some(msg_type) = msg.get("type")
+                    && msg_type == "FEED_SUBSCRIPTION"
+                {
+                    info!("  Subscription details: {:?}", msg);
                 }
             }
 
@@ -499,17 +498,16 @@ async fn test_subscribe_and_receive_events() {
         );
         // Print all channel messages
         for msg in messages.iter() {
-            if let Some(ch) = msg.get("channel") {
-                if let Some(ch_id) = ch.as_u64() {
-                    if ch_id == channel_id as u64 {
-                        info!(
-                            "Message for channel {}: type={}",
-                            channel_id,
-                            msg.get("type")
-                                .map_or("unknown", |v| v.as_str().unwrap_or("unknown"))
-                        );
-                    }
-                }
+            if let Some(ch) = msg.get("channel")
+                && let Some(ch_id) = ch.as_u64()
+                && ch_id == channel_id as u64
+            {
+                info!(
+                    "Message for channel {}: type={}",
+                    channel_id,
+                    msg.get("type")
+                        .map_or("unknown", |v| v.as_str().unwrap_or("unknown"))
+                );
             }
         }
     } else {
@@ -626,10 +624,10 @@ async fn test_unsubscribe() {
         info!("WARNING: Can't find unsubscribe message");
         // Print all feed subscription messages
         for msg in messages.iter() {
-            if let Some(msg_type) = msg.get("type") {
-                if msg_type.as_str().unwrap_or("") == "FEED_SUBSCRIPTION" {
-                    info!("FEED_SUBSCRIPTION message: {:?}", msg);
-                }
+            if let Some(msg_type) = msg.get("type")
+                && msg_type.as_str().unwrap_or("") == "FEED_SUBSCRIPTION"
+            {
+                info!("FEED_SUBSCRIPTION message: {:?}", msg);
             }
         }
     }
@@ -665,10 +663,10 @@ async fn test_unsubscribe() {
         info!("WARNING: Can't find reset message");
         // Print subscription messages
         for msg in messages.iter() {
-            if let Some(msg_type) = msg.get("type") {
-                if msg_type.as_str().unwrap_or("") == "FEED_SUBSCRIPTION" {
-                    info!("FEED_SUBSCRIPTION message: {:?}", msg);
-                }
+            if let Some(msg_type) = msg.get("type")
+                && msg_type.as_str().unwrap_or("") == "FEED_SUBSCRIPTION"
+            {
+                info!("FEED_SUBSCRIPTION message: {:?}", msg);
             }
         }
     }
@@ -734,21 +732,21 @@ async fn test_historical_data() {
 
     // Print all relevant messages for debugging
     for msg in messages.iter() {
-        if let Some(msg_type) = msg.get("type") {
-            if msg_type.as_str().unwrap_or("") == "FEED_SUBSCRIPTION" {
-                info!("Found FEED_SUBSCRIPTION: {:?}", msg);
+        if let Some(msg_type) = msg.get("type")
+            && msg_type.as_str().unwrap_or("") == "FEED_SUBSCRIPTION"
+        {
+            info!("Found FEED_SUBSCRIPTION: {:?}", msg);
 
-                if let Some(add) = msg.get("add") {
-                    if let Some(add_array) = add.as_array() {
-                        for (i, sub) in add_array.iter().enumerate() {
-                            info!("  Subscription {}: {:?}", i, sub);
+            if let Some(add) = msg.get("add")
+                && let Some(add_array) = add.as_array()
+            {
+                for (i, sub) in add_array.iter().enumerate() {
+                    info!("  Subscription {}: {:?}", i, sub);
 
-                            if let Some(from_time) = sub.get("fromTime") {
-                                info!("  Has fromTime: {}", from_time);
-                            } else {
-                                info!("  No fromTime found");
-                            }
-                        }
+                    if let Some(from_time) = sub.get("fromTime") {
+                        info!("  Has fromTime: {}", from_time);
+                    } else {
+                        info!("  No fromTime found");
                     }
                 }
             }
@@ -767,14 +765,14 @@ async fn test_historical_data() {
                     return false;
                 }
 
-                if let Some(add) = m.get("add") {
-                    if let Some(add_array) = add.as_array() {
-                        for sub in add_array {
-                            if let Some(from_time) = sub.get("fromTime") {
-                                if from_time.as_i64() == Some(timestamp) {
-                                    return true;
-                                }
-                            }
+                if let Some(add) = m.get("add")
+                    && let Some(add_array) = add.as_array()
+                {
+                    for sub in add_array {
+                        if let Some(from_time) = sub.get("fromTime")
+                            && from_time.as_i64() == Some(timestamp)
+                        {
+                            return true;
                         }
                     }
                 }

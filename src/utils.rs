@@ -62,105 +62,105 @@ pub fn parse_compact_data(data: &[CompactData]) -> Vec<MarketEvent> {
     while i < data.len() {
         if let CompactData::EventType(event_type) = &data[i] {
             i += 1;
-            if i < data.len() {
-                if let CompactData::Values(values) = &data[i] {
-                    match event_type.as_str() {
-                        "Quote" => {
-                            let mut j = 0;
-                            while j + 5 < values.len() {
-                                if let (
-                                    Some(symbol),
-                                    Some(_), // event_type
-                                    Some(bid_price),
-                                    Some(ask_price),
-                                    Some(bid_size),
-                                    Some(ask_size),
-                                ) = (
-                                    values.get(j).and_then(|v| v.as_str()),
-                                    values.get(j + 1).and_then(|v| v.as_str()),
-                                    values.get(j + 2).and_then(|v| v.as_f64()),
-                                    values.get(j + 3).and_then(|v| v.as_f64()),
-                                    values.get(j + 4).and_then(|v| v.as_f64()),
-                                    values.get(j + 5).and_then(|v| v.as_f64()),
-                                ) {
-                                    events.push(MarketEvent::Quote(QuoteEvent {
-                                        event_type: "Quote".to_string(),
-                                        event_symbol: symbol.to_string(),
-                                        bid_price,
-                                        ask_price,
-                                        bid_size,
-                                        ask_size,
-                                    }));
-                                }
-                                j += 6;
+            if i < data.len()
+                && let CompactData::Values(values) = &data[i]
+            {
+                match event_type.as_str() {
+                    "Quote" => {
+                        let mut j = 0;
+                        while j + 5 < values.len() {
+                            if let (
+                                Some(symbol),
+                                Some(_), // event_type
+                                Some(bid_price),
+                                Some(ask_price),
+                                Some(bid_size),
+                                Some(ask_size),
+                            ) = (
+                                values.get(j).and_then(|v| v.as_str()),
+                                values.get(j + 1).and_then(|v| v.as_str()),
+                                values.get(j + 2).and_then(|v| v.as_f64()),
+                                values.get(j + 3).and_then(|v| v.as_f64()),
+                                values.get(j + 4).and_then(|v| v.as_f64()),
+                                values.get(j + 5).and_then(|v| v.as_f64()),
+                            ) {
+                                events.push(MarketEvent::Quote(QuoteEvent {
+                                    event_type: "Quote".to_string(),
+                                    event_symbol: symbol.to_string(),
+                                    bid_price,
+                                    ask_price,
+                                    bid_size,
+                                    ask_size,
+                                }));
                             }
+                            j += 6;
                         }
-                        "Trade" => {
-                            // Parsear valores de Trade
-                            let mut j = 0;
-                            while j + 4 < values.len() {
-                                if let (
-                                    Some(symbol),
-                                    Some(_), // event_type
-                                    Some(price),
-                                    Some(size),
-                                    Some(day_volume),
-                                ) = (
-                                    values.get(j).and_then(|v| v.as_str()),
-                                    values.get(j + 1).and_then(|v| v.as_str()),
-                                    values.get(j + 2).and_then(|v| v.as_f64()),
-                                    values.get(j + 3).and_then(|v| v.as_f64()),
-                                    values.get(j + 4).and_then(|v| v.as_f64()),
-                                ) {
-                                    events.push(MarketEvent::Trade(TradeEvent {
-                                        event_type: "Trade".to_string(),
-                                        event_symbol: symbol.to_string(),
-                                        price,
-                                        size,
-                                        day_volume,
-                                    }));
-                                }
-                                j += 5;
-                            }
-                        }
-                        "Greeks" => {
-                            let mut j = 0;
-                            while j + 7 < values.len() {
-                                if let (
-                                    Some(symbol),
-                                    Some(_), // event_type
-                                    Some(delta),
-                                    Some(gamma),
-                                    Some(theta),
-                                    Some(vega),
-                                    Some(rho),
-                                    Some(volatility),
-                                ) = (
-                                    values.get(j).and_then(|v| v.as_str()),
-                                    values.get(j + 1).and_then(|v| v.as_str()),
-                                    values.get(j + 2).and_then(|v| v.as_f64()),
-                                    values.get(j + 3).and_then(|v| v.as_f64()),
-                                    values.get(j + 4).and_then(|v| v.as_f64()),
-                                    values.get(j + 5).and_then(|v| v.as_f64()),
-                                    values.get(j + 6).and_then(|v| v.as_f64()),
-                                    values.get(j + 7).and_then(|v| v.as_f64()),
-                                ) {
-                                    events.push(MarketEvent::Greeks(GreeksEvent {
-                                        event_type: "Greeks".to_string(),
-                                        event_symbol: symbol.to_string(),
-                                        delta,
-                                        gamma,
-                                        theta,
-                                        vega,
-                                        rho,
-                                        volatility,
-                                    }));
-                                }
-                                j += 8;
-                            }
-                        }
-                        _ => {}
                     }
+                    "Trade" => {
+                        // Parsear valores de Trade
+                        let mut j = 0;
+                        while j + 4 < values.len() {
+                            if let (
+                                Some(symbol),
+                                Some(_), // event_type
+                                Some(price),
+                                Some(size),
+                                Some(day_volume),
+                            ) = (
+                                values.get(j).and_then(|v| v.as_str()),
+                                values.get(j + 1).and_then(|v| v.as_str()),
+                                values.get(j + 2).and_then(|v| v.as_f64()),
+                                values.get(j + 3).and_then(|v| v.as_f64()),
+                                values.get(j + 4).and_then(|v| v.as_f64()),
+                            ) {
+                                events.push(MarketEvent::Trade(TradeEvent {
+                                    event_type: "Trade".to_string(),
+                                    event_symbol: symbol.to_string(),
+                                    price,
+                                    size,
+                                    day_volume,
+                                }));
+                            }
+                            j += 5;
+                        }
+                    }
+                    "Greeks" => {
+                        let mut j = 0;
+                        while j + 7 < values.len() {
+                            if let (
+                                Some(symbol),
+                                Some(_), // event_type
+                                Some(delta),
+                                Some(gamma),
+                                Some(theta),
+                                Some(vega),
+                                Some(rho),
+                                Some(volatility),
+                            ) = (
+                                values.get(j).and_then(|v| v.as_str()),
+                                values.get(j + 1).and_then(|v| v.as_str()),
+                                values.get(j + 2).and_then(|v| v.as_f64()),
+                                values.get(j + 3).and_then(|v| v.as_f64()),
+                                values.get(j + 4).and_then(|v| v.as_f64()),
+                                values.get(j + 5).and_then(|v| v.as_f64()),
+                                values.get(j + 6).and_then(|v| v.as_f64()),
+                                values.get(j + 7).and_then(|v| v.as_f64()),
+                            ) {
+                                events.push(MarketEvent::Greeks(GreeksEvent {
+                                    event_type: "Greeks".to_string(),
+                                    event_symbol: symbol.to_string(),
+                                    delta,
+                                    gamma,
+                                    theta,
+                                    vega,
+                                    rho,
+                                    volatility,
+                                }));
+                            }
+                            j += 8;
+                        }
+                    }
+                    _ => {}
                 }
             }
         }
