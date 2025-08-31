@@ -1,4 +1,5 @@
 use dxlink::{DXLinkClient, EventType, FeedSubscription, MarketEvent};
+use std::env;
 use std::error::Error;
 use std::time::Duration;
 use tokio::time::sleep;
@@ -11,11 +12,17 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     info!("Starting DXLink client...");
 
-    // DXFeed demo server
-    let url = "wss://demo.dxfeed.com/dxlink-ws";
-    let token = "";
+    // Get configuration from environment variables
+    let url =
+        env::var("DXLINK_WS_URL").unwrap_or_else(|_| "wss://demo.dxfeed.com/dxlink-ws".to_string());
+    let token = env::var("DXLINK_API_TOKEN").unwrap_or_else(|_| String::new());
 
-    let mut client = DXLinkClient::new(url, token);
+    info!("Using DXLink URL: {}", url);
+    if token.is_empty() {
+        info!("No API token provided - using demo mode");
+    }
+
+    let mut client = DXLinkClient::new(&url, &token);
 
     info!("Connecting to DXLink server...");
     client.connect().await?;
