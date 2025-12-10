@@ -228,7 +228,7 @@ impl DXLinkClient {
     /// # Ok(())
     /// # }
     /// ```
-    pub async fn connect(&mut self) -> DXLinkResult<()> {
+    pub async fn connect(&mut self) -> DXLinkResult<Receiver<MarketEvent>> {
         // Connect to WebSocket
         let connection = WebSocketConnection::connect(&self.url).await?;
 
@@ -287,13 +287,15 @@ impl DXLinkClient {
 
         self.connection = Some(connection);
 
+        let receiver = self.event_stream();
+
         // Start message processing task first so it puede capturar todos los mensajes
         self.start_message_processing()?;
 
         // Start keepalive task with a channel
         self.start_keepalive()?;
 
-        Ok(())
+        receiver
     }
 
     /// Waits for a specific response type from the DXLink device, optionally filtered by channel ID.
