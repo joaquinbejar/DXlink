@@ -14,7 +14,7 @@ async fn test_integration_with_real_server() {
 
     let mut client = DXLinkClient::new(url, &token);
 
-    client
+    let mut event_stream = client
         .connect()
         .await
         .expect("Fallo al conectar al servidor");
@@ -40,10 +40,6 @@ async fn test_integration_with_real_server() {
 
     let event_counter = Arc::new(Mutex::new(0));
     let event_counter_clone = event_counter.clone();
-
-    let mut event_stream = client
-        .event_stream()
-        .expect("Fallo al obtener stream de eventos");
 
     let stream_task = tokio::spawn(async move {
         info!("Iniciando procesamiento de stream de eventos");

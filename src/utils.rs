@@ -37,8 +37,8 @@ use crate::events::{CompactData, GreeksEvent, QuoteEvent, TradeEvent};
 /// let data = vec![
 ///     CompactData::EventType("Quote".to_string()),
 ///     CompactData::Values(vec![
-///         Value::from("AAPL"),
 ///         Value::from("Quote"),
+///         Value::from("AAPL"),
 ///         Value::from(150.25),
 ///         Value::from(150.35),
 ///         Value::from(1000.0),
@@ -188,8 +188,8 @@ mod tests {
         let data = vec![
             CompactData::EventType("Quote".to_string()),
             CompactData::Values(vec![
-                json!("AAPL"),  // symbol
                 json!("Quote"), // event_type
+                json!("AAPL"),  // symbol
                 json!(150.25),  // bid_price
                 json!(150.50),  // ask_price
                 json!(100.0),   // bid_size
@@ -219,15 +219,15 @@ mod tests {
             CompactData::EventType("Quote".to_string()),
             CompactData::Values(vec![
                 // Primer Quote
-                json!("AAPL"),  // symbol
                 json!("Quote"), // event_type
+                json!("AAPL"),  // symbol
                 json!(150.25),  // bid_price
                 json!(150.50),  // ask_price
                 json!(100.0),   // bid_size
                 json!(150.0),   // ask_size
                 // Segundo Quote
-                json!("MSFT"),  // symbol
                 json!("Quote"), // event_type
+                json!("MSFT"),  // symbol
                 json!(280.75),  // bid_price
                 json!(281.00),  // ask_price
                 json!(80.0),    // bid_size
@@ -268,8 +268,8 @@ mod tests {
         let data = vec![
             CompactData::EventType("Trade".to_string()),
             CompactData::Values(vec![
-                json!("MSFT"),    // symbol
                 json!("Trade"),   // event_type
+                json!("MSFT"),    // symbol
                 json!(280.75),    // price
                 json!(50.0),      // size
                 json!(5000000.0), // day_volume
@@ -297,14 +297,14 @@ mod tests {
             CompactData::EventType("Trade".to_string()),
             CompactData::Values(vec![
                 // Primer Trade
-                json!("MSFT"),    // symbol
                 json!("Trade"),   // event_type
+                json!("MSFT"),    // symbol
                 json!(280.75),    // price
                 json!(50.0),      // size
                 json!(5000000.0), // day_volume
                 // Segundo Trade
-                json!("AAPL"),    // symbol
                 json!("Trade"),   // event_type
+                json!("AAPL"),    // symbol
                 json!(150.25),    // price
                 json!(100.0),     // size
                 json!(8000000.0), // day_volume
@@ -344,8 +344,8 @@ mod tests {
         let data = vec![
             CompactData::EventType("Greeks".to_string()),
             CompactData::Values(vec![
-                json!("AAPL230519C00160000"), // symbol
                 json!("Greeks"),              // event_type
+                json!("AAPL230519C00160000"), // symbol
                 json!(0.65),                  // delta
                 json!(0.05),                  // gamma
                 json!(-0.15),                 // theta

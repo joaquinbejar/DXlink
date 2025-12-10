@@ -301,6 +301,7 @@ async fn test_connect_and_authenticate() {
     // Connect to server
     let result = client.connect().await;
     assert!(result.is_ok(), "Failed to connect: {:?}", result);
+    let _event_stream = result.unwrap();
 
     // Check that the server received the expected messages
     let messages = server.get_received_messages();
@@ -331,7 +332,7 @@ async fn test_create_and_setup_feed() {
 
     // Create and connect client
     let mut client = DXLinkClient::new(&url, "test-token");
-    client.connect().await.unwrap();
+    let _event_stream = client.connect().await.unwrap();
 
     // Create feed channel
     let channel_id = client.create_feed_channel("AUTO").await;
@@ -375,7 +376,7 @@ async fn test_close_channel() {
 
     // Create and connect client
     let mut client = DXLinkClient::new(&url, "test-token");
-    client.connect().await.unwrap();
+    let _event_stream = client.connect().await.unwrap();
 
     // Create feed channel
     let channel_id = client.create_feed_channel("AUTO").await.unwrap();
@@ -405,7 +406,7 @@ async fn test_error_non_existent_channel() {
 
     // Create and connect client
     let mut client = DXLinkClient::new(&url, "test-token");
-    client.connect().await.unwrap();
+    let _event_stream = client.connect().await.unwrap();
 
     // Try to use a channel that doesn't exist
     let result = client.setup_feed(999, &[EventType::Quote]).await;
@@ -431,7 +432,7 @@ async fn test_keepalive() {
 
     // Create and connect client
     let mut client = DXLinkClient::new(&url, "test-token");
-    client.connect().await.unwrap();
+    let _event_stream = client.connect().await.unwrap();
 
     // Wait for keepalive to be sent (adjust time based on keepalive interval)
     sleep(Duration::from_secs(20)).await;

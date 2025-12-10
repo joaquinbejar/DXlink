@@ -25,7 +25,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let mut client = DXLinkClient::new(&url, &token);
 
     info!("Connecting to DXLink server...");
-    client.connect().await?;
+    let mut event_stream = client.connect().await?;
     info!("Connection successful!");
 
     // Create channel for feed
@@ -44,9 +44,6 @@ async fn main() -> Result<(), Box<dyn Error>> {
     client.on_event("AAPL", |event| {
         info!("AAPL event received: {:?}", event);
     });
-
-    // Get stream for all events
-    let mut event_stream = client.event_stream()?;
 
     // Process events in a separate task
     tokio::spawn(async move {

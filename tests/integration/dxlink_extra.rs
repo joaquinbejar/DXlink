@@ -356,7 +356,7 @@ async fn test_subscribe_and_receive_events() {
 
     // Create and connect client
     let mut client = DXLinkClient::new(&url, "test-token");
-    client.connect().await.unwrap();
+    let mut event_stream = client.connect().await.unwrap();
     info!("Client connected");
 
     // Create feed channel
@@ -389,9 +389,6 @@ async fn test_subscribe_and_receive_events() {
             _ => {}
         }
     });
-
-    // Get stream for all events
-    let mut event_stream = client.event_stream().unwrap();
 
     // Process events in a separate task, but with a timeout
     let stream_counter = Arc::new(Mutex::new(HashMap::<String, i32>::new()));
@@ -552,7 +549,7 @@ async fn test_unsubscribe() {
 
     // Create and connect client
     let mut client = DXLinkClient::new(&url, "test-token");
-    client.connect().await.unwrap();
+    let _event_stream = client.connect().await.unwrap();
     info!("Client connected");
 
     // Create feed channel
@@ -688,7 +685,7 @@ async fn test_historical_data() {
 
     // Create and connect client
     let mut client = DXLinkClient::new(&url, "test-token");
-    client.connect().await.unwrap();
+    let _event_stream = client.connect().await.unwrap();
     info!("Client connected");
 
     // Create feed channel
