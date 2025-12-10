@@ -70,8 +70,8 @@ pub fn parse_compact_data(data: &[CompactData]) -> Vec<MarketEvent> {
                         let mut j = 0;
                         while j + 5 < values.len() {
                             if let (
-                                Some(symbol),
                                 Some(_), // event_type
+                                Some(symbol),
                                 Some(bid_price),
                                 Some(ask_price),
                                 Some(bid_size),
@@ -101,8 +101,8 @@ pub fn parse_compact_data(data: &[CompactData]) -> Vec<MarketEvent> {
                         let mut j = 0;
                         while j + 4 < values.len() {
                             if let (
-                                Some(symbol),
                                 Some(_), // event_type
+                                Some(symbol),
                                 Some(price),
                                 Some(size),
                                 Some(day_volume),
@@ -128,8 +128,8 @@ pub fn parse_compact_data(data: &[CompactData]) -> Vec<MarketEvent> {
                         let mut j = 0;
                         while j + 7 < values.len() {
                             if let (
-                                Some(symbol),
                                 Some(_), // event_type
+                                Some(symbol),
                                 Some(delta),
                                 Some(gamma),
                                 Some(theta),
