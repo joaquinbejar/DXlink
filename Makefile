@@ -1,8 +1,6 @@
 # Makefile for common tasks in a Rust project
 # Detect current branch
 CURRENT_BRANCH := $(shell git rev-parse --abbrev-ref HEAD)
-ZIP_NAME = OptionStratLib.zip
-
 
 # Default target
 .PHONY: all
