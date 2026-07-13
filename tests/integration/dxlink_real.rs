@@ -6,6 +6,7 @@ use tokio::time::{sleep, timeout};
 use tracing::info;
 
 #[tokio::test]
+#[ignore] // Requires network access to the external DXFeed demo server
 async fn test_integration_with_real_server() {
     let token = env::var("DXLINK_API_TOKEN").unwrap_or_else(|_| String::new());
     let url = "wss://demo.dxfeed.com/dxlink-ws";

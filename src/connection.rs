@@ -17,6 +17,47 @@ use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::{WebSocketStream, connect_async};
 use tracing::{debug, error};
 
+/// Placeholder written in place of credential values when logging outbound messages.
+const REDACTED_PLACEHOLDER: &str = "<redacted>";
+
+/// Returns a copy of a serialized message that is safe to log.
+///
+/// Credential-bearing fields (any field named `token`, at any nesting level)
+/// are replaced with [`REDACTED_PLACEHOLDER`] so that secrets such as the
+/// DXLink auth token never reach the logs. If the payload cannot be parsed
+/// back as JSON, the whole payload is withheld from the log rather than
+/// risking a credential leak.
+fn redact_sensitive(json: &str) -> String {
+    match serde_json::from_str::<serde_json::Value>(json) {
+        Ok(mut value) => {
+            redact_value(&mut value);
+            value.to_string()
+        }
+        Err(_) => REDACTED_PLACEHOLDER.to_string(),
+    }
+}
+
+/// Recursively masks the values of credential-bearing fields in a JSON value.
+fn redact_value(value: &mut serde_json::Value) {
+    match value {
+        serde_json::Value::Object(map) => {
+            for (key, field) in map.iter_mut() {
+                if key.eq_ignore_ascii_case("token") {
+                    *field = serde_json::Value::String(REDACTED_PLACEHOLDER.to_string());
+                } else {
+                    redact_value(field);
+                }
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for item in items.iter_mut() {
+                redact_value(item);
+            }
+        }
+        _ => {}
+    }
+}
+
 /// Represents a WebSocket connection.
 ///
 /// This struct holds the read and write components of a WebSocket connection,
@@ -85,6 +126,10 @@ impl WebSocketConnection {
     /// This function serializes the given message into a JSON string and sends it over the WebSocket connection.
     /// It acquires a lock on the write portion of the connection before sending the message.
     ///
+    /// The debug log emitted by this function redacts credential-bearing fields
+    /// (such as the `token` of an auth message), so enabling `debug`-level
+    /// logging never leaks secrets.
+    ///
     /// # Arguments
     ///
     /// * `message` - A reference to the message to be sent.  The message must implement the `Serialize` trait from the `serde` crate.
@@ -96,7 +141,7 @@ impl WebSocketConnection {
     ///
     pub async fn send<T: Serialize>(&self, message: &T) -> DXLinkResult<()> {
         let json = serde_json::to_string(message)?;
-        debug!("Sending message: {}", json);
+        debug!("Sending message: {}", redact_sensitive(&json));
 
         let mut write = self.write.lock().await;
         write.send(Message::Text(json.into())).await?;
@@ -239,6 +284,139 @@ impl KeepAliveSender {
             message_type: "KEEPALIVE".to_string(),
         };
         self.connection.send(&keepalive_msg).await
+    }
+}
+
+#[cfg(test)]
+mod redaction_tests {
+    use super::*;
+    use crate::messages::{AuthMessage, KeepaliveMessage};
+    use futures_util::StreamExt;
+    use std::sync::Arc;
+    use tracing_subscriber::fmt::MakeWriter;
+    use warp::Filter;
+
+    #[test]
+    fn test_redact_sensitive_masks_auth_token() {
+        let auth_msg = AuthMessage {
+            channel: 0,
+            message_type: "AUTH".to_string(),
+            token: "super-secret-token".to_string(),
+        };
+        let json = serde_json::to_string(&auth_msg).unwrap();
+
+        let redacted = redact_sensitive(&json);
+
+        assert!(!redacted.contains("super-secret-token"));
+        let value: serde_json::Value = serde_json::from_str(&redacted).unwrap();
+        assert_eq!(value["token"], REDACTED_PLACEHOLDER);
+        assert_eq!(value["type"], "AUTH");
+        assert_eq!(value["channel"], 0);
+    }
+
+    #[test]
+    fn test_redact_sensitive_masks_nested_tokens() {
+        let json =
+            r#"{"outer":{"token":"secret-a"},"list":[{"Token":"secret-b"}],"safe":"visible"}"#;
+
+        let redacted = redact_sensitive(json);
+
+        assert!(!redacted.contains("secret-a"));
+        assert!(!redacted.contains("secret-b"));
+        assert!(redacted.contains("visible"));
+    }
+
+    #[test]
+    fn test_redact_sensitive_leaves_other_messages_untouched() {
+        let keepalive = KeepaliveMessage {
+            channel: 3,
+            message_type: "KEEPALIVE".to_string(),
+        };
+        let json = serde_json::to_string(&keepalive).unwrap();
+
+        let redacted = redact_sensitive(&json);
+
+        let value: serde_json::Value = serde_json::from_str(&redacted).unwrap();
+        assert_eq!(value["channel"], 3);
+        assert_eq!(value["type"], "KEEPALIVE");
+        assert!(!redacted.contains(REDACTED_PLACEHOLDER));
+    }
+
+    #[test]
+    fn test_redact_sensitive_withholds_unparseable_payloads() {
+        assert_eq!(redact_sensitive("not json"), REDACTED_PLACEHOLDER);
+    }
+
+    /// A `MakeWriter` that captures log output into a shared buffer so tests
+    /// can assert on what was actually logged.
+    #[derive(Clone, Default)]
+    struct SharedLogBuffer(Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl SharedLogBuffer {
+        fn contents(&self) -> String {
+            String::from_utf8(self.0.lock().unwrap().clone()).unwrap()
+        }
+    }
+
+    impl std::io::Write for SharedLogBuffer {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> MakeWriter<'a> for SharedLogBuffer {
+        type Writer = SharedLogBuffer;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    #[tokio::test]
+    async fn test_auth_token_never_appears_in_debug_logs() {
+        let buffer = SharedLogBuffer::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::DEBUG)
+            .with_writer(buffer.clone())
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        // Minimal WebSocket server on an ephemeral port that swallows messages.
+        let websocket = warp::path("websocket")
+            .and(warp::ws())
+            .map(|ws: warp::ws::Ws| {
+                ws.on_upgrade(|mut socket| async move { while socket.next().await.is_some() {} })
+            });
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("Failed to bind test server");
+        let addr = listener.local_addr().expect("Failed to get local addr");
+        tokio::spawn(warp::serve(websocket).incoming(listener).run());
+
+        let connection = WebSocketConnection::connect(&format!("ws://{}/websocket", addr))
+            .await
+            .expect("Failed to connect");
+
+        let token = "tastytrade-live-bearer-token";
+        let auth_msg = AuthMessage {
+            channel: 0,
+            message_type: "AUTH".to_string(),
+            token: token.to_string(),
+        };
+        connection
+            .send(&auth_msg)
+            .await
+            .expect("Failed to send auth message");
+
+        let logs = buffer.contents();
+        assert!(logs.contains("Sending message"));
+        assert!(!logs.contains(token), "auth token leaked into logs: {logs}");
+        assert!(logs.contains(REDACTED_PLACEHOLDER));
     }
 }
 
