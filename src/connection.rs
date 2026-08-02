@@ -17,6 +17,12 @@ use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::{WebSocketStream, connect_async};
 use tracing::{debug, error};
 
+/// How long establishing the WebSocket may take before it is abandoned.
+///
+/// Without a bound, a server that accepts the TCP connection and then never
+/// completes the upgrade holds `connect()` open indefinitely.
+pub const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+
 /// Placeholder written in place of credential values when logging outbound messages.
 const REDACTED_PLACEHOLDER: &str = "<redacted>";
 
@@ -140,9 +146,18 @@ impl WebSocketConnection {
     pub async fn connect(url: &str) -> DXLinkResult<Self> {
         debug!("Connecting to WebSocket at: {}", url);
 
-        let (ws_stream, _) = connect_async(url)
-            .await
-            .map_err(|e| DXLinkError::Connection(format!("Failed to connect: {}", e)))?;
+        let (ws_stream, _) = match timeout(DEFAULT_CONNECT_TIMEOUT, connect_async(url)).await {
+            Ok(result) => {
+                result.map_err(|e| DXLinkError::Connection(format!("Failed to connect: {}", e)))?
+            }
+            Err(_) => {
+                return Err(DXLinkError::Timeout(format!(
+                    "timed out after {}s establishing the WebSocket connection to {}",
+                    DEFAULT_CONNECT_TIMEOUT.as_secs(),
+                    url
+                )));
+            }
+        };
 
         debug!("WebSocket connection established");
 

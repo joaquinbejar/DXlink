@@ -75,6 +75,32 @@ pub struct SetupMessage {
     pub version: String,
 }
 
+/// The `SETUP` a server sends back.
+///
+/// Separate from [`SetupMessage`] because the directions are not symmetric: the
+/// client must send every field, while the AsyncAPI schema lets the server omit
+/// any of them. Deserializing the reply into the outbound type made a
+/// spec-compliant server look like a protocol error.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ServerSetupMessage {
+    /// The channel number. `SETUP` always travels on channel 0.
+    pub channel: u32,
+    /// The type of the message, always `SETUP`.
+    #[serde(rename = "type")]
+    pub message_type: String,
+    /// How long the server may stay silent before the client should give up, in
+    /// seconds. Absent if the server did not negotiate one.
+    #[serde(default)]
+    pub keepalive_timeout: Option<u32>,
+    /// The largest keepalive timeout the server accepts, in seconds.
+    #[serde(default)]
+    pub accept_keepalive_timeout: Option<u32>,
+    /// The server's protocol version string, when it reports one.
+    #[serde(default)]
+    pub version: Option<String>,
+}
+
 /// Represents a keepalive message.  This message is used to maintain an active connection
 /// and prevent timeouts.  It is sent periodically by the client or server.
 ///

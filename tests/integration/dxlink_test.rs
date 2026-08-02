@@ -157,14 +157,17 @@ async fn test_error_non_existent_channel() {
 
 /// The client must keep the session alive on its own. Virtual time drives the
 /// interval so the suite does not spend 20 real seconds proving it.
-#[tokio::test(start_paused = true)]
+#[tokio::test]
 async fn test_client_sends_keepalives() {
     let server = MockServer::start(Behaviour::Normal).await;
 
     let mut client = DXLinkClient::new(&server.url(), "test-token");
+    // Connect in real time: the handshake is bounded by a timeout that virtual
+    // time would fire before the socket finished being established.
     client.connect().await.expect("failed to connect");
 
     // Past one keepalive interval; with time paused this costs nothing.
+    tokio::time::pause();
     tokio::time::advance(Duration::from_secs(20)).await;
 
     // Back to real time before waiting: delivering the keepalive is real socket
@@ -174,4 +177,106 @@ async fn test_client_sends_keepalives() {
     server.wait_for("KEEPALIVE", is_type("KEEPALIVE")).await;
 
     client.disconnect().await.expect("failed to disconnect");
+}
+
+// --- Handshake validation (issue #11) -------------------------------------
+//
+// The handshake used to deserialize whatever arrived straight into the type it
+// hoped for, so a server ERROR surfaced as `missing field \`state\`` and a reply
+// on the wrong channel was accepted silently.
+
+/// A server that accepts the socket and says nothing must not hold the caller
+/// open. Virtual time makes the bound observable without waiting for it.
+#[tokio::test(start_paused = true)]
+async fn test_handshake_times_out_on_a_silent_server() {
+    let server = MockServer::start(Behaviour::Silent).await;
+    let mut client = DXLinkClient::new(&server.url(), "test-token");
+
+    match client.connect().await {
+        // Either bound is a correct outcome: what matters is that one of them
+        // fired instead of hanging.
+        Err(DXLinkError::Timeout(msg)) => {
+            assert!(
+                msg.contains("timed out"),
+                "timeout should say what it waited for: {msg}"
+            );
+        }
+        other => panic!("expected a Timeout against a silent server, got: {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn test_handshake_rejects_the_wrong_message_type() {
+    let server = MockServer::start(Behaviour::WrongTypeOnSetup).await;
+    let mut client = DXLinkClient::new(&server.url(), "test-token");
+
+    match client.connect().await {
+        Err(DXLinkError::Protocol(msg)) => {
+            assert!(msg.contains("SETUP"), "expected type missing: {msg}");
+            assert!(msg.contains("FEED_CONFIG"), "received type missing: {msg}");
+        }
+        other => panic!("expected a Protocol error, got: {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn test_handshake_rejects_the_wrong_channel() {
+    let server = MockServer::start(Behaviour::WrongChannelOnSetup).await;
+    let mut client = DXLinkClient::new(&server.url(), "test-token");
+
+    match client.connect().await {
+        Err(DXLinkError::Protocol(msg)) => {
+            assert!(msg.contains("channel 0"), "expected channel missing: {msg}");
+            assert!(msg.contains("channel 7"), "received channel missing: {msg}");
+        }
+        other => panic!("expected a Protocol error, got: {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn test_handshake_rejects_malformed_json() {
+    let server = MockServer::start(Behaviour::MalformedSetup).await;
+    let mut client = DXLinkClient::new(&server.url(), "test-token");
+
+    match client.connect().await {
+        Err(DXLinkError::Protocol(msg)) => {
+            assert!(msg.contains("malformed JSON"), "unclear error: {msg}");
+        }
+        other => panic!("expected a Protocol error, got: {other:?}"),
+    }
+}
+
+/// The failure the reporter of #4 actually hit next: no token, so the server
+/// answers ERROR/UNAUTHORIZED. That used to surface as `missing field \`state\``.
+#[tokio::test]
+async fn test_handshake_reports_a_server_error_as_authentication() {
+    let server = MockServer::start(Behaviour::ErrorOnSetup).await;
+    let mut client = DXLinkClient::new(&server.url(), "");
+
+    match client.connect().await {
+        Err(DXLinkError::Authentication(msg)) => {
+            assert!(msg.contains("UNAUTHORIZED"), "error code missing: {msg}");
+            assert!(
+                msg.contains("Authentication failed"),
+                "server message missing: {msg}"
+            );
+        }
+        other => panic!("expected an Authentication error, got: {other:?}"),
+    }
+}
+
+/// A failed handshake must leave the client disconnected, not half-established.
+#[tokio::test]
+async fn test_failed_handshake_leaves_the_client_disconnected() {
+    let server = MockServer::start(Behaviour::ErrorOnSetup).await;
+    let mut client = DXLinkClient::new(&server.url(), "");
+
+    assert!(client.connect().await.is_err());
+
+    // No channel can be opened, and tearing down is still safe.
+    assert!(client.create_feed_channel("AUTO").await.is_err());
+    client
+        .disconnect()
+        .await
+        .expect("disconnect after a failed handshake should be safe");
 }
