@@ -97,6 +97,29 @@ impl From<&str> for EventType {
     }
 }
 
+/// Every event type the protocol declares.
+///
+/// Written out rather than derived so adding a variant is a compile error here
+/// until someone decides what it means, instead of quietly missing from the
+/// lists this drives.
+pub const ALL_EVENT_TYPES: [EventType; 15] = [
+    EventType::Quote,
+    EventType::Trade,
+    EventType::Summary,
+    EventType::Profile,
+    EventType::Order,
+    EventType::TimeAndSale,
+    EventType::Candle,
+    EventType::TradeETH,
+    EventType::SpreadOrder,
+    EventType::Greeks,
+    EventType::TheoPrice,
+    EventType::Underlying,
+    EventType::Series,
+    EventType::Configuration,
+    EventType::Message,
+];
+
 impl std::str::FromStr for EventType {
     type Err = crate::DXLinkError;
 

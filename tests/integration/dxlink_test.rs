@@ -752,3 +752,80 @@ async fn test_a_batch_with_one_bad_type_is_rejected_whole() {
 
     client.disconnect().await.expect("failed to disconnect");
 }
+
+// --- No silent empty streams (issue #30) -----------------------------------
+
+/// Configuring a type this client cannot decode used to succeed: the wildcard
+/// asked for two fields, the server agreed, the subscription was accepted, and
+/// then nothing ever arrived. An empty stream looks exactly like a quiet market.
+#[tokio::test]
+async fn test_setup_feed_refuses_a_type_it_cannot_decode() {
+    let server = MockServer::start(Behaviour::Normal).await;
+    let mut client = DXLinkClient::new(&server.url(), "test-token");
+    client.connect().await.expect("failed to connect");
+    let channel_id = client
+        .create_feed_channel("AUTO")
+        .await
+        .expect("failed to create feed channel");
+
+    match client.setup_feed(channel_id, &[EventType::Candle]).await {
+        Err(DXLinkError::Protocol(msg)) => {
+            assert!(msg.contains("Candle"), "the type is missing: {msg}");
+            // The error has to say what does work, or it is a dead end.
+            assert!(msg.contains("Quote"), "the usable types are missing: {msg}");
+        }
+        other => panic!("an undecodable type must be refused, got: {other:?}"),
+    }
+
+    // Nothing was configured on the wire either.
+    assert_eq!(
+        server
+            .received()
+            .iter()
+            .filter(|m| m["type"] == "FEED_SETUP")
+            .count(),
+        0,
+        "a refused setup still went out"
+    );
+
+    client.disconnect().await.expect("failed to disconnect");
+}
+
+/// The same applies to subscribing, which is the other way to end up waiting
+/// for events that cannot arrive.
+#[tokio::test]
+async fn test_subscribe_refuses_a_type_it_cannot_decode() {
+    let server = MockServer::start(Behaviour::Normal).await;
+    let mut client = DXLinkClient::new(&server.url(), "test-token");
+    client.connect().await.expect("failed to connect");
+    let channel_id = client
+        .create_feed_channel("AUTO")
+        .await
+        .expect("failed to create feed channel");
+    client
+        .setup_feed(channel_id, &[EventType::Quote])
+        .await
+        .expect("failed to set up feed");
+
+    let result = client
+        .subscribe(
+            channel_id,
+            vec![FeedSubscription {
+                event_type: "Summary".to_string(),
+                symbol: "AAPL".to_string(),
+                from_time: None,
+                source: None,
+            }],
+        )
+        .await;
+
+    match result {
+        Err(DXLinkError::Protocol(msg)) => {
+            assert!(msg.contains("Summary"), "the type is missing: {msg}");
+            assert!(msg.contains("AAPL"), "the symbol is missing: {msg}");
+        }
+        other => panic!("an undecodable subscription must be refused, got: {other:?}"),
+    }
+
+    client.disconnect().await.expect("failed to disconnect");
+}

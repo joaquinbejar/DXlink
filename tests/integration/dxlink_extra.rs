@@ -102,46 +102,49 @@ async fn test_reset_subscriptions_sends_the_reset_flag() {
     client.disconnect().await.expect("failed to disconnect");
 }
 
-/// Historical data is requested by adding `fromTime` to the subscription. The
-/// value must reach the wire unchanged: it is epoch milliseconds and a silent
-/// unit conversion would quietly shift every candle.
+/// Historical data is requested by adding `fromTime`, but this client has no
+/// Candle decoder yet, so the request is refused rather than accepted into a
+/// stream that can never produce. Restore the delivery assertions here when the
+/// Candle decoder lands.
 #[tokio::test]
-async fn test_historical_subscription_carries_from_time() {
+async fn test_historical_subscription_is_refused_without_a_decoder() {
     let server = MockServer::start(Behaviour::Normal).await;
-    let (mut client, channel_id) = connected_feed(&server, &[EventType::Candle]).await;
+    let mut client = DXLinkClient::new(&server.url(), "test-token");
+    client.connect().await.expect("failed to connect");
+    let channel_id = client
+        .create_feed_channel("AUTO")
+        .await
+        .expect("failed to create feed channel");
 
-    // Fixed value rather than "now": the assertion is about faithful transport.
-    let from_time: i64 = 1_700_000_000_000;
+    // Configuring the channel for Candle is refused first.
+    assert!(
+        client
+            .setup_feed(channel_id, &[EventType::Candle])
+            .await
+            .is_err(),
+        "a type with no decoder must not be configurable"
+    );
 
+    // And so is subscribing, on a channel configured for something else.
     client
+        .setup_feed(channel_id, &[EventType::Quote])
+        .await
+        .expect("failed to set up feed");
+
+    let result = client
         .subscribe(
             channel_id,
             vec![FeedSubscription {
                 event_type: "Candle".to_string(),
                 symbol: "AAPL{=5m}".to_string(),
-                from_time: Some(from_time),
+                from_time: Some(1_700_000_000_000),
                 source: None,
             }],
         )
-        .await
-        .expect("failed to subscribe to historical data");
-
-    let subscription = server
-        .wait_for("the historical subscription", |m| {
-            is_type_on_channel("FEED_SUBSCRIPTION", channel_id)(m) && m.get("add").is_some()
-        })
         .await;
-
-    let added = subscription["add"]
-        .as_array()
-        .expect("add should be a list");
-    assert_eq!(added.len(), 1);
-    assert_eq!(added[0]["symbol"], "AAPL{=5m}");
-    assert_eq!(added[0]["type"], "Candle");
-    assert_eq!(
-        added[0]["fromTime"].as_i64(),
-        Some(from_time),
-        "fromTime must reach the wire unchanged"
+    assert!(
+        result.is_err(),
+        "an undecodable subscription must be refused"
     );
 
     client.disconnect().await.expect("failed to disconnect");

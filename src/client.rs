@@ -6,7 +6,7 @@
 
 use crate::connection::{WebSocketConnection, sanitize_server_text};
 use crate::error::{DXLinkError, DXLinkResult};
-use crate::events::{CompactData, EventType, MarketEvent};
+use crate::events::{ALL_EVENT_TYPES, CompactData, EventType, MarketEvent};
 use crate::messages::{
     AuthMessage, AuthStateMessage, BaseMessage, ChannelRequestMessage, ErrorMessage,
     FeedConfigMessage, FeedDataMessage, FeedSetupMessage, FeedSubscription,
@@ -287,6 +287,16 @@ fn validate_feed_config(
     Ok(())
 }
 
+/// The event types this client can turn into a [`MarketEvent`], for error text.
+fn decodable_type_names() -> String {
+    ALL_EVENT_TYPES
+        .iter()
+        .filter(|event_type| event_type.compact_fields().is_some())
+        .map(|event_type| event_type.to_string())
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 /// Parses every subscription's event type, rejecting the whole batch if any is
 /// unknown.
 ///
@@ -296,7 +306,18 @@ fn validate_feed_config(
 fn parse_subscription_types(subscriptions: &[FeedSubscription]) -> DXLinkResult<Vec<EventType>> {
     subscriptions
         .iter()
-        .map(|sub| sub.event_type.parse::<EventType>())
+        .map(|sub| {
+            let event_type = sub.event_type.parse::<EventType>()?;
+            if event_type.compact_fields().is_none() {
+                return Err(DXLinkError::Protocol(format!(
+                    "this client cannot decode {event_type} events, so subscribing `{}` to \
+                     them would return nothing. Decoded types: {}",
+                    sub.symbol,
+                    decodable_type_names()
+                )));
+            }
+            Ok(event_type)
+        })
         .collect()
 }
 
@@ -1344,14 +1365,19 @@ impl DXLinkClient {
         let mut accept_event_fields = HashMap::new();
 
         for event_type in event_types {
-            // One source of truth: the same list validates the server's reply
-            // and drives the decoder stride.
-            let fields: Vec<String> = event_type
-                .compact_fields()
-                .unwrap_or(&["eventType", "eventSymbol"])
-                .iter()
-                .map(|f| (*f).to_string())
-                .collect();
+            // Refuse rather than half-configure. The wildcard this replaces
+            // requested only eventType and eventSymbol for anything without a
+            // decoder, so the server accepted the setup, accepted the
+            // subscription, and then nothing ever arrived: an empty stream that
+            // looks exactly like a quiet market.
+            let Some(fields) = event_type.compact_fields() else {
+                return Err(DXLinkError::Protocol(format!(
+                    "this client cannot decode {event_type} events, so subscribing to them \
+                     would return nothing. Decoded types: {}",
+                    decodable_type_names()
+                )));
+            };
+            let fields: Vec<String> = fields.iter().map(|f| (*f).to_string()).collect();
 
             accept_event_fields.insert(event_type.to_string(), fields);
         }
