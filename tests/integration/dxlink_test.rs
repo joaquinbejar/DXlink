@@ -769,9 +769,9 @@ async fn test_setup_feed_refuses_a_type_it_cannot_decode() {
         .await
         .expect("failed to create feed channel");
 
-    match client.setup_feed(channel_id, &[EventType::Candle]).await {
+    match client.setup_feed(channel_id, &[EventType::Summary]).await {
         Err(DXLinkError::Protocol(msg)) => {
-            assert!(msg.contains("Candle"), "the type is missing: {msg}");
+            assert!(msg.contains("Summary"), "the type is missing: {msg}");
             // The error has to say what does work, or it is a dead end.
             assert!(msg.contains("Quote"), "the usable types are missing: {msg}");
         }

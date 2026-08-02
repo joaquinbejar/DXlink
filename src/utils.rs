@@ -5,7 +5,7 @@
 ******************************************************************************/
 use crate::MarketEvent;
 use crate::error::{DXLinkError, DXLinkResult};
-use crate::events::{CompactData, EventType, GreeksEvent, QuoteEvent, TradeEvent};
+use crate::events::{CandleEvent, CompactData, EventType, GreeksEvent, QuoteEvent, TradeEvent};
 use serde_json::Value;
 use tracing::warn;
 
@@ -112,6 +112,22 @@ fn as_text<'a>(
     values[index].as_str().ok_or_else(|| {
         DXLinkError::Protocol(format!(
             "{event_type} row {row}: field `{field}` should be a string, got {}",
+            values[index]
+        ))
+    })
+}
+
+/// A column that must be a whole number, such as an epoch millisecond time.
+fn as_int(
+    values: &[Value],
+    index: usize,
+    event_type: &str,
+    row: usize,
+    field: &str,
+) -> DXLinkResult<i64> {
+    values[index].as_i64().ok_or_else(|| {
+        DXLinkError::Protocol(format!(
+            "{event_type} row {row}: field `{field}` should be a whole number, got {}",
             values[index]
         ))
     })
@@ -259,6 +275,29 @@ fn build_event(
             rho: number(6)?,
             volatility: number(7)?,
         }),
+        EventType::Candle => {
+            let int = |index: usize| as_int(row_values, index, header, row, fields[index]);
+            MarketEvent::Candle(CandleEvent {
+                event_type: header.to_string(),
+                event_symbol: symbol,
+                event_time: int(2)?,
+                event_flags: int(3)?,
+                index: int(4)?,
+                time: int(5)?,
+                sequence: int(6)?,
+                count: int(7)?,
+                open: number(8)?,
+                high: number(9)?,
+                low: number(10)?,
+                close: number(11)?,
+                volume: number(12)?,
+                vwap: number(13)?,
+                bid_volume: number(14)?,
+                ask_volume: number(15)?,
+                imp_volatility: number(16)?,
+                open_interest: number(17)?,
+            })
+        }
         // compact_fields returned Some for this type, so a missing arm here is a
         // bug in this match rather than a protocol problem.
         other => {
@@ -563,9 +602,11 @@ mod strict_tests {
 
     #[test]
     fn test_an_undecodable_event_type_is_reported() {
-        // Declared by the protocol, no decoder here.
-        let error = try_parse_compact_data(&batch("Candle", vec![json!("Candle"), json!("AAPL")]))
-            .expect_err("Candle has no decoder");
+        // Declared by the protocol, no decoder here. Update this to another
+        // undecoded type when Summary gains one.
+        let error =
+            try_parse_compact_data(&batch("Summary", vec![json!("Summary"), json!("AAPL")]))
+                .expect_err("Summary has no decoder");
         assert!(error.to_string().contains("no decoder"), "{error}");
     }
 
@@ -613,5 +654,153 @@ mod strict_tests {
         // what is wrong.
         assert!(try_parse_compact_data(&batch("Quote", values.clone())).is_err());
         assert!(parse_compact_data(&batch("Quote", values)).is_empty());
+    }
+}
+
+#[cfg(test)]
+mod candle_tests {
+    use super::*;
+    use serde_json::json;
+
+    /// The exact 18 columns issue #24 specifies, in order.
+    fn candle_row(symbol: &str) -> Vec<Value> {
+        vec![
+            json!("Candle"),             // 0 eventType
+            json!(symbol),               // 1 eventSymbol
+            json!(1_700_000_000_500i64), // 2 eventTime
+            json!(0i64),                 // 3 eventFlags
+            json!(7i64),                 // 4 index
+            json!(1_700_000_000_000i64), // 5 time
+            json!(3i64),                 // 6 sequence
+            json!(42i64),                // 7 count
+            json!(149.0),                // 8 open
+            json!(151.0),                // 9 high
+            json!(148.5),                // 10 low
+            json!(150.5),                // 11 close
+            json!(1_234_000.0),          // 12 volume
+            json!(150.1),                // 13 VWAP
+            json!(600_000.0),            // 14 bidVolume
+            json!(634_000.0),            // 15 askVolume
+            json!(0.31),                 // 16 impVolatility
+            json!(4_200.0),              // 17 openInterest
+        ]
+    }
+
+    fn batch(values: Vec<Value>) -> Vec<CompactData> {
+        vec![
+            CompactData::EventType("Candle".to_string()),
+            CompactData::Values(values),
+        ]
+    }
+
+    /// The requested field list and the decoder must agree on all 18 columns.
+    #[test]
+    fn test_the_field_list_matches_the_decoder_stride() {
+        let fields = EventType::Candle
+            .compact_fields()
+            .expect("Candle has a decoder");
+        assert_eq!(fields.len(), 18, "the layout is 18 columns");
+        assert_eq!(fields[0], "eventType");
+        assert_eq!(fields[1], "eventSymbol");
+        assert_eq!(fields[13], "VWAP", "the wire name is upper case");
+        assert_eq!(fields.len(), candle_row("AAPL").len());
+    }
+
+    #[test]
+    fn test_two_candles_decode_with_the_right_stride() {
+        let mut values = candle_row("AAPL{=5m}");
+        values.extend(candle_row("MSFT{=5m}"));
+
+        let events = try_parse_compact_data(&batch(values)).expect("well formed");
+        assert_eq!(events.len(), 2);
+
+        match (&events[0], &events[1]) {
+            (MarketEvent::Candle(first), MarketEvent::Candle(second)) => {
+                // The symbols prove the stride of eighteen.
+                assert_eq!(first.event_symbol, "AAPL{=5m}");
+                assert_eq!(second.event_symbol, "MSFT{=5m}");
+                assert_eq!(first.event_time, 1_700_000_000_500);
+                assert_eq!(first.event_flags, 0);
+                assert_eq!(first.index, 7);
+                assert_eq!(first.time, 1_700_000_000_000);
+                assert_eq!(first.sequence, 3);
+                assert_eq!(first.count, 42);
+                assert_eq!(first.open, 149.0);
+                assert_eq!(first.high, 151.0);
+                assert_eq!(first.low, 148.5);
+                assert_eq!(first.close, 150.5);
+                assert_eq!(first.volume, 1_234_000.0);
+                assert_eq!(first.vwap, 150.1);
+                assert_eq!(first.bid_volume, 600_000.0);
+                assert_eq!(first.ask_volume, 634_000.0);
+                assert_eq!(first.imp_volatility, 0.31);
+                assert_eq!(first.open_interest, 4_200.0);
+            }
+            other => panic!("expected two candles, got {other:?}"),
+        }
+    }
+
+    /// eventFlags is what marks a historical snapshot's boundaries; a consumer
+    /// that cannot see it cannot tell a snapshot from live updates.
+    #[test]
+    fn test_snapshot_flags_reach_the_consumer() {
+        let mut values = candle_row("AAPL{=5m}");
+        values[3] = json!(4i64); // SNAPSHOT_BEGIN
+
+        let events = try_parse_compact_data(&batch(values)).expect("well formed");
+        match &events[0] {
+            MarketEvent::Candle(candle) => assert_eq!(candle.event_flags, 4),
+            other => panic!("expected a candle, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_a_fractional_time_is_rejected() {
+        let mut values = candle_row("AAPL{=5m}");
+        values[5] = json!(1.5);
+
+        let error = try_parse_compact_data(&batch(values)).expect_err("time is a whole number");
+        let text = error.to_string();
+        assert!(text.contains("time"), "the field is missing: {text}");
+        assert!(text.contains("whole number"), "unclear: {text}");
+    }
+
+    /// An instrument with no implied volatility or open interest still decodes:
+    /// the protocol sends NaN rather than dropping the columns.
+    #[test]
+    fn test_absent_optional_values_decode_as_nan() {
+        let mut values = candle_row("AAPL{=5m}");
+        values[16] = json!("NaN");
+        values[17] = json!("NaN");
+
+        let events = try_parse_compact_data(&batch(values)).expect("NaN is a value");
+        match &events[0] {
+            MarketEvent::Candle(candle) => {
+                assert!(candle.imp_volatility.is_nan());
+                assert!(candle.open_interest.is_nan());
+                assert_eq!(candle.close, 150.5);
+            }
+            other => panic!("expected a candle, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_a_truncated_candle_row_is_rejected() {
+        let mut values = candle_row("AAPL{=5m}");
+        values.pop();
+        assert!(try_parse_compact_data(&batch(values)).is_err());
+    }
+
+    #[test]
+    fn test_a_candle_is_not_mistaken_for_another_event() {
+        let events = try_parse_compact_data(&batch(candle_row("AAPL{=5m}"))).expect("well formed");
+        assert!(matches!(events[0], MarketEvent::Candle(_)));
+
+        let json = serde_json::to_string(&events[0]).expect("serialize");
+        let back: MarketEvent = serde_json::from_str(&json).expect("deserialize");
+        assert!(
+            matches!(back, MarketEvent::Candle(_)),
+            "an untagged round trip picked the wrong variant: {back:?}"
+        );
     }
 }

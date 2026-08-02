@@ -444,6 +444,23 @@ fn field_value(field: &str, event_type: &str, symbol: &str) -> Value {
         "price" => json!(151.25),
         "size" => json!(75.0),
         "dayVolume" => json!(10_000_000.0),
+        // Candle
+        "eventTime" => json!(1_700_000_000_500i64),
+        "eventFlags" => json!(0i64),
+        "index" => json!(7i64),
+        "time" => json!(1_700_000_000_000i64),
+        "sequence" => json!(3i64),
+        "count" => json!(42i64),
+        "open" => json!(149.0),
+        "high" => json!(151.0),
+        "low" => json!(148.5),
+        "close" => json!(150.5),
+        "volume" => json!(1_234_000.0),
+        "VWAP" => json!(150.1),
+        "bidVolume" => json!(600_000.0),
+        "askVolume" => json!(634_000.0),
+        "impVolatility" => json!(0.31),
+        "openInterest" => json!(4_200.0),
         // Greeks
         "delta" => json!(0.65),
         "gamma" => json!(0.05),
@@ -451,7 +468,13 @@ fn field_value(field: &str, event_type: &str, symbol: &str) -> Value {
         "vega" => json!(0.1),
         "rho" => json!(0.03),
         "volatility" => json!(0.25),
-        _ => Value::Null,
+        // Loud on purpose. A null here decodes as a wrong column type and the
+        // test fails several layers away with "no event arrived", which is a
+        // slow way to learn the fixture is missing a column.
+        unknown => panic!(
+            "the fixture has no value for column `{unknown}` of a {event_type}; \
+             add one when the event's field list grows"
+        ),
     }
 }
 
@@ -470,6 +493,22 @@ pub mod expected {
     pub const VEGA: f64 = 0.1;
     pub const RHO: f64 = 0.03;
     pub const VOLATILITY: f64 = 0.25;
+    pub const EVENT_TIME: i64 = 1_700_000_000_500;
+    pub const EVENT_FLAGS: i64 = 0;
+    pub const INDEX: i64 = 7;
+    pub const TIME: i64 = 1_700_000_000_000;
+    pub const SEQUENCE: i64 = 3;
+    pub const COUNT: i64 = 42;
+    pub const OPEN: f64 = 149.0;
+    pub const HIGH: f64 = 151.0;
+    pub const LOW: f64 = 148.5;
+    pub const CLOSE: f64 = 150.5;
+    pub const VOLUME: f64 = 1_234_000.0;
+    pub const VWAP: f64 = 150.1;
+    pub const BID_VOLUME: f64 = 600_000.0;
+    pub const ASK_VOLUME: f64 = 634_000.0;
+    pub const IMP_VOLATILITY: f64 = 0.31;
+    pub const OPEN_INTEREST: f64 = 4_200.0;
 }
 
 /// Convenience predicates for `wait_for`.

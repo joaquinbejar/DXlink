@@ -348,6 +348,7 @@ fn symbol_of(event: &MarketEvent) -> &str {
         MarketEvent::Quote(e) => &e.event_symbol,
         MarketEvent::Trade(e) => &e.event_symbol,
         MarketEvent::Greeks(e) => &e.event_symbol,
+        MarketEvent::Candle(e) => &e.event_symbol,
     }
 }
 

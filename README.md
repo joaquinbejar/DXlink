@@ -11,11 +11,12 @@ to DXLink servers, subscribing to market events, and processing real-time market
 - Session lifecycle over the DXLink WebSocket protocol: `SETUP`, token
   authentication, feed channels, `FEED_SETUP`, subscribe and unsubscribe.
 - Automatic keepalives while the connection is open.
-- Market events decoded from the `COMPACT` wire format: **`Quote`, `Trade`
-  and `Greeks`**.
+- Market events decoded from the `COMPACT` wire format: **`Quote`, `Trade`,
+  `Greeks` and `Candle`**, each with the full field set the dxFeed schema
+  defines for it.
 - Both delivery styles: a per-symbol callback and a single event stream.
-- Historical data via `from_time` on a subscription, for event types this
-  client can decode.
+- Historical data via `from_time` on a `Candle` subscription, decoded into
+  OHLC bars.
 - Typed errors ([`DXLinkError`]) with [`DXLinkError::is_terminal`] to tell a
   lost connection from one bad message.
 - Strict decoding: [`try_parse_compact_data`] reports a short row, a wrong
@@ -29,10 +30,9 @@ to DXLink servers, subscribing to market events, and processing real-time market
 - **No reconnection.** If the connection drops, the client reports the error
   and stops; re-establishing the session is the caller's job.
 - [`EventType`] declares more variants than the library can decode. Only
-  `Quote`, `Trade` and `Greeks` produce a [`MarketEvent`], and configuring or
-  subscribing to any other type is **refused** rather than accepted into a
-  stream that can never produce. `Candle` included: historical requests come
-  back when its decoder lands.
+  `Quote`, `Trade`, `Greeks` and `Candle` produce a [`MarketEvent`], and
+  configuring or subscribing to any other type is **refused** rather than
+  accepted into a stream that can never produce.
 
 ### Minimum supported Rust version
 
@@ -141,9 +141,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
 DXLink supports subscribing to historical data through Candle events, by
 specifying the period, type, and a timestamp to fetch from.
 
-Note this client has no `Candle` decoder yet, so such a subscription is
-currently **refused**: it would otherwise be accepted and then deliver
-nothing. The shape of the request is:
+The bars come back as [`MarketEvent::Candle`]:
 
 ```rust
 use dxlink::FeedSubscription;
@@ -197,11 +195,11 @@ are decoded into a [`MarketEvent`] and delivered:
 | `Quote`  | `bidPrice`, `askPrice`, `bidSize`, `askSize` |
 | `Trade`  | `price`, `size`, `dayVolume` |
 | `Greeks` | `delta`, `gamma`, `theta`, `vega`, `rho`, `volatility` |
+| `Candle` | `time`, `open`, `high`, `low`, `close`, `volume` |
 
-Subscribing to any other variant (`Summary`, `Profile`, `Candle`,
-`TimeAndSale`, …) is accepted by the server, but no event will reach your
-callback or stream. `Candle` in particular is usable only to request
-historical data; the rows are not decoded yet.
+Configuring or subscribing to any other variant (`Summary`, `Profile`,
+`TimeAndSale`, …) is **refused**, rather than accepted into a stream that can
+never produce.
 
 
 ### License
