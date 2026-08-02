@@ -1479,3 +1479,203 @@ mod json_double_tests {
         assert!(error.contains("cheap"), "the value is missing: {error}");
     }
 }
+
+/// Serde coverage for the event types added after the original three.
+///
+/// The property is stronger than "the names look right": each struct's
+/// serialized key set has to equal that type's [`EventType::compact_fields`]
+/// list, which is the same list `setup_feed` sends. A `#[serde(rename)]` that
+/// drifts from the wire name fails here rather than on a live feed.
+#[cfg(test)]
+mod event_serde_tests {
+    use super::*;
+    use serde_json::{Value, from_str, to_string};
+
+    /// Asserts the serialized field names are exactly the layout, no more and
+    /// no less, and that the value survives a round trip.
+    fn assert_wire_contract<T>(event: &T, event_type: EventType)
+    where
+        T: Serialize + for<'de> Deserialize<'de>,
+    {
+        let serialized = to_string(event).expect("serialize");
+        let value: Value = from_str(&serialized).expect("valid JSON");
+        let object = value.as_object().expect("an event is an object");
+
+        let mut got: Vec<&str> = object.keys().map(String::as_str).collect();
+        got.sort_unstable();
+
+        let mut want: Vec<&str> = event_type
+            .compact_fields()
+            .expect("the type has a layout")
+            .to_vec();
+        want.sort_unstable();
+
+        assert_eq!(
+            got, want,
+            "{event_type}'s serde names do not match the fields it requests"
+        );
+
+        from_str::<T>(&serialized).expect("round trip");
+    }
+
+    fn candle() -> CandleEvent {
+        CandleEvent {
+            event_type: "Candle".to_string(),
+            event_symbol: "AAPL{=5m}".to_string(),
+            event_time: 1_700_000_000_500,
+            event_flags: 0,
+            index: 7,
+            time: 1_700_000_000_000,
+            sequence: 3,
+            count: 42,
+            open: 149.0,
+            high: 151.0,
+            low: 148.5,
+            close: 150.5,
+            volume: 1_234_000.0,
+            vwap: 150.1,
+            bid_volume: 600_000.0,
+            ask_volume: 634_000.0,
+            imp_volatility: 0.31,
+            open_interest: 4_200.0,
+        }
+    }
+
+    fn summary() -> SummaryEvent {
+        SummaryEvent {
+            event_type: "Summary".to_string(),
+            event_symbol: "AAPL".to_string(),
+            event_time: 1_700_000_000_500,
+            day_id: 20240119,
+            day_open_price: 149.5,
+            day_high_price: 152.0,
+            day_low_price: 148.0,
+            day_close_price: 150.75,
+            day_close_price_type: "Final".to_string(),
+            prev_day_id: 20240118,
+            prev_day_close_price: 147.75,
+            prev_day_close_price_type: "Final".to_string(),
+            prev_day_volume: 58_000_000.0,
+            open_interest: 4_200.0,
+        }
+    }
+
+    fn print() -> TimeAndSaleEvent {
+        TimeAndSaleEvent {
+            event_type: "TimeAndSale".to_string(),
+            event_symbol: "AAPL".to_string(),
+            event_time: 1_700_000_000_500,
+            event_flags: 0,
+            index: 11,
+            time: 1_700_000_000_000,
+            time_nano_part: 250_000,
+            sequence: 3,
+            exchange_code: "Q".to_string(),
+            price: 151.25,
+            size: 75.0,
+            bid_price: 151.2,
+            ask_price: 151.3,
+            exchange_sale_conditions: "@ TI".to_string(),
+            trade_through_exempt: "X".to_string(),
+            aggressor_side: "Buy".to_string(),
+            spread_leg: false,
+            extended_trading_hours: true,
+            valid_tick: true,
+            sale_type: "NEW".to_string(),
+            buyer: "NSDQ".to_string(),
+            seller: "NYSE".to_string(),
+        }
+    }
+
+    fn profile() -> ProfileEvent {
+        ProfileEvent {
+            event_type: "Profile".to_string(),
+            event_symbol: "AAPL".to_string(),
+            event_time: 1_700_000_000_500,
+            description: "Apple Inc. - Common Stock".to_string(),
+            short_sale_restriction: "Inactive".to_string(),
+            trading_status: "Halted".to_string(),
+            status_reason: "News pending".to_string(),
+            halt_start_time: 1_700_000_100_000,
+            halt_end_time: 1_700_000_900_000,
+            high_limit_price: 165.0,
+            low_limit_price: 135.0,
+            high_52_week_price: 199.62,
+            low_52_week_price: 124.17,
+            beta: 1.29,
+            earnings_per_share: 6.13,
+            dividend_frequency: 4.0,
+            ex_dividend_amount: 0.24,
+            ex_dividend_day_id: 20240209,
+            shares: 15_552_800_000.0,
+            free_float: 15_461_900_000.0,
+        }
+    }
+
+    #[test]
+    fn test_candle_serde_names_match_its_layout() {
+        assert_wire_contract(&candle(), EventType::Candle);
+    }
+
+    #[test]
+    fn test_summary_serde_names_match_its_layout() {
+        assert_wire_contract(&summary(), EventType::Summary);
+    }
+
+    #[test]
+    fn test_time_and_sale_serde_names_match_its_layout() {
+        assert_wire_contract(&print(), EventType::TimeAndSale);
+    }
+
+    #[test]
+    fn test_profile_serde_names_match_its_layout() {
+        assert_wire_contract(&profile(), EventType::Profile);
+    }
+
+    /// A FULL-format payload carries the non-finite doubles as strings, so the
+    /// structs have to read them back the same way the COMPACT decoder does.
+    #[test]
+    fn test_non_finite_doubles_survive_a_full_round_trip() {
+        let mut bar = candle();
+        bar.imp_volatility = f64::NAN;
+        let serialized = to_string(&bar).expect("serialize");
+        assert!(
+            serialized.contains("\"impVolatility\":\"NaN\""),
+            "NaN is not a JSON literal, it has to be the string: {serialized}"
+        );
+        let back: CandleEvent = from_str(&serialized).expect("round trip");
+        assert!(back.imp_volatility.is_nan());
+
+        let mut instrument = profile();
+        instrument.high_limit_price = f64::INFINITY;
+        instrument.shares = f64::NAN;
+        let serialized = to_string(&instrument).expect("serialize");
+        assert!(
+            serialized.contains("\"highLimitPrice\":\"Infinity\""),
+            "wrong encoding: {serialized}"
+        );
+        let back: ProfileEvent = from_str(&serialized).expect("round trip");
+        assert_eq!(back.high_limit_price, f64::INFINITY);
+        assert!(back.shares.is_nan());
+    }
+
+    /// Untagged deserialization keeps the first variant that fits, so each new
+    /// type has to still come back as itself.
+    #[test]
+    fn test_each_new_type_round_trips_as_its_own_variant() {
+        for event in [
+            MarketEvent::Candle(candle()),
+            MarketEvent::Summary(summary()),
+            MarketEvent::TimeAndSale(print()),
+            MarketEvent::Profile(profile()),
+        ] {
+            let serialized = to_string(&event).expect("serialize");
+            let back: MarketEvent = from_str(&serialized).expect("round trip");
+            assert_eq!(
+                std::mem::discriminant(&event),
+                std::mem::discriminant(&back),
+                "an untagged round trip picked the wrong variant for {serialized}"
+            );
+        }
+    }
+}
