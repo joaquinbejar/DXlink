@@ -10,8 +10,8 @@
 //!   authentication, feed channels, `FEED_SETUP`, subscribe and unsubscribe.
 //! - Automatic keepalives while the connection is open.
 //! - Market events decoded from the `COMPACT` wire format: **`Quote`, `Trade`,
-//!   `Greeks`, `Candle`, `Summary`, `TimeAndSale`, `Profile` and `Underlying`**, each
-//!   with the full field set the dxFeed schema defines for it.
+//!   `Greeks`, `Candle`, `Summary`, `TimeAndSale`, `Profile`, `Underlying` and
+//!   `TheoPrice`**, each with the full field set the dxFeed schema defines for it.
 //! - Both delivery styles: a per-symbol callback and a single event stream.
 //! - Historical data via `from_time` on a `Candle` subscription, decoded into
 //!   OHLC bars.
@@ -28,8 +28,8 @@
 //! - **No reconnection.** If the connection drops, the client reports the error
 //!   and stops; re-establishing the session is the caller's job.
 //! - [`EventType`] declares more variants than the library can decode. Only
-//!   `Quote`, `Trade`, `Greeks`, `Candle`, `Summary`, `TimeAndSale`, `Profile` and
-//!   `Underlying` produce a [`MarketEvent`], and
+//!   `Quote`, `Trade`, `Greeks`, `Candle`, `Summary`, `TimeAndSale`, `Profile`,
+//!   `Underlying` and `TheoPrice` produce a [`MarketEvent`], and
 //!   configuring or subscribing to any other type is **refused** rather than
 //!   accepted into a stream that can never produce.
 //!
@@ -199,8 +199,9 @@
 //! | `TimeAndSale` | the full 22-column layout: price, size and the surrounding quote plus exchange, sale conditions, aggressor side and the print flags |
 //! | `Profile` | the full 20-column layout: description, trading status and halt window, price limits, 52-week range and the fundamentals |
 //! | `Underlying` | the full 13-column layout: implied volatility with its term structure, call and put volume and their ratio |
+//! | `TheoPrice` | the full 13-column layout: the theoretical price with the underlying price, delta, gamma, dividend and interest it came from |
 //!
-//! Configuring or subscribing to any other variant (`TheoPrice`, `Order`,
+//! Configuring or subscribing to any other variant (`Order`, `Series`,
 //! …) is **refused**, rather than accepted into a stream that can
 //! never produce.
 //!

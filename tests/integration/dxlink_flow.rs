@@ -937,3 +937,113 @@ async fn test_underlyings_reach_the_stream_and_the_callback() {
 
     client.disconnect().await.expect("failed to disconnect");
 }
+
+/// Issue #29 asks for two theoretical prices reaching both delivery paths with
+/// every pricing input intact.
+#[tokio::test]
+async fn test_theo_prices_reach_the_stream_and_the_callback() {
+    let server = MockServer::start(Behaviour::Normal).await;
+
+    let mut client = DXLinkClient::new(&server.url(), "test-token");
+    let mut event_stream = client.connect().await.expect("failed to connect");
+
+    let channel_id = client
+        .create_feed_channel("AUTO")
+        .await
+        .expect("failed to create feed channel");
+    client
+        .setup_feed(channel_id, &[EventType::TheoPrice])
+        .await
+        .expect("failed to set up feed");
+
+    let call = "AAPL240119C00150000";
+    let put = "AAPL240119P00150000";
+
+    let delivered = Arc::new(Mutex::new(Vec::new()));
+    let sink = delivered.clone();
+    client.on_event(call, move |event| {
+        sink.lock().expect("callback lock poisoned").push(event);
+    });
+
+    client
+        .subscribe(
+            channel_id,
+            vec![
+                FeedSubscription {
+                    event_type: "TheoPrice".to_string(),
+                    symbol: call.to_string(),
+                    from_time: None,
+                    source: None,
+                },
+                FeedSubscription {
+                    event_type: "TheoPrice".to_string(),
+                    symbol: put.to_string(),
+                    from_time: None,
+                    source: None,
+                },
+            ],
+        )
+        .await
+        .expect("failed to subscribe");
+
+    let events = collect_events(&mut event_stream, 2).await;
+    assert_eq!(
+        events.len(),
+        2,
+        "expected two theoretical prices, got {events:?}"
+    );
+
+    let symbols: Vec<&str> = events
+        .iter()
+        .map(|event| match event {
+            MarketEvent::TheoPrice(theo) => theo.event_symbol.as_str(),
+            other => panic!("expected a theoretical price, got {other:?}"),
+        })
+        .collect();
+    assert!(symbols.contains(&call), "the call is missing: {symbols:?}");
+    assert!(symbols.contains(&put), "the put is missing: {symbols:?}");
+
+    let theo = events
+        .iter()
+        .find_map(|event| match event {
+            MarketEvent::TheoPrice(theo) if theo.event_symbol == call => Some(theo),
+            _ => None,
+        })
+        .expect("no TheoPrice for the call reached the stream");
+
+    assert_eq!(theo.event_type, "TheoPrice");
+    assert_eq!(theo.event_time, expected::EVENT_TIME);
+    assert_eq!(theo.event_flags, expected::EVENT_FLAGS);
+    assert_eq!(theo.index, expected::INDEX);
+    assert_eq!(theo.time, expected::TIME);
+    assert_eq!(theo.sequence, expected::SEQUENCE);
+    assert_eq!(theo.price, expected::PRICE);
+    assert_eq!(theo.underlying_price, expected::UNDERLYING_PRICE);
+    assert_eq!(theo.delta, expected::DELTA);
+    assert_eq!(theo.gamma, expected::GAMMA);
+    assert_eq!(theo.dividend, expected::DIVIDEND);
+    assert_eq!(theo.interest, expected::INTEREST);
+
+    // The callback routes through symbol_of, which needed a new arm for this
+    // variant, and it is scoped to the call so the put must not appear.
+    let seen: Vec<MarketEvent> = {
+        let events = delivered.lock().expect("callback lock poisoned");
+        events.clone()
+    };
+    match seen.as_slice() {
+        [MarketEvent::TheoPrice(theo)] => {
+            assert_eq!(theo.event_symbol, call);
+            // The two prices are adjacent columns and both are prices, so this
+            // is the pair a shifted layout would swap.
+            assert_eq!(theo.price, expected::PRICE);
+            assert_eq!(theo.underlying_price, expected::UNDERLYING_PRICE);
+        }
+        other => {
+            panic!(
+                "the callback for the call should have received one theoretical price, got {other:?}"
+            )
+        }
+    }
+
+    client.disconnect().await.expect("failed to disconnect");
+}

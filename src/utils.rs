@@ -7,7 +7,7 @@ use crate::MarketEvent;
 use crate::error::{DXLinkError, DXLinkResult};
 use crate::events::{
     CandleEvent, CompactData, EventType, GreeksEvent, ProfileEvent, QuoteEvent, SummaryEvent,
-    TimeAndSaleEvent, TradeEvent, UnderlyingEvent,
+    TheoPriceEvent, TimeAndSaleEvent, TradeEvent, UnderlyingEvent,
 };
 use serde_json::Value;
 use tracing::warn;
@@ -419,6 +419,24 @@ fn build_event(
                 call_volume: number(10)?,
                 put_volume: number(11)?,
                 put_call_ratio: number(12)?,
+            })
+        }
+        EventType::TheoPrice => {
+            let int = |index: usize| as_int(row_values, index, header, row, fields[index]);
+            MarketEvent::TheoPrice(TheoPriceEvent {
+                event_type: header.to_string(),
+                event_symbol: symbol,
+                event_time: int(2)?,
+                event_flags: int(3)?,
+                index: int(4)?,
+                time: int(5)?,
+                sequence: int(6)?,
+                price: number(7)?,
+                underlying_price: number(8)?,
+                delta: number(9)?,
+                gamma: number(10)?,
+                dividend: number(11)?,
+                interest: number(12)?,
             })
         }
         // compact_fields returned Some for this type, so a missing arm here is a
@@ -1629,6 +1647,160 @@ mod underlying_tests {
         let back: MarketEvent = serde_json::from_str(&json).expect("deserialize");
         assert!(
             matches!(back, MarketEvent::Underlying(_)),
+            "an untagged round trip picked the wrong variant: {back:?}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod theo_price_tests {
+    use super::*;
+    use serde_json::json;
+
+    /// The exact 13 columns issue #29 specifies, in order.
+    fn theo_row(symbol: &str) -> Vec<Value> {
+        vec![
+            json!("TheoPrice"),          // 0 eventType
+            json!(symbol),               // 1 eventSymbol
+            json!(1_700_000_000_500i64), // 2 eventTime
+            json!(0i64),                 // 3 eventFlags
+            json!(5i64),                 // 4 index
+            json!(1_700_000_000_000i64), // 5 time
+            json!(3i64),                 // 6 sequence
+            json!(4.35),                 // 7 price
+            json!(152.4),                // 8 underlyingPrice
+            json!(0.65),                 // 9 delta
+            json!(0.05),                 // 10 gamma
+            json!(0.55),                 // 11 dividend
+            json!(4.75),                 // 12 interest
+        ]
+    }
+
+    fn batch(values: Vec<Value>) -> Vec<CompactData> {
+        vec![
+            CompactData::EventType("TheoPrice".to_string()),
+            CompactData::Values(values),
+        ]
+    }
+
+    #[test]
+    fn test_the_field_list_matches_the_decoder_stride() {
+        let fields = EventType::TheoPrice
+            .compact_fields()
+            .expect("TheoPrice has a decoder");
+        assert_eq!(fields.len(), 13, "the layout is 13 columns");
+        assert_eq!(fields.len(), theo_row("AAPL240119C00150000").len());
+    }
+
+    #[test]
+    fn test_two_theo_prices_decode_with_the_right_stride() {
+        let mut values = theo_row("AAPL240119C00150000");
+        values.extend(theo_row("AAPL240119P00150000"));
+
+        let events = try_parse_compact_data(&batch(values)).expect("well formed");
+        assert_eq!(events.len(), 2);
+
+        match (&events[0], &events[1]) {
+            (MarketEvent::TheoPrice(first), MarketEvent::TheoPrice(second)) => {
+                // The symbols prove the stride of thirteen.
+                assert_eq!(first.event_symbol, "AAPL240119C00150000");
+                assert_eq!(second.event_symbol, "AAPL240119P00150000");
+                assert_eq!(first.event_time, 1_700_000_000_500);
+                assert_eq!(first.event_flags, 0);
+                assert_eq!(first.index, 5);
+                assert_eq!(first.time, 1_700_000_000_000);
+                assert_eq!(first.sequence, 3);
+                assert_eq!(first.price, 4.35);
+                assert_eq!(first.underlying_price, 152.4);
+                assert_eq!(first.delta, 0.65);
+                assert_eq!(first.gamma, 0.05);
+                assert_eq!(first.dividend, 0.55);
+                assert_eq!(first.interest, 4.75);
+            }
+            other => panic!("expected two theoretical prices, got {other:?}"),
+        }
+    }
+
+    /// The option price and the underlying price are adjacent and both are
+    /// prices, so a one-column shift there is the drift that looks most
+    /// plausible on a screen.
+    #[test]
+    fn test_the_option_price_is_not_the_underlying_price() {
+        let events =
+            try_parse_compact_data(&batch(theo_row("AAPL240119C00150000"))).expect("well formed");
+        match &events[0] {
+            MarketEvent::TheoPrice(theo) => {
+                assert_eq!(theo.price, 4.35, "the option price is the cheap one");
+                assert_eq!(theo.underlying_price, 152.4);
+                assert!(
+                    theo.price < theo.underlying_price,
+                    "a shifted layout would swap these two"
+                );
+            }
+            other => panic!("expected a theoretical price, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_a_textual_price_is_rejected() {
+        let mut values = theo_row("AAPL240119C00150000");
+        // Not a JSONDouble special value, so it must not decode.
+        values[7] = json!("4.35");
+
+        let error = try_parse_compact_data(&batch(values)).expect_err("the column is a number");
+        assert!(
+            error.to_string().contains("price"),
+            "the field is missing: {error}"
+        );
+    }
+
+    #[test]
+    fn test_a_fractional_index_is_rejected() {
+        let mut values = theo_row("AAPL240119C00150000");
+        values[4] = json!(5.5);
+
+        let error =
+            try_parse_compact_data(&batch(values)).expect_err("the column is a whole number");
+        assert!(
+            error.to_string().contains("index"),
+            "the field is missing: {error}"
+        );
+    }
+
+    #[test]
+    fn test_an_option_with_no_dividend_decodes() {
+        // A non-dividend-paying underlying reports NaN rather than zero, and
+        // the difference matters to whoever re-prices from these inputs.
+        let mut values = theo_row("AAPL240119C00150000");
+        values[11] = json!("NaN");
+
+        let events = try_parse_compact_data(&batch(values)).expect("NaN is a value");
+        match &events[0] {
+            MarketEvent::TheoPrice(theo) => {
+                assert!(theo.dividend.is_nan());
+                assert_eq!(theo.interest, 4.75);
+            }
+            other => panic!("expected a theoretical price, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_a_truncated_theo_price_row_is_rejected() {
+        let mut values = theo_row("AAPL240119C00150000");
+        values.pop();
+        assert!(try_parse_compact_data(&batch(values)).is_err());
+    }
+
+    #[test]
+    fn test_a_theo_price_is_not_mistaken_for_another_event() {
+        let events =
+            try_parse_compact_data(&batch(theo_row("AAPL240119C00150000"))).expect("well formed");
+        assert!(matches!(events[0], MarketEvent::TheoPrice(_)));
+
+        let json = serde_json::to_string(&events[0]).expect("serialize");
+        let back: MarketEvent = serde_json::from_str(&json).expect("deserialize");
+        assert!(
+            matches!(back, MarketEvent::TheoPrice(_)),
             "an untagged round trip picked the wrong variant: {back:?}"
         );
     }

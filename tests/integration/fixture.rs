@@ -472,7 +472,8 @@ fn field_value(field: &str, event_type: &str, symbol: &str) -> Value {
         "prevDayClosePriceType" => json!("Final"),
         "prevDayVolume" => json!(58_000_000.0),
         "openInterest" => json!(4_200.0),
-        // TimeAndSale (time, price, size, bidPrice and askPrice are above)
+        // TimeAndSale (time comes from Candle, price and size from Trade,
+        // bidPrice and askPrice from Quote)
         "timeNanoPart" => json!(250_000i64),
         "exchangeCode" => json!("Q"),
         "exchangeSaleConditions" => json!("@ TI"),
@@ -502,12 +503,16 @@ fn field_value(field: &str, event_type: &str, symbol: &str) -> Value {
         "exDividendDayId" => json!(20240209i64),
         "shares" => json!(15_552_800_000.0),
         "freeFloat" => json!(15_461_900_000.0),
-        // Underlying (volatility is above, shared with Greeks)
+        // Underlying (volatility is shared with Greeks)
         "frontVolatility" => json!(0.28),
         "backVolatility" => json!(0.22),
         "callVolume" => json!(310_000.0),
         "putVolume" => json!(465_000.0),
         "putCallRatio" => json!(1.5),
+        // TheoPrice (price is shared with Trade, delta and gamma with Greeks)
+        "underlyingPrice" => json!(152.4),
+        "dividend" => json!(0.55),
+        "interest" => json!(4.75),
         // Greeks
         "delta" => json!(0.65),
         "gamma" => json!(0.05),
@@ -599,6 +604,9 @@ pub mod expected {
     pub const CALL_VOLUME: f64 = 310_000.0;
     pub const PUT_VOLUME: f64 = 465_000.0;
     pub const PUT_CALL_RATIO: f64 = 1.5;
+    pub const UNDERLYING_PRICE: f64 = 152.4;
+    pub const DIVIDEND: f64 = 0.55;
+    pub const INTEREST: f64 = 4.75;
 }
 
 /// Convenience predicates for `wait_for`.

@@ -297,6 +297,21 @@ impl EventType {
                 "putVolume",
                 "putCallRatio",
             ]),
+            EventType::TheoPrice => Some(&[
+                "eventType",
+                "eventSymbol",
+                "eventTime",
+                "eventFlags",
+                "index",
+                "time",
+                "sequence",
+                "price",
+                "underlyingPrice",
+                "delta",
+                "gamma",
+                "dividend",
+                "interest",
+            ]),
             EventType::Greeks => Some(&[
                 "eventType",
                 "eventSymbol",
@@ -311,7 +326,6 @@ impl EventType {
             EventType::Order
             | EventType::TradeETH
             | EventType::SpreadOrder
-            | EventType::TheoPrice
             | EventType::Series
             | EventType::Configuration
             | EventType::Message => None,
@@ -904,6 +918,64 @@ pub struct UnderlyingEvent {
     pub put_call_ratio: f64,
 }
 
+/// The theoretical price of an option and the inputs it was computed from.
+///
+/// Every field the dxFeed AsyncAPI schema defines for a theoretical price, in
+/// the order the client requests them. The inputs travel with the output on
+/// purpose: a theoretical price is only meaningful next to the underlying
+/// price, dividend and interest rate that produced it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TheoPriceEvent {
+    /// The type of the event, `TheoPrice`.
+    #[serde(rename = "eventType")]
+    pub event_type: String,
+
+    /// The option symbol the price is for.
+    #[serde(rename = "eventSymbol")]
+    pub event_symbol: String,
+
+    /// When the server emitted the event, as epoch milliseconds.
+    #[serde(rename = "eventTime")]
+    pub event_time: i64,
+
+    /// Transactional and snapshot bits for this record.
+    #[serde(rename = "eventFlags")]
+    pub event_flags: i64,
+
+    /// Unique index of the record, ordering it within the stream.
+    pub index: i64,
+
+    /// When the price was computed, as epoch milliseconds.
+    pub time: i64,
+
+    /// Sequence number, separating records that share a millisecond.
+    pub sequence: i64,
+
+    /// Theoretical option price.
+    #[serde(with = "json_double")]
+    pub price: f64,
+
+    /// Underlying price the theoretical price was computed from.
+    #[serde(rename = "underlyingPrice", with = "json_double")]
+    pub underlying_price: f64,
+
+    /// Delta of the option at that price.
+    #[serde(with = "json_double")]
+    pub delta: f64,
+
+    /// Gamma of the option at that price.
+    #[serde(with = "json_double")]
+    pub gamma: f64,
+
+    /// Dividend rate used as an input.
+    #[serde(with = "json_double")]
+    pub dividend: f64,
+
+    /// Interest rate used as an input.
+    #[serde(with = "json_double")]
+    pub interest: f64,
+}
+
 /// Represents a market event, which can be a quote, trade, or greeks event.
 ///
 /// This enum uses `serde`'s untagged enum serialization, meaning that the serialized
@@ -979,13 +1051,15 @@ pub enum MarketEvent {
     /// Instrument metadata: description, trading status and fundamentals.
     Profile(ProfileEvent),
     /// The option surface over an underlying: implied volatility and volumes.
+    Underlying(UnderlyingEvent),
+    /// A theoretical option price with the inputs it was computed from.
     ///
     /// New variants go last on purpose: `MarketEvent` is `#[serde(untagged)]`,
     /// so serde tries them in declaration order and keeps the first that
     /// deserializes. Appending leaves every variant already in the list
     /// matching exactly as it did. Each type has a round-trip test that would
     /// catch one variant stealing another's payload.
-    Underlying(UnderlyingEvent),
+    TheoPrice(TheoPriceEvent),
 }
 
 /// Represents compact data, which can be either an event type (string) or a vector of JSON values.
@@ -1705,6 +1779,29 @@ mod event_serde_tests {
         }
     }
 
+    fn theo_price() -> TheoPriceEvent {
+        TheoPriceEvent {
+            event_type: "TheoPrice".to_string(),
+            event_symbol: "AAPL240119C00150000".to_string(),
+            event_time: 1_700_000_000_500,
+            event_flags: 0,
+            index: 5,
+            time: 1_700_000_000_000,
+            sequence: 3,
+            price: 4.35,
+            underlying_price: 152.4,
+            delta: 0.65,
+            gamma: 0.05,
+            dividend: 0.55,
+            interest: 4.75,
+        }
+    }
+
+    #[test]
+    fn test_theo_price_serde_names_match_its_layout() {
+        assert_wire_contract(&theo_price(), EventType::TheoPrice);
+    }
+
     #[test]
     fn test_underlying_serde_names_match_its_layout() {
         assert_wire_contract(&underlying(), EventType::Underlying);
@@ -1767,6 +1864,7 @@ mod event_serde_tests {
             MarketEvent::TimeAndSale(print()),
             MarketEvent::Profile(profile()),
             MarketEvent::Underlying(underlying()),
+            MarketEvent::TheoPrice(theo_price()),
         ] {
             let serialized = to_string(&event).expect("serialize");
             let back: MarketEvent = from_str(&serialized).expect("round trip");
