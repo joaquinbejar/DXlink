@@ -13,8 +13,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
     info!("Starting DXLink client...");
 
     // Get configuration from environment variables
-    let url =
-        env::var("DXLINK_WS_URL").unwrap_or_else(|_| "wss://demo.dxfeed.com/dxlink-ws".to_string());
+    let url = env::var("DXLINK_WS_URL")
+        .unwrap_or_else(|_| "wss://tasty-demo-dxlink-md-ws.dxfeed.com/delayed".to_string());
     let token = env::var("DXLINK_API_TOKEN").unwrap_or_else(|_| String::new());
 
     info!("Using DXLink URL: {}", url);

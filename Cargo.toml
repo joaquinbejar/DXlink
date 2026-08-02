@@ -3,7 +3,7 @@ name = "dxlink"
 version = "0.3.0"
 edition = "2024"
 license = "MIT"
-description = "Library for trading through tastytrade's API"
+description = "Rust client for the DXLink WebSocket protocol: real-time market data from tastytrade/dxFeed"
 repository = "https://github.com/joaquinbejar/DXlink"
 
 include = [

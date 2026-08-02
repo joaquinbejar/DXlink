@@ -4,15 +4,27 @@
 //! for real-time market data. This library provides a clean and type-safe API for connecting
 //! to DXLink servers, subscribing to market events, and processing real-time market data.
 //!
-//! ## Features
+//! ## What is supported
 //!
-//! - Full implementation of the DXLink WebSocket protocol (AsyncAPI 2.4.0)
-//! - Strongly typed event definitions for Quote, Trade, Greeks, and more
-//! - Async/await based API for efficient resource usage
-//! - Automatic handling of authentication and connection maintenance
-//! - Support for multiple subscription channels
-//! - Callback and stream-based APIs for event processing
-//! - Robust error handling and reconnection logic
+//! - Session lifecycle over the DXLink WebSocket protocol: `SETUP`, token
+//!   authentication, feed channels, `FEED_SETUP`, subscribe and unsubscribe.
+//! - Automatic keepalives while the connection is open.
+//! - Market events decoded from the `COMPACT` wire format: **`Quote`, `Trade`
+//!   and `Greeks`**.
+//! - Both delivery styles: a per-symbol callback and a single event stream.
+//! - Historical data through `Candle` subscriptions with `from_time`.
+//! - Typed errors ([`DXLinkError`]) with [`DXLinkError::is_terminal`] to tell a
+//!   lost connection from one bad message.
+//!
+//! ## What is not supported yet
+//!
+//! - **No reconnection.** If the connection drops, the client reports the error
+//!   and stops; re-establishing the session is the caller's job.
+//! - [`EventType`] declares more variants than the library can decode. Only
+//!   `Quote`, `Trade` and `Greeks` produce a [`MarketEvent`]; subscribing to any
+//!   other type is accepted by the server but never delivers events here.
+//! - The consumer is not notified when the event stream stops producing because
+//!   the connection was lost.
 //!
 //! ref: <https://raw.githubusercontent.com/dxFeed/dxLink/refs/heads/main/dxlink-specification/asyncapi.yml>
 //!
@@ -34,26 +46,24 @@
 //!     // (typically obtained from tastytrade API)
 //!     use tracing::info;
 //! let token = "your_api_token_here";
-//!     let url = "wss://tasty-openapi-ws.dxfeed.com/realtime";
+//!     let url = "wss://tasty-demo-dxlink-md-ws.dxfeed.com/delayed";
 //!     let mut client = DXLinkClient::new(url, token);
 //!     
-//!     // Connect to the DXLink server
-//!     client.connect().await?;
-//!     
+//!     // Connect to the DXLink server. This returns the event stream; there is
+//!     // exactly one, and asking for it again is an error.
+//!     let mut event_stream = client.connect().await?;
+//!
 //!     // Create a feed channel with AUTO contract type
 //!     let channel_id = client.create_feed_channel("AUTO").await?;
-//!     
+//!
 //!     // Configure the channel for Quote and Trade events
 //!     client.setup_feed(channel_id, &[EventType::Quote, EventType::Trade]).await?;
-//!     
+//!
 //!     // Register a callback for specific symbol
 //!     client.on_event("SPY", |event| {
 //!         info!("Event received for SPY: {:?}", event);
 //!     });
-//!     
-//!     // Get a stream for all events
-//!     let mut event_stream = client.event_stream()?;
-//!     
+//!
 //!     // Process events in a separate task
 //!     tokio::spawn(async move {
 //!         while let Some(event) = event_stream.recv().await {
@@ -160,15 +170,19 @@
 //!
 //! ## Available Event Types
 //!
-//! The library supports the following event types:
+//! [`EventType`] mirrors the event types DXLink itself defines, but only these
+//! are decoded into a [`MarketEvent`] and delivered:
 //!
-//! - `Quote` - Current bid/ask prices and sizes
-//! - `Trade` - Last trade information
-//! - `Greeks` - Option greeks data (delta, gamma, theta, etc.)
-//! - `Summary` - Daily summary information
-//! - `Profile` - Instrument profile information
-//! - `Candle` - OHLC (Open, High, Low, Close) data for time periods
-//! - And more!
+//! | Event type | Decoded fields |
+//! |------------|----------------|
+//! | `Quote`  | `bidPrice`, `askPrice`, `bidSize`, `askSize` |
+//! | `Trade`  | `price`, `size`, `dayVolume` |
+//! | `Greeks` | `delta`, `gamma`, `theta`, `vega`, `rho`, `volatility` |
+//!
+//! Subscribing to any other variant (`Summary`, `Profile`, `Candle`,
+//! `TimeAndSale`, …) is accepted by the server, but no event will reach your
+//! callback or stream. `Candle` in particular is usable only to request
+//! historical data; the rows are not decoded yet.
 //!
 //!
 //! ## License
