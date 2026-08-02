@@ -4,8 +4,8 @@
 //! Every assertion here used to be either commented out or replaced by a
 //! warning log, which is why subscription bugs could not fail the suite.
 
-use crate::fixture::{Behaviour, MockServer, is_type_on_channel};
-use dxlink::{DXLinkClient, EventType, FeedSubscription};
+use crate::fixture::{Behaviour, MockServer, expected, is_type_on_channel};
+use dxlink::{DXLinkClient, EventType, FeedSubscription, MarketEvent};
 
 /// Opens a connected client with a configured feed channel.
 async fn connected_feed(server: &MockServer, events: &[EventType]) -> (DXLinkClient, u32) {
@@ -102,50 +102,73 @@ async fn test_reset_subscriptions_sends_the_reset_flag() {
     client.disconnect().await.expect("failed to disconnect");
 }
 
-/// Historical data is requested by adding `fromTime`, but this client has no
-/// Candle decoder yet, so the request is refused rather than accepted into a
-/// stream that can never produce. Restore the delivery assertions here when the
-/// Candle decoder lands.
+/// Historical data is requested by adding `fromTime`, and now that Candle rows
+/// decode, the bars must actually arrive. The refusal this replaces was the
+/// honest behaviour while there was no decoder.
 #[tokio::test]
-async fn test_historical_subscription_is_refused_without_a_decoder() {
+async fn test_historical_candles_are_requested_and_delivered() {
     let server = MockServer::start(Behaviour::Normal).await;
     let mut client = DXLinkClient::new(&server.url(), "test-token");
-    client.connect().await.expect("failed to connect");
+    let mut stream = client.connect().await.expect("failed to connect");
     let channel_id = client
         .create_feed_channel("AUTO")
         .await
         .expect("failed to create feed channel");
-
-    // Configuring the channel for Candle is refused first.
-    assert!(
-        client
-            .setup_feed(channel_id, &[EventType::Candle])
-            .await
-            .is_err(),
-        "a type with no decoder must not be configurable"
-    );
-
-    // And so is subscribing, on a channel configured for something else.
     client
-        .setup_feed(channel_id, &[EventType::Quote])
+        .setup_feed(channel_id, &[EventType::Candle])
         .await
-        .expect("failed to set up feed");
+        .expect("Candle has a decoder now, so configuring it must work");
 
-    let result = client
+    // Fixed value rather than "now": the assertion is about faithful transport.
+    let from_time: i64 = 1_700_000_000_000;
+
+    client
         .subscribe(
             channel_id,
             vec![FeedSubscription {
                 event_type: "Candle".to_string(),
                 symbol: "AAPL{=5m}".to_string(),
-                from_time: Some(1_700_000_000_000),
+                from_time: Some(from_time),
                 source: None,
             }],
         )
+        .await
+        .expect("failed to subscribe to historical data");
+
+    let subscription = server
+        .wait_for("the historical subscription", |m| {
+            is_type_on_channel("FEED_SUBSCRIPTION", channel_id)(m) && m.get("add").is_some()
+        })
         .await;
-    assert!(
-        result.is_err(),
-        "an undecodable subscription must be refused"
+
+    let added = subscription["add"]
+        .as_array()
+        .expect("add should be a list");
+    assert_eq!(added[0]["symbol"], "AAPL{=5m}");
+    assert_eq!(
+        added[0]["fromTime"].as_i64(),
+        Some(from_time),
+        "fromTime must reach the wire unchanged"
     );
+
+    // And the bar comes back decoded.
+    let event = tokio::time::timeout(std::time::Duration::from_secs(5), stream.recv())
+        .await
+        .expect("no candle arrived")
+        .expect("the stream closed");
+
+    match event {
+        MarketEvent::Candle(candle) => {
+            assert_eq!(candle.event_symbol, "AAPL{=5m}");
+            assert_eq!(candle.time, expected::TIME);
+            assert_eq!(candle.open, expected::OPEN);
+            assert_eq!(candle.high, expected::HIGH);
+            assert_eq!(candle.low, expected::LOW);
+            assert_eq!(candle.close, expected::CLOSE);
+            assert_eq!(candle.volume, expected::VOLUME);
+        }
+        other => panic!("expected a candle, got {other:?}"),
+    }
 
     client.disconnect().await.expect("failed to disconnect");
 }

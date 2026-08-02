@@ -444,6 +444,13 @@ fn field_value(field: &str, event_type: &str, symbol: &str) -> Value {
         "price" => json!(151.25),
         "size" => json!(75.0),
         "dayVolume" => json!(10_000_000.0),
+        // Candle
+        "time" => json!(1_700_000_000_000i64),
+        "open" => json!(149.0),
+        "high" => json!(151.0),
+        "low" => json!(148.5),
+        "close" => json!(150.5),
+        "volume" => json!(1_234_000.0),
         // Greeks
         "delta" => json!(0.65),
         "gamma" => json!(0.05),
@@ -470,6 +477,12 @@ pub mod expected {
     pub const VEGA: f64 = 0.1;
     pub const RHO: f64 = 0.03;
     pub const VOLATILITY: f64 = 0.25;
+    pub const TIME: i64 = 1_700_000_000_000;
+    pub const OPEN: f64 = 149.0;
+    pub const HIGH: f64 = 151.0;
+    pub const LOW: f64 = 148.5;
+    pub const CLOSE: f64 = 150.5;
+    pub const VOLUME: f64 = 1_234_000.0;
 }
 
 /// Convenience predicates for `wait_for`.

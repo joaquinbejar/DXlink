@@ -200,6 +200,16 @@ impl EventType {
                 "askSize",
             ]),
             EventType::Trade => Some(&["eventType", "eventSymbol", "price", "size", "dayVolume"]),
+            EventType::Candle => Some(&[
+                "eventType",
+                "eventSymbol",
+                "time",
+                "open",
+                "high",
+                "low",
+                "close",
+                "volume",
+            ]),
             EventType::Greeks => Some(&[
                 "eventType",
                 "eventSymbol",
@@ -215,7 +225,6 @@ impl EventType {
             | EventType::Profile
             | EventType::Order
             | EventType::TimeAndSale
-            | EventType::Candle
             | EventType::TradeETH
             | EventType::SpreadOrder
             | EventType::TheoPrice
@@ -417,6 +426,45 @@ pub struct GreeksEvent {
     pub volatility: f64,
 }
 
+/// One OHLC bar for a period, the shape historical data comes back in.
+///
+/// Candle symbols carry the period, for example `AAPL{=5m}` for five minute
+/// bars. Field names and their meaning follow the dxFeed AsyncAPI schema.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CandleEvent {
+    /// The type of the event, `Candle`.
+    #[serde(rename = "eventType")]
+    pub event_type: String,
+
+    /// The candle symbol, including its period, such as `AAPL{=5m}`.
+    #[serde(rename = "eventSymbol")]
+    pub event_symbol: String,
+
+    /// Start of the bar, as epoch milliseconds.
+    #[serde(rename = "time")]
+    pub time: i64,
+
+    /// First price in the bar.
+    #[serde(rename = "open", with = "json_double")]
+    pub open: f64,
+
+    /// Highest price in the bar.
+    #[serde(rename = "high", with = "json_double")]
+    pub high: f64,
+
+    /// Lowest price in the bar.
+    #[serde(rename = "low", with = "json_double")]
+    pub low: f64,
+
+    /// Last price in the bar.
+    #[serde(rename = "close", with = "json_double")]
+    pub close: f64,
+
+    /// Total volume traded during the bar.
+    #[serde(rename = "volume", with = "json_double")]
+    pub volume: f64,
+}
+
 /// Represents a market event, which can be a quote, trade, or greeks event.
 ///
 /// This enum uses `serde`'s untagged enum serialization, meaning that the serialized
@@ -483,6 +531,13 @@ pub enum MarketEvent {
     /// Represents a Greeks event, containing Greek values (delta, gamma, theta, vega, rho)
     /// for a specific financial instrument.
     Greeks(GreeksEvent),
+    /// One OHLC bar, from a historical or streaming candle subscription.
+    ///
+    /// Last in the list on purpose: `MarketEvent` is `#[serde(untagged)]`, so
+    /// serde tries variants in declaration order and keeps the first that
+    /// deserializes. A candle has fields none of the others do, but ordering it
+    /// after them keeps the existing three matching exactly as before.
+    Candle(CandleEvent),
 }
 
 /// Represents compact data, which can be either an event type (string) or a vector of JSON values.
