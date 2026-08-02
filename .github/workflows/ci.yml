@@ -75,3 +75,36 @@ jobs:
       - run: rm -f rust-toolchain.toml
       - run: cargo +1.88.0 build --workspace --all-features
       - run: cargo +1.88.0 test --workspace --all-features
+
+  # Produces the report the 75% project and patch gates in codecov.yml are
+  # measured against. Without this job those gates were documented but never
+  # evaluated, so a patch with no tests could not fail anything.
+  #
+  # Branch protection: make "codecov/project" and "codecov/patch" required
+  # status checks on main, alongside build, lint, run_tests, audit and msrv.
+  # Codecov posts them per pull request; without the required-check setting they
+  # report but do not block.
+  coverage:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # Pinned so a tarpaulin release cannot change coverage numbers on its own.
+      - name: Install cargo-tarpaulin
+        run: cargo install --locked cargo-tarpaulin --version ^0.32
+      - name: Measure coverage
+        env:
+          LOGLEVEL: WARN
+        # No --exclude-files: nothing here is generated or vendored, so
+        # excluding anything would only flatter the number.
+        run: cargo tarpaulin --workspace --all-features --timeout 180 --out xml
+      # Fail loudly rather than uploading nothing and reporting success.
+      - name: Verify the report exists
+        run: test -s cobertura.xml
+      - name: Upload to Codecov
+        uses: codecov/codecov-action@v5
+        with:
+          files: cobertura.xml
+          fail_ci_if_error: true
+          token: ${{ secrets.CODECOV_TOKEN }}

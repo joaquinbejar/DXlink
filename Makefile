@@ -89,19 +89,21 @@ publish: readme coverage
 	cargo package
 	cargo publish
 
+.PHONY: check-cargo-tarpaulin
+check-cargo-tarpaulin:
+	@command -v cargo-tarpaulin > /dev/null || (echo "Installing cargo-tarpaulin..."; cargo install --locked cargo-tarpaulin --version '^0.32')
+
 .PHONY: coverage
-coverage:
+coverage: check-cargo-tarpaulin
 	export LOGLEVEL=WARN
-	cargo install cargo-tarpaulin
 	mkdir -p coverage
-	cargo tarpaulin --all-features --workspace --timeout 120 --out Xml
+	cargo tarpaulin --all-features --workspace --timeout 180 --out Xml
 
 .PHONY: coverage-html
-coverage-html:
+coverage-html: check-cargo-tarpaulin
 	export LOGLEVEL=WARN
-	cargo install cargo-tarpaulin
 	mkdir -p coverage
-	cargo tarpaulin --all-features --workspace --timeout 120 --out Html
+	cargo tarpaulin --all-features --workspace --timeout 180 --out Html
 
 .PHONY: open-coverage
 open-coverage:
