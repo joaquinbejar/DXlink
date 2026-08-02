@@ -657,3 +657,98 @@ async fn test_a_rejected_reconfiguration_invalidates_the_channel() {
 
     client.disconnect().await.expect("failed to disconnect");
 }
+
+// --- Fallible event type parsing (issue #21) -------------------------------
+
+/// A misspelled event type used to go out on the wire verbatim while being
+/// recorded locally as Quote, so the client believed in a subscription it had
+/// never made and the server had never acknowledged.
+#[tokio::test]
+async fn test_subscribing_with_an_unknown_event_type_is_rejected() {
+    let server = MockServer::start(Behaviour::Normal).await;
+    let mut client = DXLinkClient::new(&server.url(), "test-token");
+    client.connect().await.expect("failed to connect");
+    let channel_id = client
+        .create_feed_channel("AUTO")
+        .await
+        .expect("failed to create feed channel");
+    client
+        .setup_feed(channel_id, &[EventType::Quote])
+        .await
+        .expect("failed to set up feed");
+
+    let result = client
+        .subscribe(
+            channel_id,
+            vec![FeedSubscription {
+                event_type: "Qutoe".to_string(),
+                symbol: "AAPL".to_string(),
+                from_time: None,
+                source: None,
+            }],
+        )
+        .await;
+
+    match result {
+        Err(DXLinkError::Protocol(msg)) => {
+            assert!(
+                msg.contains("Qutoe"),
+                "the offending name is missing: {msg}"
+            );
+        }
+        other => panic!("a misspelled event type must be rejected, got: {other:?}"),
+    }
+
+    // And nothing reached the wire.
+    let sent = server
+        .received()
+        .iter()
+        .filter(|m| m["type"] == "FEED_SUBSCRIPTION")
+        .count();
+    assert_eq!(sent, 0, "a rejected subscription still went out");
+
+    client.disconnect().await.expect("failed to disconnect");
+}
+
+/// One bad entry rejects the batch: sending half and recording the other half
+/// leaves the client and the server disagreeing about what is subscribed.
+#[tokio::test]
+async fn test_a_batch_with_one_bad_type_is_rejected_whole() {
+    let server = MockServer::start(Behaviour::Normal).await;
+    let mut client = DXLinkClient::new(&server.url(), "test-token");
+    client.connect().await.expect("failed to connect");
+    let channel_id = client
+        .create_feed_channel("AUTO")
+        .await
+        .expect("failed to create feed channel");
+    client
+        .setup_feed(channel_id, &[EventType::Quote])
+        .await
+        .expect("failed to set up feed");
+
+    let good = FeedSubscription {
+        event_type: "Quote".to_string(),
+        symbol: "AAPL".to_string(),
+        from_time: None,
+        source: None,
+    };
+    let bad = FeedSubscription {
+        event_type: "Nonsense".to_string(),
+        symbol: "MSFT".to_string(),
+        from_time: None,
+        source: None,
+    };
+
+    assert!(client.subscribe(channel_id, vec![good, bad]).await.is_err());
+    assert_eq!(
+        server
+            .received()
+            .iter()
+            .filter(|m| m["type"] == "FEED_SUBSCRIPTION")
+            .count(),
+        0,
+        "a partially valid batch still went out"
+    );
+
+    client.disconnect().await.expect("failed to disconnect");
+}

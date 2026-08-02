@@ -64,6 +64,16 @@ impl fmt::Display for EventType {
     }
 }
 
+/// Parses a wire name, answering `Quote` for anything it does not recognise.
+///
+/// **This conversion loses information and should not be used on a protocol
+/// path.** A typo such as `"Qutoe"` becomes `Quote`, so the client records a
+/// subscription it never made while sending the misspelling to the server.
+/// Use [`EventType::from_str`] or [`EventType::from_wire_name`] instead, both
+/// of which say they do not know the name.
+///
+/// It is kept for source compatibility and is scheduled for removal in the
+/// next minor release of the 0.x line; nothing inside this crate uses it.
 impl From<&str> for EventType {
     fn from(s: &str) -> Self {
         match s {
@@ -84,6 +94,36 @@ impl From<&str> for EventType {
             "Message" => EventType::Message,
             _ => EventType::Quote, // Default
         }
+    }
+}
+
+impl std::str::FromStr for EventType {
+    type Err = crate::DXLinkError;
+
+    /// Parses a wire name, rejecting anything the protocol does not declare.
+    ///
+    /// # Errors
+    ///
+    /// [`DXLinkError::Protocol`](crate::DXLinkError::Protocol) naming the
+    /// string that was not recognised.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use dxlink::EventType;
+    ///
+    /// assert_eq!("Quote".parse::<EventType>().unwrap(), EventType::Quote);
+    /// // The lenient From impl would answer Quote for this.
+    /// assert!("Qutoe".parse::<EventType>().is_err());
+    /// ```
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        EventType::from_wire_name(s).ok_or_else(|| {
+            crate::DXLinkError::Protocol(format!(
+                "`{s}` is not a DXLink event type; the protocol declares Quote, Trade, \
+                 Summary, Profile, Order, TimeAndSale, Candle, TradeETH, SpreadOrder, \
+                 Greeks, TheoPrice, Underlying, Series, Configuration and Message"
+            ))
+        })
     }
 }
 
