@@ -6,8 +6,8 @@
 use crate::MarketEvent;
 use crate::error::{DXLinkError, DXLinkResult};
 use crate::events::{
-    CandleEvent, CompactData, EventType, GreeksEvent, QuoteEvent, SummaryEvent, TimeAndSaleEvent,
-    TradeEvent,
+    CandleEvent, CompactData, EventType, GreeksEvent, ProfileEvent, QuoteEvent, SummaryEvent,
+    TimeAndSaleEvent, TradeEvent,
 };
 use serde_json::Value;
 use tracing::warn;
@@ -373,6 +373,34 @@ fn build_event(
                 sale_type: text(19)?,
                 buyer: text(20)?,
                 seller: text(21)?,
+            })
+        }
+        EventType::Profile => {
+            let int = |index: usize| as_int(row_values, index, header, row, fields[index]);
+            let text = |index: usize| {
+                as_text(row_values, index, header, row, fields[index]).map(str::to_string)
+            };
+            MarketEvent::Profile(ProfileEvent {
+                event_type: header.to_string(),
+                event_symbol: symbol,
+                event_time: int(2)?,
+                description: text(3)?,
+                short_sale_restriction: text(4)?,
+                trading_status: text(5)?,
+                status_reason: text(6)?,
+                halt_start_time: int(7)?,
+                halt_end_time: int(8)?,
+                high_limit_price: number(9)?,
+                low_limit_price: number(10)?,
+                high_52_week_price: number(11)?,
+                low_52_week_price: number(12)?,
+                beta: number(13)?,
+                earnings_per_share: number(14)?,
+                dividend_frequency: number(15)?,
+                ex_dividend_amount: number(16)?,
+                ex_dividend_day_id: int(17)?,
+                shares: number(18)?,
+                free_float: number(19)?,
             })
         }
         // compact_fields returned Some for this type, so a missing arm here is a
@@ -1199,6 +1227,230 @@ mod time_and_sale_tests {
         let back: MarketEvent = serde_json::from_str(&json).expect("deserialize");
         assert!(
             matches!(back, MarketEvent::TimeAndSale(_)),
+            "an untagged round trip picked the wrong variant: {back:?}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod profile_tests {
+    use super::*;
+    use serde_json::json;
+
+    /// The exact 20 columns issue #27 specifies, in order.
+    fn profile_row(symbol: &str) -> Vec<Value> {
+        vec![
+            json!("Profile"),                   // 0 eventType
+            json!(symbol),                      // 1 eventSymbol
+            json!(1_700_000_000_500i64),        // 2 eventTime
+            json!("Apple Inc. - Common Stock"), // 3 description
+            json!("Inactive"),                  // 4 shortSaleRestriction
+            json!("Halted"),                    // 5 tradingStatus
+            json!("News pending"),              // 6 statusReason
+            json!(1_700_000_100_000i64),        // 7 haltStartTime
+            json!(1_700_000_900_000i64),        // 8 haltEndTime
+            json!(165.0),                       // 9 highLimitPrice
+            json!(135.0),                       // 10 lowLimitPrice
+            json!(199.62),                      // 11 high52WeekPrice
+            json!(124.17),                      // 12 low52WeekPrice
+            json!(1.29),                        // 13 beta
+            json!(6.13),                        // 14 earningsPerShare
+            json!(4.0),                         // 15 dividendFrequency
+            json!(0.24),                        // 16 exDividendAmount
+            json!(20240209i64),                 // 17 exDividendDayId
+            json!(15_552_800_000.0),            // 18 shares
+            json!(15_461_900_000.0),            // 19 freeFloat
+        ]
+    }
+
+    fn batch(values: Vec<Value>) -> Vec<CompactData> {
+        vec![
+            CompactData::EventType("Profile".to_string()),
+            CompactData::Values(values),
+        ]
+    }
+
+    #[test]
+    fn test_the_field_list_matches_the_decoder_stride() {
+        let fields = EventType::Profile
+            .compact_fields()
+            .expect("Profile has a decoder");
+        assert_eq!(fields.len(), 20, "the layout is 20 columns");
+        assert_eq!(fields.len(), profile_row("AAPL").len());
+    }
+
+    #[test]
+    fn test_two_profiles_decode_with_the_right_stride() {
+        let mut values = profile_row("AAPL");
+        values.extend(profile_row("MSFT"));
+
+        let events = try_parse_compact_data(&batch(values)).expect("well formed");
+        assert_eq!(events.len(), 2);
+
+        match (&events[0], &events[1]) {
+            (MarketEvent::Profile(first), MarketEvent::Profile(second)) => {
+                // The symbols prove the stride of twenty.
+                assert_eq!(first.event_symbol, "AAPL");
+                assert_eq!(second.event_symbol, "MSFT");
+                assert_eq!(first.event_time, 1_700_000_000_500);
+                assert_eq!(first.description, "Apple Inc. - Common Stock");
+                assert_eq!(first.short_sale_restriction, "Inactive");
+                assert_eq!(first.trading_status, "Halted");
+                assert_eq!(first.status_reason, "News pending");
+                assert_eq!(first.halt_start_time, 1_700_000_100_000);
+                assert_eq!(first.halt_end_time, 1_700_000_900_000);
+                assert_eq!(first.high_limit_price, 165.0);
+                assert_eq!(first.low_limit_price, 135.0);
+                assert_eq!(first.high_52_week_price, 199.62);
+                assert_eq!(first.low_52_week_price, 124.17);
+                assert_eq!(first.beta, 1.29);
+                assert_eq!(first.earnings_per_share, 6.13);
+                assert_eq!(first.dividend_frequency, 4.0);
+                assert_eq!(first.ex_dividend_amount, 0.24);
+                assert_eq!(first.ex_dividend_day_id, 20240209);
+                assert_eq!(first.shares, 15_552_800_000.0);
+                assert_eq!(first.free_float, 15_461_900_000.0);
+            }
+            other => panic!("expected two profiles, got {other:?}"),
+        }
+    }
+
+    /// The four text columns sit next to each other, so a one-column shift
+    /// keeps decoding and only changes which string is which.
+    #[test]
+    fn test_the_status_columns_keep_their_own_meaning() {
+        let mut values = profile_row("AAPL");
+        values[4] = json!("Active");
+        values[5] = json!("Active");
+        values[6] = json!("");
+
+        let events = try_parse_compact_data(&batch(values)).expect("well formed");
+        match &events[0] {
+            MarketEvent::Profile(profile) => {
+                assert_eq!(profile.short_sale_restriction, "Active");
+                assert_eq!(profile.trading_status, "Active");
+                // A trading instrument has no reason to report, and an empty
+                // string is a value rather than a missing column.
+                assert_eq!(profile.status_reason, "");
+                assert_eq!(profile.description, "Apple Inc. - Common Stock");
+            }
+            other => panic!("expected a profile, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_a_numeric_trading_status_is_rejected() {
+        let mut values = profile_row("AAPL");
+        values[5] = json!(1.0);
+
+        let error = try_parse_compact_data(&batch(values)).expect_err("the column is text");
+        assert!(
+            error.to_string().contains("tradingStatus"),
+            "the field is missing: {error}"
+        );
+    }
+
+    #[test]
+    fn test_a_textual_limit_price_is_rejected() {
+        let mut values = profile_row("AAPL");
+        // "165.0" as text is what a shifted layout looks like, and it is not a
+        // JSONDouble special value, so it must not decode.
+        values[9] = json!("165.0");
+
+        let error = try_parse_compact_data(&batch(values)).expect_err("the column is a number");
+        assert!(
+            error.to_string().contains("highLimitPrice"),
+            "the field is missing: {error}"
+        );
+    }
+
+    #[test]
+    fn test_an_instrument_without_fundamentals_decodes() {
+        // An index has no earnings, dividends or float; the protocol sends NaN
+        // rather than omitting the columns.
+        let mut values = profile_row("SPX");
+        values[13] = json!("NaN");
+        values[14] = json!("NaN");
+        values[18] = json!("NaN");
+        values[19] = json!("NaN");
+
+        let events = try_parse_compact_data(&batch(values)).expect("NaN is a value");
+        match &events[0] {
+            MarketEvent::Profile(profile) => {
+                assert!(profile.beta.is_nan());
+                assert!(profile.earnings_per_share.is_nan());
+                assert!(profile.shares.is_nan());
+                assert!(profile.free_float.is_nan());
+                // The limits still have to be real numbers.
+                assert_eq!(profile.high_limit_price, 165.0);
+            }
+            other => panic!("expected a profile, got {other:?}"),
+        }
+    }
+
+    /// The venue reports no upper limit as positive infinity, which JSON has no
+    /// literal for.
+    #[test]
+    fn test_an_unbounded_limit_price_decodes() {
+        let mut values = profile_row("AAPL");
+        values[9] = json!("Infinity");
+        values[10] = json!("-Infinity");
+
+        let events = try_parse_compact_data(&batch(values)).expect("Infinity is a value");
+        match &events[0] {
+            MarketEvent::Profile(profile) => {
+                assert_eq!(profile.high_limit_price, f64::INFINITY);
+                assert_eq!(profile.low_limit_price, f64::NEG_INFINITY);
+            }
+            other => panic!("expected a profile, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_a_truncated_profile_row_is_rejected() {
+        let mut values = profile_row("AAPL");
+        values.pop();
+        assert!(try_parse_compact_data(&batch(values)).is_err());
+    }
+
+    #[test]
+    fn test_a_profile_is_not_mistaken_for_another_event() {
+        let events = try_parse_compact_data(&batch(profile_row("AAPL"))).expect("well formed");
+        assert!(matches!(events[0], MarketEvent::Profile(_)));
+
+        let json = serde_json::to_string(&events[0]).expect("serialize");
+        // Every camelCase wire name has to survive the round trip.
+        for field in [
+            "eventType",
+            "eventSymbol",
+            "eventTime",
+            "description",
+            "shortSaleRestriction",
+            "tradingStatus",
+            "statusReason",
+            "haltStartTime",
+            "haltEndTime",
+            "highLimitPrice",
+            "lowLimitPrice",
+            "high52WeekPrice",
+            "low52WeekPrice",
+            "beta",
+            "earningsPerShare",
+            "dividendFrequency",
+            "exDividendAmount",
+            "exDividendDayId",
+            "shares",
+            "freeFloat",
+        ] {
+            assert!(
+                json.contains(&format!("\"{field}\":")),
+                "wire name `{field}` is missing: {json}"
+            );
+        }
+
+        let back: MarketEvent = serde_json::from_str(&json).expect("deserialize");
+        assert!(
+            matches!(back, MarketEvent::Profile(_)),
             "an untagged round trip picked the wrong variant: {back:?}"
         );
     }

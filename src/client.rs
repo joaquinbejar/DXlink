@@ -351,6 +351,7 @@ fn symbol_of(event: &MarketEvent) -> &str {
         MarketEvent::Candle(e) => &e.event_symbol,
         MarketEvent::Summary(e) => &e.event_symbol,
         MarketEvent::TimeAndSale(e) => &e.event_symbol,
+        MarketEvent::Profile(e) => &e.event_symbol,
     }
 }
 

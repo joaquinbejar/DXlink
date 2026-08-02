@@ -236,6 +236,28 @@ impl EventType {
                 "impVolatility",
                 "openInterest",
             ]),
+            EventType::Profile => Some(&[
+                "eventType",
+                "eventSymbol",
+                "eventTime",
+                "description",
+                "shortSaleRestriction",
+                "tradingStatus",
+                "statusReason",
+                "haltStartTime",
+                "haltEndTime",
+                "highLimitPrice",
+                "lowLimitPrice",
+                "high52WeekPrice",
+                "low52WeekPrice",
+                "beta",
+                "earningsPerShare",
+                "dividendFrequency",
+                "exDividendAmount",
+                "exDividendDayId",
+                "shares",
+                "freeFloat",
+            ]),
             EventType::TimeAndSale => Some(&[
                 "eventType",
                 "eventSymbol",
@@ -271,8 +293,7 @@ impl EventType {
                 "volatility",
             ]),
             // Declared by the protocol, not decoded here.
-            EventType::Profile
-            | EventType::Order
+            EventType::Order
             | EventType::TradeETH
             | EventType::SpreadOrder
             | EventType::TheoPrice
@@ -622,6 +643,95 @@ pub struct SummaryEvent {
     pub open_interest: f64,
 }
 
+/// Instrument metadata: what it is, whether it is tradable right now, and the
+/// fundamentals that frame a price.
+///
+/// Every field the dxFeed AsyncAPI schema defines for a profile, in the order
+/// the client requests them. `trading_status` and the halt window are the
+/// operational half — a price from a halted instrument is stale by definition —
+/// and the limit prices bound what the venue will accept at all.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProfileEvent {
+    /// The type of the event, `Profile`.
+    #[serde(rename = "eventType")]
+    pub event_type: String,
+
+    /// The symbol the profile describes.
+    #[serde(rename = "eventSymbol")]
+    pub event_symbol: String,
+
+    /// When the server emitted the event, as epoch milliseconds.
+    #[serde(rename = "eventTime")]
+    pub event_time: i64,
+
+    /// Human-readable description of the instrument.
+    pub description: String,
+
+    /// Short sale restriction state: `Active`, `Inactive` or `Undefined`.
+    #[serde(rename = "shortSaleRestriction")]
+    pub short_sale_restriction: String,
+
+    /// Whether trading is `Active`, `Halted` or `Undefined`.
+    #[serde(rename = "tradingStatus")]
+    pub trading_status: String,
+
+    /// Why trading is in its current status, when the venue gives a reason.
+    #[serde(rename = "statusReason")]
+    pub status_reason: String,
+
+    /// Start of the trading halt, as epoch milliseconds.
+    #[serde(rename = "haltStartTime")]
+    pub halt_start_time: i64,
+
+    /// End of the trading halt, as epoch milliseconds.
+    #[serde(rename = "haltEndTime")]
+    pub halt_end_time: i64,
+
+    /// Highest price the venue will accept today.
+    #[serde(rename = "highLimitPrice", with = "json_double")]
+    pub high_limit_price: f64,
+
+    /// Lowest price the venue will accept today.
+    #[serde(rename = "lowLimitPrice", with = "json_double")]
+    pub low_limit_price: f64,
+
+    /// Highest price over the last 52 weeks.
+    #[serde(rename = "high52WeekPrice", with = "json_double")]
+    pub high_52_week_price: f64,
+
+    /// Lowest price over the last 52 weeks.
+    #[serde(rename = "low52WeekPrice", with = "json_double")]
+    pub low_52_week_price: f64,
+
+    /// Beta against the market.
+    #[serde(with = "json_double")]
+    pub beta: f64,
+
+    /// Earnings per share.
+    #[serde(rename = "earningsPerShare", with = "json_double")]
+    pub earnings_per_share: f64,
+
+    /// Dividend payments per year.
+    #[serde(rename = "dividendFrequency", with = "json_double")]
+    pub dividend_frequency: f64,
+
+    /// Amount of the last dividend that went ex.
+    #[serde(rename = "exDividendAmount", with = "json_double")]
+    pub ex_dividend_amount: f64,
+
+    /// Day the last dividend went ex, as a day identifier.
+    #[serde(rename = "exDividendDayId")]
+    pub ex_dividend_day_id: i64,
+
+    /// Shares outstanding.
+    #[serde(with = "json_double")]
+    pub shares: f64,
+
+    /// Shares available to trade.
+    #[serde(rename = "freeFloat", with = "json_double")]
+    pub free_float: f64,
+}
+
 /// One execution as it printed, with the quote that stood around it.
 ///
 /// Every field the dxFeed AsyncAPI schema defines for a trade print, in the
@@ -792,13 +902,15 @@ pub enum MarketEvent {
     /// One OHLC bar, from a historical or streaming candle subscription.
     Candle(CandleEvent),
     /// One execution as it printed, with the surrounding quote.
+    TimeAndSale(TimeAndSaleEvent),
+    /// Instrument metadata: description, trading status and fundamentals.
     ///
     /// New variants go last on purpose: `MarketEvent` is `#[serde(untagged)]`,
     /// so serde tries them in declaration order and keeps the first that
     /// deserializes. Appending leaves every variant already in the list
     /// matching exactly as it did. Each type has a round-trip test that would
     /// catch one variant stealing another's payload.
-    TimeAndSale(TimeAndSaleEvent),
+    Profile(ProfileEvent),
 }
 
 /// Represents compact data, which can be either an event type (string) or a vector of JSON values.
