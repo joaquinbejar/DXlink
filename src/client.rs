@@ -4,7 +4,7 @@
    Date: 7/3/25
 ******************************************************************************/
 
-use crate::connection::WebSocketConnection;
+use crate::connection::{WebSocketConnection, sanitize_server_text};
 use crate::error::{DXLinkError, DXLinkResult};
 use crate::events::{CompactData, EventType, MarketEvent};
 use crate::messages::{
@@ -136,8 +136,12 @@ async fn expect_handshake_message(
 
     // A server ERROR here is the server telling us why, not an unexpected frame.
     if received_type == "ERROR" {
-        let code = value["error"].as_str().unwrap_or("unknown");
-        let message = value["message"].as_str().unwrap_or("");
+        // Both fields are free text chosen by the server and end up in an error
+        // the caller will very likely log, so they get the same treatment as a
+        // close reason: a server echoing the token back must not turn our own
+        // error reporting into a credential leak.
+        let code = sanitize_server_text(value["error"].as_str().unwrap_or("unknown"));
+        let message = sanitize_server_text(value["message"].as_str().unwrap_or(""));
         let detail = format!("during {state}, the server returned {code}: {message}");
         return Err(if code.eq_ignore_ascii_case("UNAUTHORIZED") {
             DXLinkError::Authentication(detail)
