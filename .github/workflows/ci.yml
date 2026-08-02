@@ -86,6 +86,9 @@ jobs:
   # report but do not block.
   coverage:
     runs-on: ubuntu-latest
+    env:
+      # Read once at job level so the upload step can test for its presence.
+      CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -102,9 +105,22 @@ jobs:
       # Fail loudly rather than uploading nothing and reporting success.
       - name: Verify the report exists
         run: test -s cobertura.xml
+      # Codecov requires a token to accept an upload for a protected branch, so
+      # without the secret every pull request would fail on a repository setting
+      # rather than on anything in the diff. Measurement still runs and still
+      # fails on a missing report; only the upload is conditional, and when the
+      # token is present an upload error is fatal as intended.
       - name: Upload to Codecov
+        if: env.CODECOV_TOKEN != ''
         uses: codecov/codecov-action@v5
         with:
           files: cobertura.xml
+          # tarpaulin also writes a JSON report next to the XML; without this the
+          # CLI discovers and uploads both.
+          disable_search: true
           fail_ci_if_error: true
           token: ${{ secrets.CODECOV_TOKEN }}
+      - name: Report that coverage was not uploaded
+        if: env.CODECOV_TOKEN == ''
+        run: |
+          echo "::warning title=Coverage not uploaded::CODECOV_TOKEN is not set, so the 75% project and patch gates in codecov.yml are measured locally but not enforced. Add the secret and mark codecov/project and codecov/patch as required checks to close the loop."
