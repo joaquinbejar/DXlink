@@ -33,6 +33,46 @@ pub enum DXLinkError {
     Unknown(String),
 }
 
+impl DXLinkError {
+    /// Reports whether this error requires a connection to be (re)established
+    /// before anything can proceed.
+    ///
+    /// A terminal error means retrying as-is can never succeed: the transport
+    /// failed, the peer went away, the credentials were rejected, or there was no
+    /// live connection to begin with. A non-terminal error describes a single bad
+    /// message — the frame was rejected, the connection was not.
+    ///
+    /// This is what tells a read loop whether to stop or to skip the offending
+    /// message and keep going.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use dxlink::DXLinkError;
+    ///
+    /// // The peer hung up: nothing more can be read from this socket.
+    /// assert!(DXLinkError::Connection("server closed the connection".to_string()).is_terminal());
+    ///
+    /// // One malformed frame; the connection is still healthy.
+    /// assert!(!DXLinkError::UnexpectedMessage("Expected text message".to_string()).is_terminal());
+    /// ```
+    pub fn is_terminal(&self) -> bool {
+        match self {
+            // The transport itself failed or the peer went away.
+            DXLinkError::WebSocket(_) | DXLinkError::Connection(_) => true,
+            // Retrying with the same rejected credentials cannot succeed.
+            DXLinkError::Authentication(_) => true,
+            // These describe one message, not the state of the connection.
+            DXLinkError::Serialization(_)
+            | DXLinkError::Channel(_)
+            | DXLinkError::Protocol(_)
+            | DXLinkError::Timeout(_)
+            | DXLinkError::UnexpectedMessage(_)
+            | DXLinkError::Unknown(_) => false,
+        }
+    }
+}
+
 impl Display for DXLinkError {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -185,6 +225,30 @@ mod tests {
                 _ => panic!("Expected Unknown error"),
             },
         }
+    }
+
+    #[test]
+    fn test_is_terminal_for_connection_level_failures() {
+        // The transport is gone or the credentials were rejected: reading the
+        // same socket again cannot succeed.
+        assert!(DXLinkError::Connection("closed".to_string()).is_terminal());
+        assert!(DXLinkError::Authentication("bad token".to_string()).is_terminal());
+        assert!(
+            DXLinkError::WebSocket(Box::new(tungstenite::Error::ConnectionClosed)).is_terminal()
+        );
+    }
+
+    #[test]
+    fn test_is_terminal_for_message_level_failures() {
+        // These describe one bad message; the connection is still usable, so a
+        // read loop must skip and keep going rather than tear down.
+        let ser_error = serde_json::from_str::<serde_json::Value>("invalid json").unwrap_err();
+        assert!(!DXLinkError::Serialization(ser_error).is_terminal());
+        assert!(!DXLinkError::Channel("no such channel".to_string()).is_terminal());
+        assert!(!DXLinkError::Protocol("unexpected state".to_string()).is_terminal());
+        assert!(!DXLinkError::Timeout("no CHANNEL_OPENED".to_string()).is_terminal());
+        assert!(!DXLinkError::UnexpectedMessage("binary frame".to_string()).is_terminal());
+        assert!(!DXLinkError::Unknown("something".to_string()).is_terminal());
     }
 
     // Test error conversion and propagation with ?

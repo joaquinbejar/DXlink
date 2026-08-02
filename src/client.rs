@@ -541,9 +541,15 @@ impl DXLinkClient {
                             }
                         }
                     }
+                    // The connection is gone: reading the same dead socket again
+                    // can only fail, so stop instead of spinning forever.
+                    Err(e) if e.is_terminal() => {
+                        error!("Connection lost, stopping message processing: {}", e);
+                        break;
+                    }
                     Err(e) => {
                         error!("Error receiving message: {}", e);
-                        // Una pequeña pausa para no saturar logs en caso de errores repetidos
+                        // A short pause so repeated errors do not flood the logs
                         tokio::time::sleep(Duration::from_millis(100)).await;
                     }
                 }
@@ -1198,6 +1204,53 @@ mod tests {
             }
             _ => panic!("Expected Protocol error"),
         }
+    }
+
+    /// The message task must stop once the connection is gone, instead of
+    /// re-reading a dead socket every 100ms forever (issue #4).
+    #[tokio::test]
+    async fn test_message_task_stops_when_server_closes() {
+        use tokio::net::TcpListener;
+        use tokio_tungstenite::accept_async;
+
+        // A bare WebSocket server that accepts the handshake and immediately
+        // hangs up. No DXLink handshake is needed: start_message_processing only
+        // requires a live connection.
+        let listener = TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("failed to bind test server");
+        let addr = listener.local_addr().expect("failed to read local addr");
+
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("failed to accept");
+            let ws = accept_async(stream).await.expect("failed to handshake");
+            drop(ws);
+        });
+
+        let mut client = DXLinkClient::new(&format!("ws://{}", addr), "test_token");
+        client.connection = Some(
+            crate::connection::WebSocketConnection::connect(&format!("ws://{}", addr))
+                .await
+                .expect("failed to connect"),
+        );
+
+        client
+            .start_message_processing()
+            .expect("failed to start message processing");
+
+        let handle = client
+            .message_handle
+            .take()
+            .expect("message task should have been spawned");
+
+        // Awaiting the handle rather than polling is_finished() also fails the
+        // test if the task panicked on its way out. Generous bound: the point is
+        // that it terminates at all, not how fast.
+        let joined = tokio::time::timeout(Duration::from_secs(5), handle)
+            .await
+            .expect("message task kept running after the server closed the connection");
+
+        joined.expect("message task panicked instead of stopping cleanly");
     }
 
     // Test error cases for connection
