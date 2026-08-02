@@ -7,10 +7,14 @@
 use super::error::{DXLinkError, DXLinkResult};
 use futures_util::{SinkExt, StreamExt};
 use serde::Serialize;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
+// tokio's Instant, not std's: it follows the runtime clock, so idle suppression
+// and the scheduler that consumes it agree under paused time as well as in
+// production.
 use tokio::net::TcpStream;
 use tokio::sync::Mutex;
+use tokio::time::Instant;
 use tokio::time::timeout;
 use tokio_tungstenite::MaybeTlsStream;
 use tokio_tungstenite::tungstenite::Message;
@@ -123,6 +127,12 @@ pub struct WebSocketConnection {
         Mutex<futures_util::stream::SplitSink<WebSocketStream<MaybeTlsStream<TcpStream>>, Message>>,
     >,
     read: Arc<Mutex<futures_util::stream::SplitStream<WebSocketStream<MaybeTlsStream<TcpStream>>>>>,
+    /// When something was last written to this socket.
+    ///
+    /// The keepalive exists to keep the server from timing us out, so any other
+    /// outbound message serves the same purpose. Tracking this lets the
+    /// keepalive skip a beat that regular traffic already covered.
+    last_sent: Arc<StdMutex<Instant>>,
 }
 
 impl WebSocketConnection {
@@ -166,6 +176,7 @@ impl WebSocketConnection {
         Ok(Self {
             write: Arc::new(Mutex::new(write)),
             read: Arc::new(Mutex::new(read)),
+            last_sent: Arc::new(StdMutex::new(Instant::now())),
         })
     }
 
@@ -191,8 +202,11 @@ impl WebSocketConnection {
         let json = serde_json::to_string(message)?;
         debug!("Sending message: {}", redact_sensitive(&json));
 
-        let mut write = self.write.lock().await;
-        write.send(Message::Text(json.into())).await?;
+        {
+            let mut write = self.write.lock().await;
+            write.send(Message::Text(json.into())).await?;
+        }
+        self.mark_sent();
         Ok(())
     }
 
@@ -303,6 +317,24 @@ impl WebSocketConnection {
         }
     }
 
+    /// Records that something has just gone out on this socket.
+    fn mark_sent(&self) {
+        if let Ok(mut last) = self.last_sent.lock() {
+            *last = Instant::now();
+        }
+    }
+
+    /// How long since anything was last written to this socket.
+    ///
+    /// A caller scheduling keepalives uses this to avoid sending one when
+    /// ordinary traffic has already reset the server's idle timer.
+    pub fn since_last_send(&self) -> Duration {
+        self.last_sent
+            .lock()
+            .map(|last| last.elapsed())
+            .unwrap_or_default()
+    }
+
     /// Creates a new `KeepAliveSender` instance.
     ///
     /// This function returns a `KeepAliveSender` that can be used to send
@@ -335,6 +367,7 @@ impl Clone for WebSocketConnection {
         Self {
             write: Arc::clone(&self.write),
             read: Arc::clone(&self.read),
+            last_sent: Arc::clone(&self.last_sent),
         }
     }
 }

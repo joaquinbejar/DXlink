@@ -54,6 +54,10 @@ pub enum Behaviour {
     ErrorOnSetup,
     /// Answer SETUP with an ERROR whose message echoes a credential back.
     ErrorEchoingToken,
+    /// Negotiate a 3 second keepalive deadline, below the 15s the client used
+    /// to assume. Lets a test prove the negotiated value is honoured without
+    /// waiting a minute for it.
+    ShortKeepalive,
 }
 
 pub struct MockServer {
@@ -159,12 +163,17 @@ impl MockServer {
 
                 match value["type"].as_str().unwrap_or("") {
                     "SETUP" => {
+                        let negotiated = if behaviour == Behaviour::ShortKeepalive {
+                            3
+                        } else {
+                            60
+                        };
                         responses.push(json!({
                             "channel": channel,
                             "type": "SETUP",
                             "version": "1.0.0",
-                            "keepaliveTimeout": 60,
-                            "acceptKeepaliveTimeout": 60
+                            "keepaliveTimeout": negotiated,
+                            "acceptKeepaliveTimeout": negotiated
                         }));
                         responses.push(json!({
                             "channel": 0, "type": "AUTH_STATE", "state": "UNAUTHORIZED"

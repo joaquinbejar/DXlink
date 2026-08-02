@@ -27,9 +27,17 @@ use tracing::{debug, error, info, warn};
 /// message is received within this timeframe, the connection is considered closed.
 const DEFAULT_KEEPALIVE_TIMEOUT: u32 = 60;
 
-/// Default interval for sending keep-alive messages in seconds.  Clients should
-/// send a keep-alive message at least this often to maintain the connection.
-const DEFAULT_KEEPALIVE_INTERVAL: u32 = 15;
+/// Fraction of the negotiated deadline at which maintenance is sent.
+///
+/// The specification only requires *some* outbound message before the server's
+/// `keepaliveTimeout`. Sending three times per deadline leaves room for a lost
+/// packet without being chatty. The previous fixed 15s ignored the negotiation
+/// entirely, so a server asking for less than that could close the connection
+/// while the client believed it was healthy.
+const KEEPALIVE_DIVISOR: u32 = 3;
+
+/// Never schedule maintenance faster than this, whatever the server negotiates.
+const MIN_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(1);
 
 /// The `version` advertised in `SETUP`.
 ///
@@ -218,8 +226,12 @@ pub struct DXLinkClient {
     token: String,
     /// The active WebSocket connection, if established.  `None` indicates no active connection.
     connection: Option<WebSocketConnection>,
-    /// The timeout for keepalive messages in seconds.
+    /// The keepalive timeout this client advertises, in seconds. Also the
+    /// deadline after which inbound silence is treated as a dead connection.
     keepalive_timeout: u32,
+    /// The keepalive timeout the server asked for, learned from its `SETUP`.
+    /// `None` until the handshake completes or if the server did not send one.
+    server_keepalive_timeout: Option<u32>,
     /// A thread-safe counter for generating unique channel IDs.
     next_channel_id: Arc<Mutex<u32>>,
     /// A thread-safe map storing the association between channel IDs and the services they are subscribed to.
@@ -267,6 +279,7 @@ impl DXLinkClient {
             token: token.to_string(),
             connection: None,
             keepalive_timeout: DEFAULT_KEEPALIVE_TIMEOUT,
+            server_keepalive_timeout: None,
             next_channel_id: Arc::new(Mutex::new(1)), // Start from 1 as 0 is the main channel
             channels: Arc::new(Mutex::new(HashMap::new())),
             callbacks: Arc::new(Mutex::new(HashMap::new())),
@@ -277,6 +290,46 @@ impl DXLinkClient {
             keepalive_sender: None,
             response_requests: Arc::new(Mutex::new(Vec::new())),
         }
+    }
+
+    /// Sets the keepalive timeout this client advertises, in seconds.
+    ///
+    /// This is the deadline the client asks the server to respect, and the one
+    /// after which inbound silence is reported as a dead connection. It does not
+    /// change how often the client sends maintenance: that follows what the
+    /// server negotiates in its `SETUP` reply.
+    ///
+    /// Must be called before [`connect`](Self::connect); afterwards it has no
+    /// effect on the running session. A zero is rejected.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use dxlink::DXLinkClient;
+    ///
+    /// let client = DXLinkClient::new("wss://example.com", "token")
+    ///     .with_keepalive_timeout(30)
+    ///     .expect("30 seconds is a valid timeout");
+    /// ```
+    pub fn with_keepalive_timeout(mut self, seconds: u32) -> DXLinkResult<Self> {
+        if seconds == 0 {
+            return Err(DXLinkError::Protocol(
+                "keepalive timeout must be greater than zero".to_string(),
+            ));
+        }
+        self.keepalive_timeout = seconds;
+        Ok(self)
+    }
+
+    /// The interval at which maintenance is sent, derived from the negotiated
+    /// deadline. Falls back to the advertised timeout when the server did not
+    /// negotiate one.
+    fn keepalive_interval(&self) -> Duration {
+        let deadline = self
+            .server_keepalive_timeout
+            .unwrap_or(self.keepalive_timeout);
+        Duration::from_secs(u64::from(deadline.div_ceil(KEEPALIVE_DIVISOR)))
+            .max(MIN_KEEPALIVE_INTERVAL)
     }
 
     /// Establishes a connection to the DXLink server.
@@ -341,6 +394,9 @@ impl DXLinkClient {
             "Server SETUP: version={:?}, keepaliveTimeout={:?}",
             server_setup.version, server_setup.keepalive_timeout
         );
+        // A zero would schedule maintenance in a tight loop; treat it as "not
+        // negotiated" rather than trusting it.
+        self.server_keepalive_timeout = server_setup.keepalive_timeout.filter(|t| *t > 0);
 
         let response =
             expect_handshake_message(&connection, "SETUP", "AUTH_STATE", MAIN_CHANNEL).await?;
@@ -469,16 +525,31 @@ impl DXLinkClient {
         // Obtener la conexión
         let connection = self.connection.as_ref().unwrap().clone();
 
-        // Usar la constante para el intervalo de keepalive
-        let keepalive_interval = Duration::from_secs(DEFAULT_KEEPALIVE_INTERVAL as u64);
+        // Derived from what the server negotiated, not from a fixed constant.
+        let keepalive_interval = self.keepalive_interval();
+        debug!(
+            "Keepalive every {:?} (server asked for {:?}s)",
+            keepalive_interval, self.server_keepalive_timeout
+        );
 
         let keepalive_handle = tokio::spawn(async move {
-            let mut interval = tokio::time::interval(keepalive_interval);
+            // Start one interval out: tokio's first tick is immediate, which
+            // fired a redundant KEEPALIVE the instant the session opened.
+            let mut interval = tokio::time::interval_at(
+                tokio::time::Instant::now() + keepalive_interval,
+                keepalive_interval,
+            );
 
             loop {
                 tokio::select! {
                     _ = interval.tick() => {
-                        // Es hora de enviar un keepalive
+                        // Any outbound message resets the server's idle timer,
+                        // so traffic that already went out covers this beat.
+                        if connection.since_last_send() < keepalive_interval {
+                            debug!("Skipping keepalive, the socket was used recently");
+                            continue;
+                        }
+
                         let keepalive_msg = KeepaliveMessage {
                             channel: MAIN_CHANNEL,
                             message_type: "KEEPALIVE".to_string(),
@@ -490,7 +561,6 @@ impl DXLinkClient {
                             },
                             Err(e) => {
                                 error!("Failed to send keepalive: {}", e);
-                                // Salir del bucle en caso de error para que la tarea termine
                                 break;
                             }
                         }
@@ -528,9 +598,35 @@ impl DXLinkClient {
         let response_requests = self.response_requests.clone();
 
         // Iniciar la tarea de procesamiento de mensajes
+        // Inbound silence past our advertised deadline means the peer is gone,
+        // even though the socket is still open. Without this the task waits on a
+        // dead connection forever.
+        let receive_deadline = Duration::from_secs(u64::from(self.keepalive_timeout));
+
         let message_handle = tokio::spawn(async move {
             loop {
-                match connection.receive().await {
+                let received = match connection.receive_with_timeout(receive_deadline).await {
+                    Ok(Some(msg)) => Ok(msg),
+                    Ok(None) => {
+                        // Silence past the advertised deadline means the peer is
+                        // gone even though the socket is still open. Terminal
+                        // here specifically: a bare read timeout is not terminal
+                        // in general, which is why this does not go through
+                        // is_terminal().
+                        error!(
+                            "{}",
+                            DXLinkError::Timeout(format!(
+                                "no message received on channel {} for {}s, the connection is assumed dead",
+                                MAIN_CHANNEL,
+                                receive_deadline.as_secs()
+                            ))
+                        );
+                        break;
+                    }
+                    Err(e) => Err(e),
+                };
+
+                match received {
                     Ok(msg) => {
                         debug!("Received message: {}", msg);
 
@@ -1408,5 +1504,48 @@ mod version_tests {
             !client_version.is_empty() && client_version.contains('.'),
             "prerelease and normal versions alike are carried verbatim: {client_version}"
         );
+    }
+}
+
+#[cfg(test)]
+mod keepalive_tests {
+    use super::*;
+
+    #[test]
+    fn test_interval_follows_the_negotiated_deadline() {
+        let mut client = DXLinkClient::new("wss://example.com", "token");
+
+        // Nothing negotiated yet: fall back to what we advertise.
+        assert_eq!(
+            client.keepalive_interval(),
+            Duration::from_secs(u64::from(DEFAULT_KEEPALIVE_TIMEOUT).div_ceil(3))
+        );
+
+        // A server asking for less than the old fixed 15s must be honoured, or
+        // it closes the connection while the client thinks it is healthy.
+        client.server_keepalive_timeout = Some(3);
+        assert_eq!(client.keepalive_interval(), Duration::from_secs(1));
+
+        client.server_keepalive_timeout = Some(60);
+        assert_eq!(client.keepalive_interval(), Duration::from_secs(20));
+    }
+
+    #[test]
+    fn test_interval_never_collapses_to_zero() {
+        let mut client = DXLinkClient::new("wss://example.com", "token");
+        // Would round down to zero and spin the task.
+        client.server_keepalive_timeout = Some(1);
+        assert!(client.keepalive_interval() >= MIN_KEEPALIVE_INTERVAL);
+    }
+
+    #[test]
+    fn test_advertised_timeout_is_configurable_and_validated() {
+        let client = DXLinkClient::new("wss://example.com", "token")
+            .with_keepalive_timeout(30)
+            .expect("30 is valid");
+        assert_eq!(client.keepalive_timeout, 30);
+
+        let rejected = DXLinkClient::new("wss://example.com", "token").with_keepalive_timeout(0);
+        assert!(matches!(rejected, Err(DXLinkError::Protocol(_))));
     }
 }
