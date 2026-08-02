@@ -33,6 +33,45 @@ pub enum DXLinkError {
     Unknown(String),
 }
 
+impl DXLinkError {
+    /// Reports whether this error leaves the connection unusable.
+    ///
+    /// A terminal error means the WebSocket cannot carry further traffic and the
+    /// caller must establish a new connection to continue; retrying the same
+    /// socket will never succeed. A non-terminal error describes a single bad
+    /// message — the frame was rejected, the connection was not.
+    ///
+    /// This is what tells a read loop whether to stop or to skip the offending
+    /// message and keep going.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use dxlink::DXLinkError;
+    ///
+    /// // The peer hung up: nothing more can be read from this socket.
+    /// assert!(DXLinkError::Connection("server closed the connection".to_string()).is_terminal());
+    ///
+    /// // One malformed frame; the connection is still healthy.
+    /// assert!(!DXLinkError::UnexpectedMessage("Expected text message".to_string()).is_terminal());
+    /// ```
+    pub fn is_terminal(&self) -> bool {
+        match self {
+            // The transport itself failed or the peer went away.
+            DXLinkError::WebSocket(_) | DXLinkError::Connection(_) => true,
+            // Retrying with the same rejected credentials cannot succeed.
+            DXLinkError::Authentication(_) => true,
+            // These describe one message, not the state of the connection.
+            DXLinkError::Serialization(_)
+            | DXLinkError::Channel(_)
+            | DXLinkError::Protocol(_)
+            | DXLinkError::Timeout(_)
+            | DXLinkError::UnexpectedMessage(_)
+            | DXLinkError::Unknown(_) => false,
+        }
+    }
+}
+
 impl Display for DXLinkError {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         match self {

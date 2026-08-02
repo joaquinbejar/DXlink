@@ -150,10 +150,16 @@ impl WebSocketConnection {
 
     /// Receives a text message from the WebSocket connection.
     ///
-    /// This function attempts to read the next message from the WebSocket stream.
-    /// It expects the message to be a text message. If a non-text message or an error
-    /// is encountered, an appropriate error is returned.  If the connection is closed
-    /// unexpectedly, an error is also returned.
+    /// DXLink is a text-JSON protocol, so only `Text` frames carry payloads.
+    /// WebSocket control frames (`Ping`, `Pong`) are ordinary transport traffic —
+    /// the underlying library answers Pings on its own but still surfaces them
+    /// here — so they are skipped and reading continues until a payload arrives.
+    ///
+    /// A `Close` frame is reported as [`DXLinkError::Connection`] rather than as
+    /// an unexpected message: a server that closes is usually saying something
+    /// specific (bad token, unsupported version) and that belongs in the error
+    /// text. A `Binary` frame is a genuine protocol anomaly for DXLink and is
+    /// rejected as [`DXLinkError::UnexpectedMessage`].
     ///
     /// # Returns
     ///
@@ -164,26 +170,47 @@ impl WebSocketConnection {
     pub async fn receive(&self) -> DXLinkResult<String> {
         let mut read = self.read.lock().await;
 
-        match read.next().await {
-            Some(Ok(Message::Text(text))) => {
-                debug!("Received message: {}", text);
-                Ok(text.to_string())
-            }
-            Some(Ok(message)) => {
-                debug!("Received non-text message: {:?}", message);
-                Err(DXLinkError::UnexpectedMessage(
-                    "Expected text message".to_string(),
-                ))
-            }
-            Some(Err(e)) => {
-                error!("WebSocket error: {}", e);
-                Err(DXLinkError::WebSocket(Box::new(e)))
-            }
-            None => {
-                error!("WebSocket connection closed unexpectedly");
-                Err(DXLinkError::Connection(
-                    "Connection closed unexpectedly".to_string(),
-                ))
+        loop {
+            match read.next().await {
+                Some(Ok(Message::Text(text))) => {
+                    debug!("Received message: {}", text);
+                    return Ok(text.to_string());
+                }
+                // Control frames are normal protocol traffic, not a protocol error.
+                // `Frame` is documented by tungstenite as never yielded while
+                // reading; the arm is defensive so a future change cannot make it
+                // fatal by accident.
+                Some(Ok(message @ (Message::Ping(_) | Message::Pong(_) | Message::Frame(_)))) => {
+                    debug!("Skipping WebSocket control frame: {:?}", message);
+                }
+                Some(Ok(Message::Close(frame))) => {
+                    let detail = match frame {
+                        Some(frame) => format!("code {}, reason: {}", frame.code, frame.reason),
+                        None => "no close frame".to_string(),
+                    };
+                    error!("Server closed the connection: {}", detail);
+                    return Err(DXLinkError::Connection(format!(
+                        "server closed the connection ({})",
+                        detail
+                    )));
+                }
+                Some(Ok(Message::Binary(bytes))) => {
+                    debug!("Received binary frame of {} bytes", bytes.len());
+                    return Err(DXLinkError::UnexpectedMessage(format!(
+                        "Expected text message, got a binary frame of {} bytes",
+                        bytes.len()
+                    )));
+                }
+                Some(Err(e)) => {
+                    error!("WebSocket error: {}", e);
+                    return Err(DXLinkError::WebSocket(Box::new(e)));
+                }
+                None => {
+                    error!("WebSocket connection closed unexpectedly");
+                    return Err(DXLinkError::Connection(
+                        "Connection closed unexpectedly".to_string(),
+                    ));
+                }
             }
         }
     }

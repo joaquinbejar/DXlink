@@ -541,9 +541,15 @@ impl DXLinkClient {
                             }
                         }
                     }
+                    // The connection is gone: reading the same dead socket again
+                    // can only fail, so stop instead of spinning forever.
+                    Err(e) if e.is_terminal() => {
+                        error!("Connection lost, stopping message processing: {}", e);
+                        break;
+                    }
                     Err(e) => {
                         error!("Error receiving message: {}", e);
-                        // Una pequeña pausa para no saturar logs en caso de errores repetidos
+                        // A short pause so repeated errors do not flood the logs
                         tokio::time::sleep(Duration::from_millis(100)).await;
                     }
                 }
