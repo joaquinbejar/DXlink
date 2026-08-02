@@ -614,3 +614,117 @@ async fn test_summaries_reach_the_stream_and_the_callback() {
 
     client.disconnect().await.expect("failed to disconnect");
 }
+
+/// Issue #26 asks for two prints reaching both delivery paths with their sale
+/// conditions, timestamps, prices and booleans intact.
+#[tokio::test]
+async fn test_prints_reach_the_stream_and_the_callback() {
+    let server = MockServer::start(Behaviour::Normal).await;
+
+    let mut client = DXLinkClient::new(&server.url(), "test-token");
+    let mut event_stream = client.connect().await.expect("failed to connect");
+
+    let channel_id = client
+        .create_feed_channel("AUTO")
+        .await
+        .expect("failed to create feed channel");
+    client
+        .setup_feed(channel_id, &[EventType::TimeAndSale])
+        .await
+        .expect("failed to set up feed");
+
+    let delivered = Arc::new(Mutex::new(Vec::new()));
+    let sink = delivered.clone();
+    client.on_event("AAPL", move |event| {
+        sink.lock().expect("callback lock poisoned").push(event);
+    });
+
+    client
+        .subscribe(
+            channel_id,
+            vec![
+                FeedSubscription {
+                    event_type: "TimeAndSale".to_string(),
+                    symbol: "AAPL".to_string(),
+                    from_time: None,
+                    source: None,
+                },
+                FeedSubscription {
+                    event_type: "TimeAndSale".to_string(),
+                    symbol: "MSFT".to_string(),
+                    from_time: None,
+                    source: None,
+                },
+            ],
+        )
+        .await
+        .expect("failed to subscribe");
+
+    let events = collect_events(&mut event_stream, 2).await;
+    assert_eq!(events.len(), 2, "expected two prints, got {events:?}");
+
+    let symbols: Vec<&str> = events
+        .iter()
+        .map(|event| match event {
+            MarketEvent::TimeAndSale(print) => print.event_symbol.as_str(),
+            other => panic!("expected a print, got {other:?}"),
+        })
+        .collect();
+    assert!(symbols.contains(&"AAPL"), "AAPL is missing: {symbols:?}");
+    assert!(symbols.contains(&"MSFT"), "MSFT is missing: {symbols:?}");
+
+    let print = events
+        .iter()
+        .find_map(|event| match event {
+            MarketEvent::TimeAndSale(print) if print.event_symbol == "AAPL" => Some(print),
+            _ => None,
+        })
+        .expect("no TimeAndSale for AAPL reached the stream");
+
+    assert_eq!(print.event_type, "TimeAndSale");
+    assert_eq!(print.event_time, expected::EVENT_TIME);
+    assert_eq!(print.event_flags, expected::EVENT_FLAGS);
+    assert_eq!(print.index, expected::INDEX);
+    assert_eq!(print.time, expected::TIME);
+    assert_eq!(print.time_nano_part, expected::TIME_NANO_PART);
+    assert_eq!(print.sequence, expected::SEQUENCE);
+    assert_eq!(print.exchange_code, expected::EXCHANGE_CODE);
+    assert_eq!(print.price, expected::PRICE);
+    assert_eq!(print.size, expected::SIZE);
+    assert_eq!(print.bid_price, expected::BID_PRICE);
+    assert_eq!(print.ask_price, expected::ASK_PRICE);
+    assert_eq!(
+        print.exchange_sale_conditions,
+        expected::EXCHANGE_SALE_CONDITIONS
+    );
+    assert_eq!(print.trade_through_exempt, expected::TRADE_THROUGH_EXEMPT);
+    assert_eq!(print.aggressor_side, expected::AGGRESSOR_SIDE);
+    assert_eq!(print.spread_leg, expected::SPREAD_LEG);
+    assert_eq!(
+        print.extended_trading_hours,
+        expected::EXTENDED_TRADING_HOURS
+    );
+    assert_eq!(print.valid_tick, expected::VALID_TICK);
+    assert_eq!(print.sale_type, expected::SALE_TYPE);
+    assert_eq!(print.buyer, expected::BUYER);
+    assert_eq!(print.seller, expected::SELLER);
+
+    // The callback routes through symbol_of, which needed a new arm for this
+    // variant, and it is scoped to AAPL so MSFT must not appear.
+    let seen: Vec<MarketEvent> = {
+        let events = delivered.lock().expect("callback lock poisoned");
+        events.clone()
+    };
+    match seen.as_slice() {
+        [MarketEvent::TimeAndSale(print)] => {
+            assert_eq!(print.event_symbol, "AAPL");
+            // The flags matter most on this path: a consumer acting on prints
+            // reads valid_tick before it moves a last price.
+            assert_eq!(print.valid_tick, expected::VALID_TICK);
+            assert_eq!(print.aggressor_side, expected::AGGRESSOR_SIDE);
+        }
+        other => panic!("the callback for AAPL should have received one print, got {other:?}"),
+    }
+
+    client.disconnect().await.expect("failed to disconnect");
+}

@@ -472,6 +472,18 @@ fn field_value(field: &str, event_type: &str, symbol: &str) -> Value {
         "prevDayClosePriceType" => json!("Final"),
         "prevDayVolume" => json!(58_000_000.0),
         "openInterest" => json!(4_200.0),
+        // TimeAndSale (time, price, size, bidPrice and askPrice are above)
+        "timeNanoPart" => json!(250_000i64),
+        "exchangeCode" => json!("Q"),
+        "exchangeSaleConditions" => json!("@ TI"),
+        "tradeThroughExempt" => json!("X"),
+        "aggressorSide" => json!("Buy"),
+        "spreadLeg" => json!(false),
+        "extendedTradingHours" => json!(true),
+        "validTick" => json!(true),
+        "type" => json!("NEW"),
+        "buyer" => json!("NSDQ"),
+        "seller" => json!("NYSE"),
         // Greeks
         "delta" => json!(0.65),
         "gamma" => json!(0.05),
@@ -530,6 +542,17 @@ pub mod expected {
     pub const PREV_DAY_CLOSE_PRICE: f64 = 147.75;
     pub const PREV_DAY_CLOSE_PRICE_TYPE: &str = "Final";
     pub const PREV_DAY_VOLUME: f64 = 58_000_000.0;
+    pub const TIME_NANO_PART: i64 = 250_000;
+    pub const EXCHANGE_CODE: &str = "Q";
+    pub const EXCHANGE_SALE_CONDITIONS: &str = "@ TI";
+    pub const TRADE_THROUGH_EXEMPT: &str = "X";
+    pub const AGGRESSOR_SIDE: &str = "Buy";
+    pub const SPREAD_LEG: bool = false;
+    pub const EXTENDED_TRADING_HOURS: bool = true;
+    pub const VALID_TICK: bool = true;
+    pub const SALE_TYPE: &str = "NEW";
+    pub const BUYER: &str = "NSDQ";
+    pub const SELLER: &str = "NYSE";
 }
 
 /// Convenience predicates for `wait_for`.

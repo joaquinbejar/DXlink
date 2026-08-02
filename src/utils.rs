@@ -6,7 +6,8 @@
 use crate::MarketEvent;
 use crate::error::{DXLinkError, DXLinkResult};
 use crate::events::{
-    CandleEvent, CompactData, EventType, GreeksEvent, QuoteEvent, SummaryEvent, TradeEvent,
+    CandleEvent, CompactData, EventType, GreeksEvent, QuoteEvent, SummaryEvent, TimeAndSaleEvent,
+    TradeEvent,
 };
 use serde_json::Value;
 use tracing::warn;
@@ -146,6 +147,27 @@ fn as_double(
     as_json_double(&values[index]).ok_or_else(|| {
         DXLinkError::Protocol(format!(
             "{event_type} row {row}: field `{field}` should be a number, got {}",
+            values[index]
+        ))
+    })
+}
+
+/// A column that must be a boolean.
+///
+/// Strict on purpose: the protocol sends JSON `true`/`false` here, and treating
+/// `0`, `"false"` or `null` as false would turn a layout error into a plausible
+/// flag. A print wrongly marked `validTick` moves a last price that should not
+/// have moved.
+fn as_bool(
+    values: &[Value],
+    index: usize,
+    event_type: &str,
+    row: usize,
+    field: &str,
+) -> DXLinkResult<bool> {
+    values[index].as_bool().ok_or_else(|| {
+        DXLinkError::Protocol(format!(
+            "{event_type} row {row}: field `{field}` should be a boolean, got {}",
             values[index]
         ))
     })
@@ -320,6 +342,37 @@ fn build_event(
                 prev_day_close_price_type: text(11)?,
                 prev_day_volume: number(12)?,
                 open_interest: number(13)?,
+            })
+        }
+        EventType::TimeAndSale => {
+            let int = |index: usize| as_int(row_values, index, header, row, fields[index]);
+            let text = |index: usize| {
+                as_text(row_values, index, header, row, fields[index]).map(str::to_string)
+            };
+            let flag = |index: usize| as_bool(row_values, index, header, row, fields[index]);
+            MarketEvent::TimeAndSale(TimeAndSaleEvent {
+                event_type: header.to_string(),
+                event_symbol: symbol,
+                event_time: int(2)?,
+                event_flags: int(3)?,
+                index: int(4)?,
+                time: int(5)?,
+                time_nano_part: int(6)?,
+                sequence: int(7)?,
+                exchange_code: text(8)?,
+                price: number(9)?,
+                size: number(10)?,
+                bid_price: number(11)?,
+                ask_price: number(12)?,
+                exchange_sale_conditions: text(13)?,
+                trade_through_exempt: text(14)?,
+                aggressor_side: text(15)?,
+                spread_leg: flag(16)?,
+                extended_trading_hours: flag(17)?,
+                valid_tick: flag(18)?,
+                sale_type: text(19)?,
+                buyer: text(20)?,
+                seller: text(21)?,
             })
         }
         // compact_fields returned Some for this type, so a missing arm here is a
@@ -959,6 +1012,193 @@ mod summary_tests {
         let back: MarketEvent = serde_json::from_str(&json).expect("deserialize");
         assert!(
             matches!(back, MarketEvent::Summary(_)),
+            "an untagged round trip picked the wrong variant: {back:?}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod time_and_sale_tests {
+    use super::*;
+    use serde_json::json;
+
+    /// The exact 22 columns issue #26 specifies, in order.
+    fn print_row(symbol: &str) -> Vec<Value> {
+        vec![
+            json!("TimeAndSale"),        // 0 eventType
+            json!(symbol),               // 1 eventSymbol
+            json!(1_700_000_000_500i64), // 2 eventTime
+            json!(0i64),                 // 3 eventFlags
+            json!(11i64),                // 4 index
+            json!(1_700_000_000_000i64), // 5 time
+            json!(250_000i64),           // 6 timeNanoPart
+            json!(3i64),                 // 7 sequence
+            json!("Q"),                  // 8 exchangeCode
+            json!(151.25),               // 9 price
+            json!(75.0),                 // 10 size
+            json!(151.2),                // 11 bidPrice
+            json!(151.3),                // 12 askPrice
+            json!("@ TI"),               // 13 exchangeSaleConditions
+            json!("X"),                  // 14 tradeThroughExempt
+            json!("Buy"),                // 15 aggressorSide
+            json!(false),                // 16 spreadLeg
+            json!(true),                 // 17 extendedTradingHours
+            json!(true),                 // 18 validTick
+            json!("NEW"),                // 19 type
+            json!("NSDQ"),               // 20 buyer
+            json!("NYSE"),               // 21 seller
+        ]
+    }
+
+    fn batch(values: Vec<Value>) -> Vec<CompactData> {
+        vec![
+            CompactData::EventType("TimeAndSale".to_string()),
+            CompactData::Values(values),
+        ]
+    }
+
+    #[test]
+    fn test_the_field_list_matches_the_decoder_stride() {
+        let fields = EventType::TimeAndSale
+            .compact_fields()
+            .expect("TimeAndSale has a decoder");
+        assert_eq!(fields.len(), 22, "the layout is 22 columns");
+        assert_eq!(fields.len(), print_row("AAPL").len());
+    }
+
+    #[test]
+    fn test_two_prints_decode_with_the_right_stride() {
+        let mut values = print_row("AAPL");
+        values.extend(print_row("MSFT"));
+
+        let events = try_parse_compact_data(&batch(values)).expect("well formed");
+        assert_eq!(events.len(), 2);
+
+        match (&events[0], &events[1]) {
+            (MarketEvent::TimeAndSale(first), MarketEvent::TimeAndSale(second)) => {
+                // The symbols prove the stride of twenty-two.
+                assert_eq!(first.event_symbol, "AAPL");
+                assert_eq!(second.event_symbol, "MSFT");
+                assert_eq!(first.event_time, 1_700_000_000_500);
+                assert_eq!(first.event_flags, 0);
+                assert_eq!(first.index, 11);
+                assert_eq!(first.time, 1_700_000_000_000);
+                assert_eq!(first.time_nano_part, 250_000);
+                assert_eq!(first.sequence, 3);
+                assert_eq!(first.exchange_code, "Q");
+                assert_eq!(first.price, 151.25);
+                assert_eq!(first.size, 75.0);
+                assert_eq!(first.bid_price, 151.2);
+                assert_eq!(first.ask_price, 151.3);
+                assert_eq!(first.exchange_sale_conditions, "@ TI");
+                assert_eq!(first.trade_through_exempt, "X");
+                assert_eq!(first.aggressor_side, "Buy");
+                assert!(!first.spread_leg);
+                assert!(first.extended_trading_hours);
+                assert!(first.valid_tick);
+                assert_eq!(first.sale_type, "NEW");
+                assert_eq!(first.buyer, "NSDQ");
+                assert_eq!(first.seller, "NYSE");
+            }
+            other => panic!("expected two prints, got {other:?}"),
+        }
+    }
+
+    /// The three booleans sit next to each other, so a one-column shift keeps
+    /// decoding and only changes which flag is which.
+    #[test]
+    fn test_the_flags_keep_their_own_columns() {
+        let mut values = print_row("AAPL");
+        values[16] = json!(true); // spreadLeg
+        values[17] = json!(false); // extendedTradingHours
+        values[18] = json!(false); // validTick
+
+        let events = try_parse_compact_data(&batch(values)).expect("well formed");
+        match &events[0] {
+            MarketEvent::TimeAndSale(print) => {
+                assert!(print.spread_leg);
+                assert!(!print.extended_trading_hours);
+                assert!(!print.valid_tick);
+            }
+            other => panic!("expected a print, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_a_numeric_flag_is_rejected() {
+        let mut values = print_row("AAPL");
+        // A layout that shifted a price into a flag column would land here.
+        values[18] = json!(1);
+
+        let error = try_parse_compact_data(&batch(values)).expect_err("the column is a boolean");
+        assert!(
+            error.to_string().contains("validTick"),
+            "the field is missing: {error}"
+        );
+        assert!(
+            error.to_string().contains("boolean"),
+            "the expected type is missing: {error}"
+        );
+    }
+
+    #[test]
+    fn test_a_numeric_sale_condition_is_rejected() {
+        let mut values = print_row("AAPL");
+        values[13] = json!(4.0);
+
+        let error = try_parse_compact_data(&batch(values)).expect_err("the column is text");
+        assert!(
+            error.to_string().contains("exchangeSaleConditions"),
+            "the field is missing: {error}"
+        );
+    }
+
+    #[test]
+    fn test_a_print_without_a_surrounding_quote_decodes() {
+        // Off-exchange prints arrive with no bid or ask; the protocol sends NaN
+        // rather than omitting the columns.
+        let mut values = print_row("AAPL");
+        values[11] = json!("NaN");
+        values[12] = json!("NaN");
+
+        let events = try_parse_compact_data(&batch(values)).expect("NaN is a value");
+        match &events[0] {
+            MarketEvent::TimeAndSale(print) => {
+                assert!(print.bid_price.is_nan());
+                assert!(print.ask_price.is_nan());
+                // The price itself still has to be a real number.
+                assert_eq!(print.price, 151.25);
+            }
+            other => panic!("expected a print, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_a_truncated_print_row_is_rejected() {
+        let mut values = print_row("AAPL");
+        values.pop();
+        assert!(try_parse_compact_data(&batch(values)).is_err());
+    }
+
+    #[test]
+    fn test_a_print_is_not_mistaken_for_another_event() {
+        let events = try_parse_compact_data(&batch(print_row("AAPL"))).expect("well formed");
+        assert!(matches!(events[0], MarketEvent::TimeAndSale(_)));
+
+        let json = serde_json::to_string(&events[0]).expect("serialize");
+        // The wire names have to survive the round trip, `type` included.
+        assert!(
+            json.contains("\"type\":\"NEW\""),
+            "wrong field name: {json}"
+        );
+        assert!(
+            json.contains("\"exchangeSaleConditions\""),
+            "wrong field name: {json}"
+        );
+
+        let back: MarketEvent = serde_json::from_str(&json).expect("deserialize");
+        assert!(
+            matches!(back, MarketEvent::TimeAndSale(_)),
             "an untagged round trip picked the wrong variant: {back:?}"
         );
     }
