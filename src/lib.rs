@@ -12,7 +12,8 @@
 //! - Market events decoded from the `COMPACT` wire format: **`Quote`, `Trade`
 //!   and `Greeks`**.
 //! - Both delivery styles: a per-symbol callback and a single event stream.
-//! - Historical data through `Candle` subscriptions with `from_time`.
+//! - `Candle` subscriptions carry `from_time` to the wire, so historical data
+//!   can be requested — but the rows that come back are not decoded yet.
 //! - Typed errors ([`DXLinkError`]) with [`DXLinkError::is_terminal`] to tell a
 //!   lost connection from one bad message.
 //!
@@ -123,8 +124,11 @@
 //! ## Working with historical data
 //!
 //! DXLink supports subscribing to historical data through Candle events.
-//! When subscribing to candle events, you need to specify the period,
-//! type, and a timestamp from which to fetch the data:
+//! When subscribing to candle events, you specify the period, type, and a
+//! timestamp from which to fetch the data.
+//!
+//! Note the subscription reaches the server, but `Candle` rows are not decoded
+//! into a [`MarketEvent`] yet, so nothing arrives on the stream for them:
 //!
 //! ```rust,no_run
 //! use dxlink::FeedSubscription;
