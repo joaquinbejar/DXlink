@@ -77,6 +77,14 @@ pub enum Behaviour {
     /// Like `DropFirstSession`, but reject `AUTH` on every connection after the
     /// first, so a reconnect hits the one failure it must not retry.
     RejectAuthOnReconnect,
+    /// Like `DropFirstSession`, but accept later connections and then say
+    /// nothing, so a reconnect times out mid-handshake instead of failing to
+    /// connect.
+    SilentOnReconnect,
+    /// Like `DropFirstSession`, but ignore `FEED_SETUP` on the second
+    /// connection and answer normally on the third, so a replay times out
+    /// partway and the next attempt has to rebuild from scratch.
+    IgnoreFeedSetupOnReconnect,
     /// Negotiate a 3 second keepalive deadline, below the 15s the client used
     /// to assume. Lets a test prove the negotiated value is honoured without
     /// waiting a minute for it.
@@ -154,6 +162,12 @@ impl MockServer {
                                 .await;
                             let _ = ws.send(Message::Close(None)).await;
                             continue 'accept;
+                        }
+                        (Behaviour::SilentOnReconnect, _) if sessions_served > 1 => continue,
+                        (Behaviour::IgnoreFeedSetupOnReconnect, "FEED_SETUP")
+                            if sessions_served == 2 =>
+                        {
+                            continue;
                         }
                         (Behaviour::RejectAuthOnReconnect, "AUTH") if sessions_served > 1 => {
                             let _ = ws
@@ -345,7 +359,10 @@ impl MockServer {
                             close_after = behaviour == Behaviour::CloseAfterSubscribe
                                 || (matches!(
                                     behaviour,
-                                    Behaviour::DropFirstSession | Behaviour::RejectAuthOnReconnect
+                                    Behaviour::DropFirstSession
+                                        | Behaviour::RejectAuthOnReconnect
+                                        | Behaviour::SilentOnReconnect
+                                        | Behaviour::IgnoreFeedSetupOnReconnect
                                 ) && sessions_served == 1);
                         }
                         "CHANNEL_CANCEL" => responses.push(json!({

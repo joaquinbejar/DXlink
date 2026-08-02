@@ -70,6 +70,14 @@ const SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
 /// unrelated channel operations time out.
 const DELIVERY_QUEUE_CAPACITY: usize = 1024;
 
+/// The shortest a reconnect will ever wait between attempts.
+///
+/// A policy may legitimately ask for a very short delay, but zero with
+/// unlimited attempts is a tight loop that turns one outage into a request and
+/// log flood. Clamped rather than rejected, so a policy stays a hint about
+/// pacing rather than something that can fail to install.
+const MIN_RECONNECT_DELAY: Duration = Duration::from_millis(50);
+
 /// How many connection-state changes to buffer for a consumer.
 ///
 /// Small on purpose: a consumer that is not reading these does not want a
@@ -762,10 +770,12 @@ impl ReconnectPolicy {
         // Saturating rather than wrapping: a long outage must not fold the
         // backoff back round to zero and start hammering.
         let factor = 2u32.saturating_pow(attempt.saturating_sub(1).min(31));
+        // Clamped to a floor: zero delays with unlimited attempts would spin.
         let delay = self
             .initial_delay
             .saturating_mul(factor)
-            .min(self.max_delay);
+            .min(self.max_delay.max(MIN_RECONNECT_DELAY))
+            .max(MIN_RECONNECT_DELAY);
 
         if !self.jitter {
             return delay;
@@ -779,7 +789,9 @@ impl ReconnectPolicy {
         if nanos == 0 {
             return delay;
         }
-        Duration::from_nanos(*seed % nanos.saturating_add(1))
+        // Spread over [0, delay], then back up to the floor: jitter must not
+        // reintroduce the tight loop the clamp above just removed.
+        Duration::from_nanos(*seed % nanos.saturating_add(1)).max(MIN_RECONNECT_DELAY)
     }
 }
 
@@ -834,6 +846,9 @@ struct ReconnectContext {
     next_request_id: Arc<Mutex<u64>>,
     disconnect_reason: Arc<Mutex<Option<String>>>,
     delivery_tx: Sender<MarketEvent>,
+    /// The slots the rebuilt session's tasks go into, so `disconnect` owns them
+    /// rather than the supervisor detaching them.
+    session_tasks: SessionTasks,
 }
 
 /// Rebuilds a session on the connection that is already installed: reopens
@@ -981,7 +996,13 @@ async fn replay_session(ctx: &ReconnectContext) -> DXLinkResult<()> {
 async fn reconnect_once(
     ctx: &ReconnectContext,
     session_lost: mpsc::Sender<String>,
-) -> DXLinkResult<(JoinHandle<()>, JoinHandle<()>, mpsc::Sender<()>)> {
+) -> DXLinkResult<()> {
+    // Taken before anything is torn down. `replay_session` clears each
+    // channel's layout before asking for a new one, so a failure partway
+    // through would otherwise leave the next attempt with nothing to
+    // reconfigure and no way to know it was ever configured.
+    let schemas_before = recover(&ctx.channel_schemas).clone();
+
     let (connection, negotiated) = handshake(&ctx.url, &ctx.token, ctx.keepalive_timeout).await?;
     *recover(&ctx.connection) = Some(connection.clone());
 
@@ -1001,7 +1022,14 @@ async fn reconnect_once(
     });
 
     match replay_session(ctx).await {
-        Ok(()) => Ok((reader, keepalive_handle, keepalive_stop)),
+        Ok(()) => {
+            // Into the shared slots, never dropped here: a dropped JoinHandle
+            // detaches its task, which would leave disconnect owning only the
+            // dead original session and unable to stop this one.
+            ctx.session_tasks
+                .install(reader, keepalive_handle, keepalive_stop);
+            Ok(())
+        }
         Err(e) => {
             // A half-rebuilt session is worse than none: it would deliver some
             // channels and silently miss others. Tear it down and let the
@@ -1010,6 +1038,10 @@ async fn reconnect_once(
             reader.abort();
             keepalive_handle.abort();
             *recover(&ctx.connection) = None;
+            // The layouts this attempt cleared have to come back, or the next
+            // attempt sees no schema, skips feed setup and subscriptions, and
+            // reports success having only opened the channels.
+            *recover(&ctx.channel_schemas) = schemas_before;
             Err(e)
         }
     }
@@ -1043,6 +1075,37 @@ fn notify(states: &Option<Sender<ConnectionState>>, state: ConnectionState) {
     }
 }
 
+/// Whether a failed reconnect attempt is worth repeating.
+///
+/// Deliberately **not** [`DXLinkError::is_terminal`]. That answers "can this
+/// socket still be used", which is a different question: a `Timeout` is not
+/// terminal there, because one unanswered read does not condemn a live
+/// connection — but a peer that accepts the reconnect and then never answers
+/// `SETUP` or `FEED_CONFIG` is exactly the case reconnection exists for, and
+/// treating it as unretryable gave up after a single attempt regardless of the
+/// policy's limit.
+///
+/// Matched exhaustively, with no `_` arm, so a new error variant forces this
+/// decision rather than defaulting to one.
+fn worth_retrying(error: &DXLinkError) -> bool {
+    match error {
+        // The transport failed or the peer went quiet. What reconnection is for.
+        DXLinkError::Connection(_)
+        | DXLinkError::WebSocket(_)
+        | DXLinkError::Timeout(_)
+        | DXLinkError::Channel(_) => true,
+        // The token will be rejected just as fast the second time.
+        DXLinkError::Authentication(_) => false,
+        // We and the server disagree about the protocol, or this client has a
+        // bug. Either way the next attempt reproduces it, and hammering a
+        // server over a disagreement is worse than stopping and saying so.
+        DXLinkError::Protocol(_)
+        | DXLinkError::Serialization(_)
+        | DXLinkError::UnexpectedMessage(_)
+        | DXLinkError::Unknown(_) => false,
+    }
+}
+
 /// Locks a client-state mutex, recovering rather than panicking if it is
 /// poisoned.
 ///
@@ -1063,6 +1126,52 @@ type ChannelSchema = HashMap<String, Vec<String>>;
 
 /// Validated layouts per channel.
 type ChannelSchemas = Arc<Mutex<HashMap<u32, ChannelSchema>>>;
+
+/// The tasks that belong to one session, in slots a reconnect can swap.
+///
+/// Shared because a reconnect replaces the reader and the keepalive, and
+/// `disconnect` has to be able to stop **whichever** session is live — not the
+/// dead one it happened to spawn itself. Dropping a `JoinHandle` detaches the
+/// task rather than stopping it, so a handle that is not in one of these slots
+/// is a task nothing can ever kill.
+#[derive(Clone, Default)]
+struct SessionTasks {
+    reader: Arc<Mutex<Option<JoinHandle<()>>>>,
+    keepalive: Arc<Mutex<Option<JoinHandle<()>>>>,
+    keepalive_stop: Arc<Mutex<Option<mpsc::Sender<()>>>>,
+}
+
+impl SessionTasks {
+    /// Installs a session's tasks, aborting whatever was in the slots.
+    ///
+    /// The previous session is dead by the time a reconnect gets here, but
+    /// aborting is what makes that true rather than assumed.
+    fn install(&self, reader: JoinHandle<()>, keepalive: JoinHandle<()>, stop: mpsc::Sender<()>) {
+        if let Some(previous) = recover(&self.reader).replace(reader) {
+            previous.abort();
+        }
+        if let Some(previous) = recover(&self.keepalive).replace(keepalive) {
+            previous.abort();
+        }
+        *recover(&self.keepalive_stop) = Some(stop);
+    }
+
+    /// The channel that stops the live keepalive, if there is one.
+    fn keepalive_stop(&self) -> Option<mpsc::Sender<()>> {
+        recover(&self.keepalive_stop).clone()
+    }
+
+    /// Aborts both tasks and forgets them. Safe to call more than once.
+    fn abort(&self) {
+        if let Some(reader) = recover(&self.reader).take() {
+            reader.abort();
+        }
+        if let Some(keepalive) = recover(&self.keepalive).take() {
+            keepalive.abort();
+        }
+        *recover(&self.keepalive_stop) = None;
+    }
+}
 
 /// The live socket, in a slot a background task can swap.
 ///
@@ -1420,9 +1529,7 @@ pub struct DXLinkClient {
     /// A sender for transmitting `MarketEvent` instances.
     event_sender: Option<Sender<MarketEvent>>,
     /// A handle to the keepalive task.
-    keepalive_handle: Option<JoinHandle<()>>,
-    /// A handle to the message processing task.
-    message_handle: Option<JoinHandle<()>>,
+    session_tasks: SessionTasks,
     /// A handle to the task that runs callbacks and feeds the event stream.
     delivery_handle: Option<JoinHandle<()>>,
     /// Set once the event stream has been handed out, so it cannot be taken
@@ -1432,7 +1539,6 @@ pub struct DXLinkClient {
     /// where the terminal error is observed.
     disconnect_reason: Arc<Mutex<Option<String>>>,
     /// A channel sender used to signal the keepalive task.
-    keepalive_sender: Option<Sender<()>>,
     /// A thread-safe vector that holds pending response requests.
     response_requests: Arc<Mutex<Vec<ResponseRequest>>>,
     /// Hands out the identity each pending request is cleaned up by.
@@ -1500,12 +1606,10 @@ impl DXLinkClient {
             callbacks: Arc::new(Mutex::new(HashMap::new())),
             subscriptions: Arc::new(Mutex::new(SubscriptionBook::default())),
             event_sender: None,
-            keepalive_handle: None,
-            message_handle: None,
+            session_tasks: SessionTasks::default(),
             delivery_handle: None,
             event_stream_taken: false,
             disconnect_reason: Arc::new(Mutex::new(None)),
-            keepalive_sender: None,
             response_requests: Arc::new(Mutex::new(Vec::new())),
             next_request_id: Arc::new(Mutex::new(0)),
             channel_schemas: Arc::new(Mutex::new(HashMap::new())),
@@ -1849,8 +1953,10 @@ impl DXLinkClient {
         );
 
         let (handle, stop) = spawn_keepalive(connection, keepalive_interval);
-        self.keepalive_sender = Some(stop);
-        self.keepalive_handle = Some(handle);
+        // Parked in the slots, not in a field: disconnect has to be able to
+        // stop whichever session is live, and a reconnect replaces these.
+        *recover(&self.session_tasks.keepalive) = Some(handle);
+        *recover(&self.session_tasks.keepalive_stop) = Some(stop);
 
         Ok(())
     }
@@ -1864,12 +1970,12 @@ impl DXLinkClient {
         })?;
 
         let delivery_tx = self.start_event_delivery();
-        self.message_handle = Some(spawn_reader(ReaderSetup {
+        let reader = spawn_reader(ReaderSetup {
             connection,
             // Cloned so the reader can tear the whole session down, not just
             // itself: stopping only the reader left the keepalive writing to a
             // socket nobody was listening to.
-            shutdown_keepalive: self.keepalive_sender.clone(),
+            shutdown_keepalive: self.session_tasks.keepalive_stop(),
             delivery_tx,
             disconnect_reason: self.disconnect_reason.clone(),
             // The reader only routes protocol traffic now; callbacks and the
@@ -1883,7 +1989,8 @@ impl DXLinkClient {
             // Only when a supervisor is going to listen. A sender with no
             // receiver would make the reader do work for nobody.
             session_lost: self.session_lost_sender.clone(),
-        }));
+        });
+        *recover(&self.session_tasks.reader) = Some(reader);
 
         Ok(())
     }
@@ -1924,6 +2031,7 @@ impl DXLinkClient {
             next_request_id: self.next_request_id.clone(),
             disconnect_reason: self.disconnect_reason.clone(),
             delivery_tx,
+            session_tasks: self.session_tasks.clone(),
         };
 
         // Taken, not cloned: the supervisor becomes the only sender, so when it
@@ -1997,7 +2105,7 @@ impl DXLinkClient {
                     }
 
                     match reconnect_once(&ctx, session_lost.clone()).await {
-                        Ok(_) => {
+                        Ok(()) => {
                             info!("Reconnected after {attempt} attempt(s)");
                             // The new session is live, so the recorded reason
                             // describes a connection that no longer applies.
@@ -2005,11 +2113,9 @@ impl DXLinkClient {
                             notify(&states, ConnectionState::Reconnected);
                             break;
                         }
-                        Err(e)
-                            if !e.is_terminal() || matches!(e, DXLinkError::Authentication(_)) =>
-                        {
+                        Err(e) if !worth_retrying(&e) => {
                             // Documented classification: a rejected token or a
-                            // local protocol error will fail identically next
+                            // protocol disagreement will fail identically next
                             // time, so retrying is just noise.
                             let reason = format!("not retrying: {e}");
                             error!("{reason}");
@@ -2055,10 +2161,14 @@ impl DXLinkClient {
         self.session_lost_sender = None;
 
         // 1. Stop writing maintenance, so nothing races the shutdown.
-        if let Some(sender) = self.keepalive_sender.take() {
+        // Taken in its own block: the guard must not live into the await below,
+        // which is the rule for every std::sync::Mutex in this file.
+        let keepalive_stop = recover(&self.session_tasks.keepalive_stop).take();
+        if let Some(sender) = keepalive_stop {
             let _ = sender.send(()).await;
         }
-        if let Some(mut handle) = self.keepalive_handle.take() {
+        let keepalive = recover(&self.session_tasks.keepalive).take();
+        if let Some(mut handle) = keepalive {
             // Borrow the handle rather than moving it into the timeout: a moved
             // handle is dropped when the timeout elapses, which detaches the
             // task instead of stopping it. Connection::send has no deadline, so
@@ -2101,7 +2211,7 @@ impl DXLinkClient {
         }
 
         // 3. Now the reader has nothing left to route.
-        if let Some(handle) = self.message_handle.take() {
+        if let Some(handle) = recover(&self.session_tasks.reader).take() {
             handle.abort();
         }
         if let Some(handle) = self.delivery_handle.take() {
@@ -2608,14 +2718,16 @@ impl DXLinkClient {
 /// prevents, not an excuse to skip `disconnect`.
 impl Drop for DXLinkClient {
     fn drop(&mut self) {
-        for handle in [
-            self.message_handle.take(),
-            self.keepalive_handle.take(),
-            self.delivery_handle.take(),
-        ]
-        .into_iter()
-        .flatten()
-        {
+        // The supervisor first: it owns the token and the delivery sender, and
+        // detaching it would leave something able to reconnect after the client
+        // it belongs to is gone.
+        if let Some(handle) = self.supervisor_handle.take() {
+            handle.abort();
+        }
+        // Whichever session is live, which is not necessarily the one this
+        // client spawned.
+        self.session_tasks.abort();
+        if let Some(handle) = self.delivery_handle.take() {
             handle.abort();
         }
     }
@@ -2650,8 +2762,14 @@ impl fmt::Debug for DXLinkClient {
         };
         debug_struct.field("subscription_count", &subscription_count);
         debug_struct.field("has_event_sender", &self.event_sender.is_some());
-        debug_struct.field("keepalive_active", &self.keepalive_handle.is_some());
-        debug_struct.field("message_handler_active", &self.message_handle.is_some());
+        debug_struct.field(
+            "keepalive_active",
+            &recover(&self.session_tasks.keepalive).is_some(),
+        );
+        debug_struct.field(
+            "message_handler_active",
+            &recover(&self.session_tasks.reader).is_some(),
+        );
 
         let pending_responses = if let Ok(requests) = self.response_requests.lock() {
             requests.len()
@@ -2692,8 +2810,8 @@ impl fmt::Display for DXLinkClient {
 
         // Show active tasks status
         let tasks_status = match (
-            self.message_handle.is_some(),
-            self.keepalive_handle.is_some(),
+            recover(&self.session_tasks.reader).is_some(),
+            recover(&self.session_tasks.keepalive).is_some(),
         ) {
             (true, true) => "All tasks running",
             (true, false) => "Message handler only",
@@ -2720,9 +2838,9 @@ mod tests {
         assert_eq!(client.keepalive_timeout, DEFAULT_KEEPALIVE_TIMEOUT);
         assert!(client.get_connection().is_err());
         assert!(client.event_sender.is_none());
-        assert!(client.keepalive_handle.is_none());
-        assert!(client.message_handle.is_none());
-        assert!(client.keepalive_sender.is_none());
+        assert!(recover(&client.session_tasks.keepalive).is_none());
+        assert!(recover(&client.session_tasks.reader).is_none());
+        assert!(recover(&client.session_tasks.keepalive_stop).is_none());
     }
 
     // Test next_channel_id
@@ -2865,8 +2983,7 @@ mod tests {
             .start_message_processing()
             .expect("failed to start message processing");
 
-        let handle = client
-            .message_handle
+        let handle = recover(&client.session_tasks.reader)
             .take()
             .expect("message task should have been spawned");
 
@@ -2911,8 +3028,12 @@ mod tests {
             .start_message_processing()
             .expect("failed to start message processing");
 
-        let message = client.message_handle.take().expect("no message task");
-        let keepalive = client.keepalive_handle.take().expect("no keepalive task");
+        let message = recover(&client.session_tasks.reader)
+            .take()
+            .expect("no message task");
+        let keepalive = recover(&client.session_tasks.keepalive)
+            .take()
+            .expect("no keepalive task");
 
         tokio::time::timeout(Duration::from_secs(5), message)
             .await
@@ -3128,6 +3249,57 @@ mod reconnect_policy_tests {
             seen.iter().any(|delay| *delay != seen[0]),
             "jitter produced the same delay every time: {seen:?}"
         );
+    }
+
+    /// A policy asking for nothing must still pace itself: zero delays with
+    /// unlimited attempts is a request and log flood, not a reconnect.
+    #[test]
+    fn test_a_zero_delay_is_clamped_to_a_floor() {
+        let zero = ReconnectPolicy {
+            initial_delay: Duration::ZERO,
+            max_delay: Duration::ZERO,
+            max_attempts: None,
+            jitter: false,
+        };
+        let mut seed = 1;
+        for attempt in 1..=5 {
+            assert_eq!(zero.delay_for(attempt, &mut seed), MIN_RECONNECT_DELAY);
+        }
+
+        // And with jitter, which spreads over [0, delay] and could otherwise
+        // put it straight back to zero.
+        let jittered = ReconnectPolicy {
+            jitter: true,
+            ..zero
+        };
+        let mut seed = 0x2545_F491_4F6C_DD1D;
+        for attempt in 1..=32 {
+            assert!(jittered.delay_for(attempt, &mut seed) >= MIN_RECONNECT_DELAY);
+        }
+    }
+
+    #[test]
+    fn test_only_transport_failures_are_worth_retrying() {
+        // What reconnection exists for.
+        assert!(worth_retrying(&DXLinkError::Connection("gone".into())));
+        assert!(worth_retrying(&DXLinkError::Channel(
+            "no such channel".into()
+        )));
+        // The case is_terminal gets wrong for this question: a peer that
+        // accepts the socket and never answers has to be retried.
+        assert!(worth_retrying(&DXLinkError::Timeout(
+            "no FEED_CONFIG".into()
+        )));
+
+        // Fails identically next time.
+        assert!(!worth_retrying(&DXLinkError::Authentication(
+            "bad token".into()
+        )));
+        assert!(!worth_retrying(&DXLinkError::Protocol(
+            "wrong layout".into()
+        )));
+        assert!(!worth_retrying(&DXLinkError::UnexpectedMessage("?".into())));
+        assert!(!worth_retrying(&DXLinkError::Unknown("?".into())));
     }
 
     #[test]
