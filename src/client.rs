@@ -193,10 +193,15 @@ async fn expect_handshake_message(
     Ok(raw)
 }
 
-/// Locks client state, recovering instead of panicking if it is poisoned.
+/// Locks a client-state mutex, recovering rather than panicking if it is
+/// poisoned.
 ///
-/// State that describes a dead connection has to be cleared on disconnect, and a
-/// prior panic elsewhere is no reason to keep it around.
+/// A poisoned lock means another thread panicked while holding it. Everything
+/// behind these locks is plain bookkeeping — channel ids, subscriptions,
+/// callbacks — not an invariant a partial write could corrupt, so turning one
+/// panic into a second panic on every later request helps nobody. Recovering
+/// keeps the client usable and leaves the original panic to be reported where
+/// it happened.
 fn recover<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     mutex
         .lock()
@@ -211,6 +216,7 @@ fn symbol_of(event: &MarketEvent) -> &str {
         MarketEvent::Greeks(e) => &e.event_symbol,
     }
 }
+
 
 /// Records why a session ended, keeping the first reason rather than the last.
 ///
@@ -236,9 +242,7 @@ struct PendingGuard {
 
 impl Drop for PendingGuard {
     fn drop(&mut self) {
-        if let Ok(mut requests) = self.requests.lock() {
-            requests.retain(|request| request.id != self.id);
-        }
+        recover(&self.requests).retain(|request| request.id != self.id);
     }
 }
 
@@ -869,7 +873,8 @@ impl DXLinkClient {
                             // the reason was only logged.
                             {
                                 let mut delivered = false;
-                                if let Ok(mut requests) = response_requests.lock() {
+                                {
+                                    let mut requests = recover(&response_requests);
                                     let is_error = msg_type == "ERROR";
 
                                     while let Some(idx) = requests.iter().position(|req| {
@@ -1141,7 +1146,7 @@ impl DXLinkClient {
 
                 // Agregar canal a la lista
                 {
-                    let mut channels = self.channels.lock().unwrap();
+                    let mut channels = recover(&self.channels);
                     channels.insert(channel_id, "FEED".to_string());
                 }
 
@@ -1257,7 +1262,7 @@ impl DXLinkClient {
 
         // Update internal subscriptions tracking
         {
-            let mut subs = self.subscriptions.lock().unwrap();
+            let mut subs = recover(&self.subscriptions);
             for sub in &subscriptions {
                 subs.insert((EventType::from(sub.event_type.as_str()), sub.symbol.clone()));
             }
@@ -1290,7 +1295,7 @@ impl DXLinkClient {
 
         // Update internal subscriptions tracking
         {
-            let mut subs = self.subscriptions.lock().unwrap();
+            let mut subs = recover(&self.subscriptions);
             for sub in &subscriptions {
                 subs.remove(&(EventType::from(sub.event_type.as_str()), sub.symbol.clone()));
             }
@@ -1319,7 +1324,7 @@ impl DXLinkClient {
 
         // Remove all subscriptions for this channel
         {
-            let mut subs = self.subscriptions.lock().unwrap();
+            let mut subs = recover(&self.subscriptions);
             subs.clear(); // This is a simplification - in reality you might want to track by channel
         }
 
@@ -1343,7 +1348,7 @@ impl DXLinkClient {
     pub async fn close_channel(&mut self, channel_id: u32) -> DXLinkResult<()> {
         // Check if the channel exists
         {
-            let channels = self.channels.lock().unwrap();
+            let channels = recover(&self.channels);
             if !channels.contains_key(&channel_id) {
                 return Err(DXLinkError::Channel(format!(
                     "Channel {} not found",
@@ -1380,7 +1385,7 @@ impl DXLinkClient {
 
                 // Remove channel from list
                 {
-                    let mut channels = self.channels.lock().unwrap();
+                    let mut channels = recover(&self.channels);
                     channels.remove(&channel_id);
                 }
 
@@ -1398,7 +1403,7 @@ impl DXLinkClient {
 
     /// Register a callback function for a specific symbol
     pub fn on_event(&self, symbol: &str, callback: impl Fn(MarketEvent) + Send + Sync + 'static) {
-        let mut callbacks = self.callbacks.lock().unwrap();
+        let mut callbacks = recover(&self.callbacks);
         callbacks.insert(
             symbol.to_string(),
             Arc::new(Box::new(callback) as EventCallback),
@@ -1460,15 +1465,12 @@ impl DXLinkClient {
     /// # }
     /// ```
     pub fn disconnect_reason(&self) -> Option<String> {
-        self.disconnect_reason
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .clone()
+        recover(&self.disconnect_reason).clone()
     }
 
     // Helper methods
     fn next_channel_id(&self) -> DXLinkResult<u32> {
-        let mut id = self.next_channel_id.lock().unwrap();
+        let mut id = recover(&self.next_channel_id);
         let channel_id = *id;
         *id += 1;
         Ok(channel_id)
@@ -1481,7 +1483,7 @@ impl DXLinkClient {
     }
 
     fn validate_channel(&self, channel_id: u32, expected_service: &str) -> DXLinkResult<()> {
-        let channels = self.channels.lock().unwrap();
+        let channels = recover(&self.channels);
         match channels.get(&channel_id) {
             Some(service) if service == expected_service => Ok(()),
             Some(service) => Err(DXLinkError::Channel(format!(
@@ -1819,6 +1821,37 @@ mod tests {
             .await
             .expect("the keepalive kept writing to a dead socket")
             .expect("the keepalive panicked");
+    }
+
+    /// A panic while holding client state must not turn every later request
+    /// into a second panic. The state behind these locks is bookkeeping, not an
+    /// invariant a partial write could corrupt.
+    #[test]
+    fn test_a_poisoned_lock_does_not_take_the_client_down() {
+        let client = DXLinkClient::new("wss://example.com", "token");
+
+        // Poison the channels lock the way a panicking thread would.
+        let channels = client.channels.clone();
+        let _ = std::thread::spawn(move || {
+            let _guard = channels.lock().unwrap();
+            panic!("poisoning the lock");
+        })
+        .join();
+        assert!(
+            client.channels.lock().is_err(),
+            "the lock should be poisoned"
+        );
+
+        // Every path over that state must still work.
+        {
+            let mut channels = recover(&client.channels);
+            channels.insert(1, "FEED".to_string());
+        }
+        assert!(client.validate_channel(1, "FEED").is_ok());
+        assert!(client.next_channel_id().is_ok());
+
+        client.on_event("AAPL", |_| {});
+        assert!(recover(&client.callbacks).contains_key("AAPL"));
     }
 
     // Test error cases for connection
