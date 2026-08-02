@@ -95,20 +95,10 @@ pub fn try_parse_compact_data(data: &[CompactData]) -> DXLinkResult<Vec<MarketEv
 
 /// Reads one COMPACT column as a DXLink JSONDouble.
 ///
-/// The protocol encodes non-finite doubles as the strings `"NaN"`, `"Infinity"`
-/// and `"-Infinity"`, because JSON has no literal for them. Treating those as a
-/// wrong column type would reject data the server is entitled to send: an option
-/// with no bid has a `NaN` price, which is ordinary rather than exceptional.
+/// Delegates to the shared mapping in `events::json_double`, so COMPACT and
+/// FULL cannot drift apart if the protocol adds another special value.
 fn as_json_double(value: &Value) -> Option<f64> {
-    if let Some(number) = value.as_f64() {
-        return Some(number);
-    }
-    match value.as_str()? {
-        "NaN" => Some(f64::NAN),
-        "Infinity" => Some(f64::INFINITY),
-        "-Infinity" => Some(f64::NEG_INFINITY),
-        _ => None,
-    }
+    crate::events::json_double::from_value(value)
 }
 
 /// A column that must be text.
