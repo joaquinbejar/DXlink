@@ -157,14 +157,17 @@ async fn test_error_non_existent_channel() {
 
 /// The client must keep the session alive on its own. Virtual time drives the
 /// interval so the suite does not spend 20 real seconds proving it.
-#[tokio::test(start_paused = true)]
+#[tokio::test]
 async fn test_client_sends_keepalives() {
     let server = MockServer::start(Behaviour::Normal).await;
 
     let mut client = DXLinkClient::new(&server.url(), "test-token");
+    // Connect in real time: the handshake is bounded by a timeout that virtual
+    // time would fire before the socket finished being established.
     client.connect().await.expect("failed to connect");
 
     // Past one keepalive interval; with time paused this costs nothing.
+    tokio::time::pause();
     tokio::time::advance(Duration::from_secs(20)).await;
 
     // Back to real time before waiting: delivering the keepalive is real socket
