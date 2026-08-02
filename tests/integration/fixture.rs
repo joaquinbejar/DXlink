@@ -64,6 +64,13 @@ pub enum Behaviour {
     IgnoreFirstChannelRequest,
     /// Complete the handshake and then hang up, so the next send fails.
     CloseAfterHandshake,
+    /// Echo a FEED_CONFIG whose Quote field list is reordered, the shape that
+    /// silently shifts every decoded value.
+    ReorderedFeedConfig,
+    /// Negotiate a data format this client cannot decode.
+    NonCompactFeedConfig,
+    /// Honour the first FEED_SETUP and reorder the reply to every one after it.
+    ReorderedFeedConfigOnSecondSetup,
     /// Negotiate a 3 second keepalive deadline, below the 15s the client used
     /// to assume. Lets a test prove the negotiated value is honoured without
     /// waiting a minute for it.
@@ -100,6 +107,7 @@ impl MockServer {
             // Field order per (channel, event type), learned from FEED_SETUP.
             let mut event_fields: HashMap<(u64, String), Vec<String>> = HashMap::new();
             let mut channel_requests_seen = 0u32;
+            let mut feed_setups_seen = 0u32;
 
             while let Some(Ok(message)) = ws.next().await {
                 let Message::Text(text) = message else {
@@ -236,6 +244,34 @@ impl MockServer {
                         "service": value["service"].as_str().unwrap_or("FEED"),
                         "parameters": {}
                     })),
+                    "FEED_SETUP"
+                        if behaviour == Behaviour::ReorderedFeedConfig
+                            || (behaviour == Behaviour::ReorderedFeedConfigOnSecondSetup && {
+                                feed_setups_seen += 1;
+                                feed_setups_seen > 1
+                            }) =>
+                    {
+                        let mut reordered = value["acceptEventFields"]["Quote"]
+                            .as_array()
+                            .cloned()
+                            .unwrap_or_default();
+                        // Guard: a fixture panic would mask the behaviour under
+                        // test rather than reporting it.
+                        if reordered.len() >= 2 {
+                            reordered.swap(0, 1);
+                        }
+                        responses.push(json!({
+                            "channel": channel, "type": "FEED_CONFIG",
+                            "aggregationPeriod": 0.1, "dataFormat": "COMPACT",
+                            "eventFields": { "Quote": reordered }
+                        }));
+                    }
+                    "FEED_SETUP" if behaviour == Behaviour::NonCompactFeedConfig => {
+                        responses.push(json!({
+                            "channel": channel, "type": "FEED_CONFIG",
+                            "aggregationPeriod": 0.1, "dataFormat": "FULL"
+                        }));
+                    }
                     "FEED_SETUP" => {
                         // Remember exactly which fields the client asked for, in
                         // order: that is the wire layout it will decode against.
@@ -256,7 +292,8 @@ impl MockServer {
                             "channel": channel,
                             "type": "FEED_CONFIG",
                             "aggregationPeriod": 0.1,
-                            "dataFormat": "COMPACT"
+                            "dataFormat": "COMPACT",
+                            "eventFields": value["acceptEventFields"].clone()
                         }));
                     }
                     "FEED_SUBSCRIPTION" => {
