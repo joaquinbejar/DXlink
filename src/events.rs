@@ -669,10 +669,11 @@ pub enum MarketEvent {
     Summary(SummaryEvent),
     /// One OHLC bar, from a historical or streaming candle subscription.
     ///
-    /// Last in the list on purpose: `MarketEvent` is `#[serde(untagged)]`, so
-    /// serde tries variants in declaration order and keeps the first that
-    /// deserializes. A candle has fields none of the others do, but ordering it
-    /// after them keeps the existing three matching exactly as before.
+    /// New variants go last on purpose: `MarketEvent` is `#[serde(untagged)]`,
+    /// so serde tries them in declaration order and keeps the first that
+    /// deserializes. Appending leaves every variant already in the list
+    /// matching exactly as it did. Each type has a round-trip test that would
+    /// catch one variant stealing another's payload.
     Candle(CandleEvent),
 }
 
