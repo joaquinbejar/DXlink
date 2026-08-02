@@ -301,7 +301,11 @@ async fn run_full_session(behaviour: Behaviour) {
     assert_eq!(trade.day_volume, 10_000_000.0);
 
     // The callback path is separate from the stream path; both must fire.
-    let delivered = callback_events.lock().expect("callback lock poisoned");
+    // Copy out of the lock in its own scope so no guard reaches the await below.
+    let delivered: Vec<MarketEvent> = {
+        let events = callback_events.lock().expect("callback lock poisoned");
+        events.clone()
+    };
     assert_eq!(
         delivered.len(),
         2,
@@ -380,14 +384,17 @@ async fn test_callback_is_scoped_to_its_symbol() {
     assert!(symbols.contains(&"AAPL"), "AAPL missing from {symbols:?}");
     assert!(symbols.contains(&"MSFT"), "MSFT missing from {symbols:?}");
 
-    let delivered = msft_events.lock().expect("lock poisoned");
+    // Copy out of the lock in its own scope so no guard reaches the await below.
+    let delivered: Vec<MarketEvent> = {
+        let events = msft_events.lock().expect("lock poisoned");
+        events.clone()
+    };
     assert_eq!(delivered.len(), 1, "MSFT callback should fire exactly once");
     match &delivered[0] {
         MarketEvent::Quote(q) => assert_eq!(q.event_symbol, "MSFT"),
         other => panic!("MSFT callback received the wrong event: {other:?}"),
     }
 
-    drop(delivered);
     client.disconnect().await.expect("failed to disconnect");
 }
 
