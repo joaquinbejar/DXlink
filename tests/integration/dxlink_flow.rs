@@ -354,3 +354,104 @@ async fn test_session_sends_the_expected_protocol_messages() {
 
     client.disconnect().await.expect("failed to disconnect");
 }
+
+// --- Delivery isolation (issue #10) ----------------------------------------
+
+/// A slow callback must not stop socket reads. It used to run on the same task
+/// that routes protocol responses, so an unrelated channel operation timed out
+/// because somebody's callback was busy.
+#[tokio::test]
+async fn test_a_slow_callback_does_not_block_protocol_operations() {
+    let server = MockServer::start(Behaviour::Normal).await;
+
+    let mut client = DXLinkClient::new(&server.url(), "test-token");
+    let mut event_stream = client.connect().await.expect("failed to connect");
+    let channel_id = client
+        .create_feed_channel("AUTO")
+        .await
+        .expect("failed to create feed channel");
+    client
+        .setup_feed(channel_id, &[EventType::Quote])
+        .await
+        .expect("failed to set up feed");
+
+    // Blocks the delivery worker for far longer than a protocol round trip.
+    client.on_event("AAPL", |_| {
+        std::thread::sleep(Duration::from_millis(1500));
+    });
+
+    client
+        .subscribe(
+            channel_id,
+            vec![FeedSubscription {
+                event_type: "Quote".to_string(),
+                symbol: "AAPL".to_string(),
+                from_time: None,
+                source: None,
+            }],
+        )
+        .await
+        .expect("failed to subscribe");
+
+    // Give the callback time to be in flight.
+    let _ = collect_events(&mut event_stream, 1).await;
+
+    // A protocol operation must still complete promptly.
+    let started = std::time::Instant::now();
+    let second = tokio::time::timeout(Duration::from_secs(3), client.create_feed_channel("AUTO"))
+        .await
+        .expect("a channel operation was blocked by a slow callback");
+    assert!(second.is_ok(), "channel operation failed: {second:?}");
+    assert!(
+        started.elapsed() < Duration::from_secs(3),
+        "channel operation took {:?}, it was waiting on the callback",
+        started.elapsed()
+    );
+
+    client.disconnect().await.expect("failed to disconnect");
+}
+
+/// A panicking callback used to take the whole task down, and with it every
+/// protocol response.
+#[tokio::test]
+async fn test_a_panicking_callback_does_not_kill_the_session() {
+    let server = MockServer::start(Behaviour::Normal).await;
+
+    let mut client = DXLinkClient::new(&server.url(), "test-token");
+    let mut event_stream = client.connect().await.expect("failed to connect");
+    let channel_id = client
+        .create_feed_channel("AUTO")
+        .await
+        .expect("failed to create feed channel");
+    client
+        .setup_feed(channel_id, &[EventType::Quote])
+        .await
+        .expect("failed to set up feed");
+
+    client.on_event("AAPL", |_| panic!("callback blew up"));
+
+    client
+        .subscribe(
+            channel_id,
+            vec![FeedSubscription {
+                event_type: "Quote".to_string(),
+                symbol: "AAPL".to_string(),
+                from_time: None,
+                source: None,
+            }],
+        )
+        .await
+        .expect("failed to subscribe");
+
+    // The event still reaches the stream even though the callback panicked.
+    let events = collect_events(&mut event_stream, 1).await;
+    assert_eq!(events.len(), 1, "the stream lost the event to the panic");
+
+    // And the session is still usable.
+    client
+        .create_feed_channel("AUTO")
+        .await
+        .expect("the session died with the callback");
+
+    client.disconnect().await.expect("failed to disconnect");
+}
