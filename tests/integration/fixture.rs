@@ -54,6 +54,16 @@ pub enum Behaviour {
     ErrorOnSetup,
     /// Answer SETUP with an ERROR whose message echoes a credential back.
     ErrorEchoingToken,
+    /// Answer a CHANNEL_REQUEST with a channel-scoped ERROR instead of
+    /// CHANNEL_OPENED.
+    ErrorOnChannelRequest,
+    /// Accept CHANNEL_REQUEST but never answer it.
+    IgnoreChannelRequest,
+    /// Ignore the first CHANNEL_REQUEST and answer every one after it, so a
+    /// test can prove a timed-out request does not steal the next response.
+    IgnoreFirstChannelRequest,
+    /// Complete the handshake and then hang up, so the next send fails.
+    CloseAfterHandshake,
     /// Negotiate a 3 second keepalive deadline, below the 15s the client used
     /// to assume. Lets a test prove the negotiated value is honoured without
     /// waiting a minute for it.
@@ -89,6 +99,7 @@ impl MockServer {
 
             // Field order per (channel, event type), learned from FEED_SETUP.
             let mut event_fields: HashMap<(u64, String), Vec<String>> = HashMap::new();
+            let mut channel_requests_seen = 0u32;
 
             while let Some(Ok(message)) = ws.next().await {
                 let Message::Text(text) = message else {
@@ -111,6 +122,18 @@ impl MockServer {
                 // Handshake fault injection, before the normal answers.
                 match (behaviour, value["type"].as_str().unwrap_or("")) {
                     (Behaviour::Silent, _) => continue,
+                    (Behaviour::CloseAfterHandshake, "AUTH") => {
+                        let _ = ws
+                            .send(Message::Text(
+                                json!({"channel": 0, "type": "AUTH_STATE",
+                                       "state": "AUTHORIZED"})
+                                .to_string()
+                                .into(),
+                            ))
+                            .await;
+                        let _ = ws.send(Message::Close(None)).await;
+                        return;
+                    }
                     (Behaviour::WrongTypeOnSetup, "SETUP") => {
                         let _ = ws
                             .send(Message::Text(
@@ -188,6 +211,23 @@ impl MockServer {
                         responses.push(json!({
                             "channel": 0, "type": "AUTH_STATE",
                             "state": state, "userId": "test-user"
+                        }));
+                    }
+                    "CHANNEL_REQUEST" if behaviour == Behaviour::IgnoreChannelRequest => {}
+                    "CHANNEL_REQUEST" if behaviour == Behaviour::IgnoreFirstChannelRequest => {
+                        channel_requests_seen += 1;
+                        if channel_requests_seen == 1 {
+                            continue;
+                        }
+                        responses.push(json!({
+                            "channel": channel, "type": "CHANNEL_OPENED",
+                            "service": "FEED", "parameters": {}
+                        }));
+                    }
+                    "CHANNEL_REQUEST" if behaviour == Behaviour::ErrorOnChannelRequest => {
+                        responses.push(json!({
+                            "channel": channel, "type": "ERROR",
+                            "error": "BAD_ACTION", "message": "contract not supported"
                         }));
                     }
                     "CHANNEL_REQUEST" => responses.push(json!({

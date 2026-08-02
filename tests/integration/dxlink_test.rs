@@ -318,3 +318,133 @@ async fn test_handshake_error_cannot_leak_an_echoed_token() {
     // The actionable part survives.
     assert!(text.contains("UNAUTHORIZED"), "error code lost: {text}");
 }
+
+// --- Response routing (issue #9) -------------------------------------------
+
+/// A channel-scoped ERROR must answer whatever operation is pending on that
+/// channel. It used to be logged only, so the caller sat until its timeout and
+/// got a misleading Timeout instead of the reason the server gave.
+#[tokio::test]
+async fn test_channel_error_answers_the_pending_operation() {
+    let server = MockServer::start(Behaviour::ErrorOnChannelRequest).await;
+    let mut client = DXLinkClient::new(&server.url(), "test-token");
+    client.connect().await.expect("failed to connect");
+
+    let started = std::time::Instant::now();
+    let result = client.create_feed_channel("AUTO").await;
+
+    match result {
+        Err(DXLinkError::Protocol(msg)) => {
+            assert!(msg.contains("BAD_ACTION"), "server error code lost: {msg}");
+            assert!(
+                msg.contains("create_feed_channel"),
+                "operation context lost: {msg}"
+            );
+        }
+        other => panic!("expected the server error to be delivered, got: {other:?}"),
+    }
+
+    // The point is that it did not wait out the 10 second timeout.
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "the error was not delivered promptly: {:?}",
+        started.elapsed()
+    );
+
+    client.disconnect().await.expect("failed to disconnect");
+}
+
+/// A request that times out must leave nothing behind that could consume a
+/// later response. Two timed-out attempts followed by a working one is the
+/// shape that used to break: the stale entry stole the third response.
+#[tokio::test]
+async fn test_a_timed_out_request_cannot_steal_a_later_response() {
+    let server = MockServer::start(Behaviour::IgnoreChannelRequest).await;
+    let mut client = DXLinkClient::new(&server.url(), "test-token");
+    client.connect().await.expect("failed to connect");
+
+    // Cancel the wait rather than sitting through the full timeout; a dropped
+    // future is exactly the path that used to leak a registration.
+    for _ in 0..2 {
+        let cancelled = tokio::time::timeout(
+            Duration::from_millis(200),
+            client.create_feed_channel("AUTO"),
+        )
+        .await;
+        assert!(cancelled.is_err(), "the fixture should never answer");
+    }
+
+    // Nothing stale may remain to answer for a later request.
+    let pending = client.pending_response_count();
+    assert_eq!(
+        pending, 0,
+        "{pending} registrations survived a cancelled wait"
+    );
+
+    client.disconnect().await.expect("failed to disconnect");
+}
+
+/// The helper's own timeout is a distinct cleanup path from a cancelled caller.
+/// This lets it fire, then proves the stale registration cannot answer for the
+/// request that follows: the second attempt must get its own channel back, not
+/// be starved by the first.
+#[tokio::test]
+async fn test_a_request_that_times_out_does_not_starve_the_next_one() {
+    let server = MockServer::start(Behaviour::IgnoreFirstChannelRequest).await;
+    let mut client = DXLinkClient::new(&server.url(), "test-token");
+    client.connect().await.expect("failed to connect");
+
+    // Let the helper's internal timeout elapse rather than cancelling it.
+    tokio::time::pause();
+    let first = client.create_feed_channel("AUTO").await;
+    tokio::time::resume();
+    assert!(
+        matches!(first, Err(DXLinkError::Timeout(_))),
+        "the first request should time out, got: {first:?}"
+    );
+    assert_eq!(
+        client.pending_response_count(),
+        0,
+        "the timed-out registration was left behind"
+    );
+
+    // The server answers from here on; the response must reach this caller.
+    let channel = client
+        .create_feed_channel("AUTO")
+        .await
+        .expect("the second request should be answered");
+    client
+        .setup_feed(channel, &[EventType::Quote])
+        .await
+        .expect("the channel the second request opened should be usable");
+
+    client.disconnect().await.expect("failed to disconnect");
+}
+
+/// A failed send is the third cleanup path: the registration goes in before the
+/// send, so a send that errors must not leave it behind.
+#[tokio::test]
+async fn test_a_failed_send_leaves_no_pending_request() {
+    let server = MockServer::start(Behaviour::CloseAfterHandshake).await;
+    let mut client = DXLinkClient::new(&server.url(), "test-token");
+    client.connect().await.expect("failed to connect");
+
+    // The server hung up right after AUTH, so this send cannot land.
+    let mut last = Ok(0);
+    for _ in 0..5 {
+        last = client.create_feed_channel("AUTO").await;
+        if last.is_err() {
+            break;
+        }
+    }
+    assert!(
+        last.is_err(),
+        "the send should fail against a closed socket"
+    );
+
+    assert_eq!(
+        client.pending_response_count(),
+        0,
+        "a failed send left a registration behind"
+    );
+}
