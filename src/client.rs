@@ -287,6 +287,19 @@ fn validate_feed_config(
     Ok(())
 }
 
+/// Parses every subscription's event type, rejecting the whole batch if any is
+/// unknown.
+///
+/// All or nothing on purpose: sending half a batch and recording the other half
+/// leaves the client and the server disagreeing about what is subscribed, which
+/// is worse than refusing the call.
+fn parse_subscription_types(subscriptions: &[FeedSubscription]) -> DXLinkResult<Vec<EventType>> {
+    subscriptions
+        .iter()
+        .map(|sub| sub.event_type.parse::<EventType>())
+        .collect()
+}
+
 /// The symbol an event refers to, borrowed rather than cloned.
 fn symbol_of(event: &MarketEvent) -> &str {
     match event {
@@ -1411,13 +1424,10 @@ impl DXLinkClient {
         // Validate channel exists and is a FEED channel
         self.validate_channel(channel_id, "FEED")?;
 
-        // Update internal subscriptions tracking
-        {
-            let mut subs = recover(&self.subscriptions);
-            for sub in &subscriptions {
-                subs.insert((EventType::from(sub.event_type.as_str()), sub.symbol.clone()));
-            }
-        }
+        // Reject before sending, not after. A misspelled type used to go out on
+        // the wire verbatim while being recorded locally as Quote, so the client
+        // believed in a subscription it had never made.
+        let parsed = parse_subscription_types(&subscriptions)?;
 
         let subscription_msg = FeedSubscriptionMessage {
             channel: channel_id,
@@ -1427,8 +1437,25 @@ impl DXLinkClient {
             reset: None,
         };
 
+        // Take the symbols back before the message is moved into the send.
+        let symbols: Vec<String> = subscription_msg
+            .add
+            .as_ref()
+            .map(|subs| subs.iter().map(|sub| sub.symbol.clone()).collect())
+            .unwrap_or_default();
+
         let conn = self.get_connection_mut()?;
         conn.send(&subscription_msg).await?;
+
+        // Only now. Recording before the send meant a failed send left the
+        // client believing in a subscription the server never received, which
+        // is the same divergence this method was fixed to avoid.
+        {
+            let mut subs = recover(&self.subscriptions);
+            for (event_type, symbol) in parsed.iter().zip(symbols) {
+                subs.insert((*event_type, symbol));
+            }
+        }
 
         info!("Subscriptions added to channel {}", channel_id);
 
@@ -1445,12 +1472,8 @@ impl DXLinkClient {
         self.validate_channel(channel_id, "FEED")?;
 
         // Update internal subscriptions tracking
-        {
-            let mut subs = recover(&self.subscriptions);
-            for sub in &subscriptions {
-                subs.remove(&(EventType::from(sub.event_type.as_str()), sub.symbol.clone()));
-            }
-        }
+        let parsed = parse_subscription_types(&subscriptions)?;
+        let symbols: Vec<String> = subscriptions.iter().map(|s| s.symbol.clone()).collect();
 
         let subscription_msg = FeedSubscriptionMessage {
             channel: channel_id,
@@ -1462,6 +1485,15 @@ impl DXLinkClient {
 
         let conn = self.get_connection_mut()?;
         conn.send(&subscription_msg).await?;
+
+        // After the send, for the same reason as subscribe: a failed send must
+        // not leave the client believing it unsubscribed.
+        {
+            let mut subs = recover(&self.subscriptions);
+            for (event_type, symbol) in parsed.iter().zip(symbols) {
+                subs.remove(&(*event_type, symbol));
+            }
+        }
 
         info!("Subscriptions removed from channel {}", channel_id);
 
