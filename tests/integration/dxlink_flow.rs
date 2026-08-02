@@ -728,3 +728,112 @@ async fn test_prints_reach_the_stream_and_the_callback() {
 
     client.disconnect().await.expect("failed to disconnect");
 }
+
+/// Issue #27 asks for two profiles reaching both delivery paths with all their
+/// metadata intact.
+#[tokio::test]
+async fn test_profiles_reach_the_stream_and_the_callback() {
+    let server = MockServer::start(Behaviour::Normal).await;
+
+    let mut client = DXLinkClient::new(&server.url(), "test-token");
+    let mut event_stream = client.connect().await.expect("failed to connect");
+
+    let channel_id = client
+        .create_feed_channel("AUTO")
+        .await
+        .expect("failed to create feed channel");
+    client
+        .setup_feed(channel_id, &[EventType::Profile])
+        .await
+        .expect("failed to set up feed");
+
+    let delivered = Arc::new(Mutex::new(Vec::new()));
+    let sink = delivered.clone();
+    client.on_event("AAPL", move |event| {
+        sink.lock().expect("callback lock poisoned").push(event);
+    });
+
+    client
+        .subscribe(
+            channel_id,
+            vec![
+                FeedSubscription {
+                    event_type: "Profile".to_string(),
+                    symbol: "AAPL".to_string(),
+                    from_time: None,
+                    source: None,
+                },
+                FeedSubscription {
+                    event_type: "Profile".to_string(),
+                    symbol: "MSFT".to_string(),
+                    from_time: None,
+                    source: None,
+                },
+            ],
+        )
+        .await
+        .expect("failed to subscribe");
+
+    let events = collect_events(&mut event_stream, 2).await;
+    assert_eq!(events.len(), 2, "expected two profiles, got {events:?}");
+
+    let symbols: Vec<&str> = events
+        .iter()
+        .map(|event| match event {
+            MarketEvent::Profile(profile) => profile.event_symbol.as_str(),
+            other => panic!("expected a profile, got {other:?}"),
+        })
+        .collect();
+    assert!(symbols.contains(&"AAPL"), "AAPL is missing: {symbols:?}");
+    assert!(symbols.contains(&"MSFT"), "MSFT is missing: {symbols:?}");
+
+    let profile = events
+        .iter()
+        .find_map(|event| match event {
+            MarketEvent::Profile(profile) if profile.event_symbol == "AAPL" => Some(profile),
+            _ => None,
+        })
+        .expect("no Profile for AAPL reached the stream");
+
+    assert_eq!(profile.event_type, "Profile");
+    assert_eq!(profile.event_time, expected::EVENT_TIME);
+    assert_eq!(profile.description, expected::DESCRIPTION);
+    assert_eq!(
+        profile.short_sale_restriction,
+        expected::SHORT_SALE_RESTRICTION
+    );
+    assert_eq!(profile.trading_status, expected::TRADING_STATUS);
+    assert_eq!(profile.status_reason, expected::STATUS_REASON);
+    assert_eq!(profile.halt_start_time, expected::HALT_START_TIME);
+    assert_eq!(profile.halt_end_time, expected::HALT_END_TIME);
+    assert_eq!(profile.high_limit_price, expected::HIGH_LIMIT_PRICE);
+    assert_eq!(profile.low_limit_price, expected::LOW_LIMIT_PRICE);
+    assert_eq!(profile.high_52_week_price, expected::HIGH_52_WEEK_PRICE);
+    assert_eq!(profile.low_52_week_price, expected::LOW_52_WEEK_PRICE);
+    assert_eq!(profile.beta, expected::BETA);
+    assert_eq!(profile.earnings_per_share, expected::EARNINGS_PER_SHARE);
+    assert_eq!(profile.dividend_frequency, expected::DIVIDEND_FREQUENCY);
+    assert_eq!(profile.ex_dividend_amount, expected::EX_DIVIDEND_AMOUNT);
+    assert_eq!(profile.ex_dividend_day_id, expected::EX_DIVIDEND_DAY_ID);
+    assert_eq!(profile.shares, expected::SHARES);
+    assert_eq!(profile.free_float, expected::FREE_FLOAT);
+
+    // The callback routes through symbol_of, which needed a new arm for this
+    // variant, and it is scoped to AAPL so MSFT must not appear.
+    let seen: Vec<MarketEvent> = {
+        let events = delivered.lock().expect("callback lock poisoned");
+        events.clone()
+    };
+    match seen.as_slice() {
+        [MarketEvent::Profile(profile)] => {
+            assert_eq!(profile.event_symbol, "AAPL");
+            // The operational half is what a consumer acts on: a price from a
+            // halted instrument is stale by definition.
+            assert_eq!(profile.trading_status, expected::TRADING_STATUS);
+            assert_eq!(profile.status_reason, expected::STATUS_REASON);
+        }
+        other => panic!("the callback for AAPL should have received one profile, got {other:?}"),
+    }
+
+    client.disconnect().await.expect("failed to disconnect");
+}

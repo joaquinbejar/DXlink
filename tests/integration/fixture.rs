@@ -484,6 +484,24 @@ fn field_value(field: &str, event_type: &str, symbol: &str) -> Value {
         "type" => json!("NEW"),
         "buyer" => json!("NSDQ"),
         "seller" => json!("NYSE"),
+        // Profile
+        "description" => json!("Apple Inc. - Common Stock"),
+        "shortSaleRestriction" => json!("Inactive"),
+        "tradingStatus" => json!("Halted"),
+        "statusReason" => json!("News pending"),
+        "haltStartTime" => json!(1_700_000_100_000i64),
+        "haltEndTime" => json!(1_700_000_900_000i64),
+        "highLimitPrice" => json!(165.0),
+        "lowLimitPrice" => json!(135.0),
+        "high52WeekPrice" => json!(199.62),
+        "low52WeekPrice" => json!(124.17),
+        "beta" => json!(1.29),
+        "earningsPerShare" => json!(6.13),
+        "dividendFrequency" => json!(4.0),
+        "exDividendAmount" => json!(0.24),
+        "exDividendDayId" => json!(20240209i64),
+        "shares" => json!(15_552_800_000.0),
+        "freeFloat" => json!(15_461_900_000.0),
         // Greeks
         "delta" => json!(0.65),
         "gamma" => json!(0.05),
@@ -553,6 +571,23 @@ pub mod expected {
     pub const SALE_TYPE: &str = "NEW";
     pub const BUYER: &str = "NSDQ";
     pub const SELLER: &str = "NYSE";
+    pub const DESCRIPTION: &str = "Apple Inc. - Common Stock";
+    pub const SHORT_SALE_RESTRICTION: &str = "Inactive";
+    pub const TRADING_STATUS: &str = "Halted";
+    pub const STATUS_REASON: &str = "News pending";
+    pub const HALT_START_TIME: i64 = 1_700_000_100_000;
+    pub const HALT_END_TIME: i64 = 1_700_000_900_000;
+    pub const HIGH_LIMIT_PRICE: f64 = 165.0;
+    pub const LOW_LIMIT_PRICE: f64 = 135.0;
+    pub const HIGH_52_WEEK_PRICE: f64 = 199.62;
+    pub const LOW_52_WEEK_PRICE: f64 = 124.17;
+    pub const BETA: f64 = 1.29;
+    pub const EARNINGS_PER_SHARE: f64 = 6.13;
+    pub const DIVIDEND_FREQUENCY: f64 = 4.0;
+    pub const EX_DIVIDEND_AMOUNT: f64 = 0.24;
+    pub const EX_DIVIDEND_DAY_ID: i64 = 20240209;
+    pub const SHARES: f64 = 15_552_800_000.0;
+    pub const FREE_FLOAT: f64 = 15_461_900_000.0;
 }
 
 /// Convenience predicates for `wait_for`.
