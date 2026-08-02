@@ -1089,7 +1089,10 @@ impl DXLinkClient {
                                                 // Report it rather than
                                                 // delivering a partial batch
                                                 // that looks complete.
-                                                error!("Malformed COMPACT data: {e}");
+                                                error!(
+                                                    "Malformed COMPACT data on channel {:?}: {e}",
+                                                    channel
+                                                );
                                                 continue;
                                             }
                                         };

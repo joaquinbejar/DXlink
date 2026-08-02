@@ -9,26 +9,12 @@ use crate::events::{CompactData, EventType, GreeksEvent, QuoteEvent, TradeEvent}
 use serde_json::Value;
 use tracing::warn;
 
-/// Parses a vector of `CompactData` and returns a vector of `MarketEvent`s.
+/// Decodes COMPACT rows, dropping the whole batch if any of it is malformed.
 ///
-/// The function iterates through the `data` vector, expecting pairs of `CompactData`
-/// elements. The first element of the pair should be a `CompactData::EventType`
-/// containing the event type as a string. The second element should be a
-/// `CompactData::Values` containing a vector of `serde_json::Value`s representing
-/// the event data.
-///
-/// The function supports three event types: "Quote", "Trade", and "Greeks".  For each
-/// recognized event type, it attempts to parse the corresponding data values and
-/// create a `MarketEvent` variant. If the data for an event is incomplete or in an
-/// unexpected format, the event is skipped.
-///
-/// # Arguments
-///
-/// * `data` - A slice of `CompactData` to parse.
-///
-/// # Returns
-///
-/// A vector of `MarketEvent`s successfully parsed from the input data.
+/// **Lossy on purpose, and kept for source compatibility.** It stops at the
+/// first thing it cannot read, logs a warning, and returns the events decoded
+/// before that point — so a consumer cannot tell corrupt protocol data from a
+/// quiet market. Use [`try_parse_compact_data`] for anything that needs to know.
 ///
 /// # Example
 ///
@@ -50,7 +36,6 @@ use tracing::warn;
 /// ];
 ///
 /// let events = parse_compact_data(&data);
-///
 /// assert_eq!(events.len(), 1);
 ///
 /// if let MarketEvent::Quote(quote) = &events[0] {
