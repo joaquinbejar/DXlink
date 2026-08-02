@@ -429,8 +429,8 @@ fn redacted(mut messages: Vec<Value>) -> Vec<Value> {
 /// The value the server reports for one COMPACT column.
 ///
 /// Keyed by wire field name so the row can be assembled in whatever order the
-/// client requested. Anything unrecognised becomes null, which surfaces as a
-/// decode failure rather than a plausible-looking number.
+/// client requested. An unrecognised column panics here rather than being
+/// filled in: see the arm at the bottom for why.
 fn field_value(field: &str, event_type: &str, symbol: &str) -> Value {
     match field {
         "eventType" => json!(event_type),
@@ -520,6 +520,16 @@ pub mod expected {
     pub const ASK_VOLUME: f64 = 634_000.0;
     pub const IMP_VOLATILITY: f64 = 0.31;
     pub const OPEN_INTEREST: f64 = 4_200.0;
+    pub const DAY_ID: i64 = 20240119;
+    pub const DAY_OPEN_PRICE: f64 = 149.5;
+    pub const DAY_HIGH_PRICE: f64 = 152.0;
+    pub const DAY_LOW_PRICE: f64 = 148.0;
+    pub const DAY_CLOSE_PRICE: f64 = 150.75;
+    pub const DAY_CLOSE_PRICE_TYPE: &str = "Final";
+    pub const PREV_DAY_ID: i64 = 20240118;
+    pub const PREV_DAY_CLOSE_PRICE: f64 = 147.75;
+    pub const PREV_DAY_CLOSE_PRICE_TYPE: &str = "Final";
+    pub const PREV_DAY_VOLUME: f64 = 58_000_000.0;
 }
 
 /// Convenience predicates for `wait_for`.

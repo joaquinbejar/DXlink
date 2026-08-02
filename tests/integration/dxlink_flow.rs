@@ -516,3 +516,101 @@ async fn test_a_lost_connection_closes_the_stream_and_reports_why() {
         "unhelpful disconnect reason: {reason}"
     );
 }
+
+/// Issue #25 asks for two Summary rows reaching both delivery paths without
+/// column drift. Two symbols, so a stride error shows up as the second event
+/// carrying the wrong symbol rather than as a plausible number.
+#[tokio::test]
+async fn test_summaries_reach_the_stream_and_the_callback() {
+    let server = MockServer::start(Behaviour::Normal).await;
+
+    let mut client = DXLinkClient::new(&server.url(), "test-token");
+    let mut event_stream = client.connect().await.expect("failed to connect");
+
+    let channel_id = client
+        .create_feed_channel("AUTO")
+        .await
+        .expect("failed to create feed channel");
+    client
+        .setup_feed(channel_id, &[EventType::Summary])
+        .await
+        .expect("failed to set up feed");
+
+    let delivered = Arc::new(Mutex::new(Vec::new()));
+    let sink = delivered.clone();
+    client.on_event("AAPL", move |event| {
+        sink.lock().expect("callback lock poisoned").push(event);
+    });
+
+    client
+        .subscribe(
+            channel_id,
+            vec![
+                FeedSubscription {
+                    event_type: "Summary".to_string(),
+                    symbol: "AAPL".to_string(),
+                    from_time: None,
+                    source: None,
+                },
+                FeedSubscription {
+                    event_type: "Summary".to_string(),
+                    symbol: "MSFT".to_string(),
+                    from_time: None,
+                    source: None,
+                },
+            ],
+        )
+        .await
+        .expect("failed to subscribe");
+
+    let events = collect_events(&mut event_stream, 2).await;
+    assert_eq!(events.len(), 2, "expected two summaries, got {events:?}");
+
+    let symbols: Vec<&str> = events
+        .iter()
+        .map(|event| match event {
+            MarketEvent::Summary(summary) => summary.event_symbol.as_str(),
+            other => panic!("expected a summary, got {other:?}"),
+        })
+        .collect();
+    assert!(symbols.contains(&"AAPL"), "AAPL is missing: {symbols:?}");
+    assert!(symbols.contains(&"MSFT"), "MSFT is missing: {symbols:?}");
+
+    let summary = events
+        .iter()
+        .find_map(|event| match event {
+            MarketEvent::Summary(summary) if summary.event_symbol == "AAPL" => Some(summary),
+            _ => None,
+        })
+        .expect("no Summary for AAPL reached the stream");
+
+    assert_eq!(summary.event_type, "Summary");
+    assert_eq!(summary.event_time, expected::EVENT_TIME);
+    assert_eq!(summary.day_id, expected::DAY_ID);
+    assert_eq!(summary.day_open_price, expected::DAY_OPEN_PRICE);
+    assert_eq!(summary.day_high_price, expected::DAY_HIGH_PRICE);
+    assert_eq!(summary.day_low_price, expected::DAY_LOW_PRICE);
+    assert_eq!(summary.day_close_price, expected::DAY_CLOSE_PRICE);
+    assert_eq!(summary.day_close_price_type, expected::DAY_CLOSE_PRICE_TYPE);
+    assert_eq!(summary.prev_day_id, expected::PREV_DAY_ID);
+    assert_eq!(summary.prev_day_close_price, expected::PREV_DAY_CLOSE_PRICE);
+    assert_eq!(
+        summary.prev_day_close_price_type,
+        expected::PREV_DAY_CLOSE_PRICE_TYPE
+    );
+    assert_eq!(summary.prev_day_volume, expected::PREV_DAY_VOLUME);
+    assert_eq!(summary.open_interest, expected::OPEN_INTEREST);
+
+    // The callback routes through symbol_of, which needed a new arm for this
+    // variant, and it is scoped to AAPL so MSFT must not appear.
+    let seen: Vec<MarketEvent> = {
+        let events = delivered.lock().expect("callback lock poisoned");
+        events.clone()
+    };
+    match seen.as_slice() {
+        [MarketEvent::Summary(summary)] => assert_eq!(summary.event_symbol, "AAPL"),
+        other => panic!("the callback for AAPL should have received one summary, got {other:?}"),
+    }
+
+    client.disconnect().await.expect("failed to disconnect");
+}
