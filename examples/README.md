@@ -6,20 +6,22 @@ This directory contains examples demonstrating how to use the DXLink library wit
 
 ### 1. Environment Configuration
 
-Copy the `.env.example` file to `.env` in the project root:
+The example reads plain environment variables and does **not** load a `.env`
+file on its own. Either export the variables, or source the file first:
 
 ```bash
 cp .env.example .env
+set -a && . ./.env && set +a
 ```
 
-Edit the `.env` file and configure your settings:
+The variables it understands:
 
 ```bash
 # Required: Your tastytrade API token
 DXLINK_API_TOKEN=your_actual_token_here
 
 # Optional: Custom WebSocket URL (defaults to demo server)
-DXLINK_WS_URL=wss://demo.dxfeed.com/dxlink-ws
+DXLINK_WS_URL=wss://tasty-demo-dxlink-md-ws.dxfeed.com/delayed
 
 # Optional: Enable debug logging
 RUST_LOG=debug
@@ -42,12 +44,10 @@ To get your tastytrade API token:
 
 The basic example demonstrates connecting to DXLink, subscribing to market data, and processing events:
 
-```bash
-# Run with environment variables from .env file
-cargo run --bin basic
+Run it from the workspace root:
 
-# Or run with explicit environment variables
-DXLINK_API_TOKEN=your_token RUST_LOG=info cargo run --bin basic
+```bash
+DXLINK_API_TOKEN=your_token RUST_LOG=info cargo run -p miscellaneous --bin basic
 ```
 
 ### Example Features
@@ -64,7 +64,7 @@ DXLINK_API_TOKEN=your_token RUST_LOG=info cargo run --bin basic
 | Variable | Description | Default | Required |
 |----------|-------------|---------|----------|
 | `DXLINK_API_TOKEN` | tastytrade API authentication token | empty | No (for demo) |
-| `DXLINK_WS_URL` | DXLink WebSocket server URL | `wss://demo.dxfeed.com/dxlink-ws` | No |
+| `DXLINK_WS_URL` | DXLink WebSocket server URL | `wss://tasty-demo-dxlink-md-ws.dxfeed.com/delayed` | No |
 | `RUST_LOG` | Logging level (error, warn, info, debug, trace) | info | No |
 
 ## Troubleshooting
@@ -91,7 +91,7 @@ DXLINK_API_TOKEN=your_token RUST_LOG=info cargo run --bin basic
 Enable debug logging to see detailed information:
 
 ```bash
-RUST_LOG=debug cargo run --bin basic
+RUST_LOG=debug cargo run -p miscellaneous --bin basic
 ```
 
 ## Security Notes

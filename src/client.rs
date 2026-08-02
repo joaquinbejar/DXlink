@@ -218,13 +218,14 @@ impl DXLinkClient {
     ///
     /// # Example
     ///
-    /// ```rust,ignore
-    /// # use dxlink::client::DXLinkClient;
-    /// # use dxlink::error::DXLinkResult;
-    /// # #[tokio::main]
-    /// # async fn main() -> DXLinkResult<()> {
-    /// let mut client = DXLinkClient::new("ws://your_dxlink_server_url", "YOUR_TOKEN", 30000)?;
-    /// client.connect().await?;
+    /// ```rust,no_run
+    /// use dxlink::{DXLinkClient, DXLinkError};
+    ///
+    /// # async fn example() -> Result<(), DXLinkError> {
+    /// let mut client = DXLinkClient::new("wss://your_dxlink_server_url", "YOUR_TOKEN");
+    /// // `connect` returns the event stream; there is exactly one per client.
+    /// let mut event_stream = client.connect().await?;
+    /// # let _ = &mut event_stream;
     /// # Ok(())
     /// # }
     /// ```

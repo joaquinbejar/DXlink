@@ -9,7 +9,7 @@ use tracing::info;
 #[ignore] // Requires network access to the external DXFeed demo server
 async fn test_integration_with_real_server() {
     let token = env::var("DXLINK_API_TOKEN").unwrap_or_else(|_| String::new());
-    let url = "wss://demo.dxfeed.com/dxlink-ws";
+    let url = "wss://tasty-demo-dxlink-md-ws.dxfeed.com/delayed";
 
     info!("Conectando al servidor demo de DXFeed: {}", url);
 
