@@ -66,9 +66,9 @@ pub struct SetupMessage {
     /// The type of the message, `SETUP` on the wire.
     #[serde(rename = "type")]
     pub message_type: String,
-    /// The keepalive timeout value in milliseconds.
+    /// The keepalive timeout, in seconds (the unit DXLink uses on the wire).
     pub keepalive_timeout: u32,
-    /// The timeout value for accepting a keepalive message.
+    /// The largest keepalive timeout this peer accepts, in seconds.
     pub accept_keepalive_timeout: u32,
     /// The version of the protocol.
     pub version: String,
