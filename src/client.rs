@@ -1029,6 +1029,12 @@ fn keepalive_interval_for(advertised: u32, negotiated: Option<u32>) -> Duration 
 ///
 /// States are advisory and the supervisor's job is to reconnect, not to block
 /// on a consumer that stopped reading.
+///
+/// **Drops the state being reported, not the oldest queued one.** An `mpsc`
+/// sender cannot evict from the front of its own queue, so a consumer that
+/// ignores the stream long enough to fill it stops seeing new states rather
+/// than losing old ones. See issue #60: the terminal states are the ones worth
+/// keeping, so the eviction should go the other way.
 fn notify(states: &Option<Sender<ConnectionState>>, state: ConnectionState) {
     if let Some(tx) = states
         && tx.try_send(state.clone()).is_err()
@@ -1688,9 +1694,11 @@ impl DXLinkClient {
     /// without one the session never comes back and the closing event stream
     /// already says so.
     ///
-    /// The stream is bounded and **drops the oldest state rather than blocking**
-    /// the supervisor. States are advisory; the authority on whether the client
-    /// is live is whether events are still arriving.
+    /// The stream is bounded and **never blocks the supervisor**: when the
+    /// queue is full the new state is dropped, so a consumer that stops reading
+    /// long enough to fill it stops seeing changes until it drains. States are
+    /// advisory; the authority on whether the client is live is whether events
+    /// are still arriving.
     ///
     /// Additive: a new method, no existing signature changes.
     pub fn connection_states(&mut self) -> Option<Receiver<ConnectionState>> {
