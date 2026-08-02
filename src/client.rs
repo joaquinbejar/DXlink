@@ -353,6 +353,7 @@ fn symbol_of(event: &MarketEvent) -> &str {
         MarketEvent::TimeAndSale(e) => &e.event_symbol,
         MarketEvent::Profile(e) => &e.event_symbol,
         MarketEvent::Underlying(e) => &e.event_symbol,
+        MarketEvent::TheoPrice(e) => &e.event_symbol,
     }
 }
 

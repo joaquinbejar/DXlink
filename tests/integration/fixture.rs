@@ -508,6 +508,10 @@ fn field_value(field: &str, event_type: &str, symbol: &str) -> Value {
         "callVolume" => json!(310_000.0),
         "putVolume" => json!(465_000.0),
         "putCallRatio" => json!(1.5),
+        // TheoPrice (price, delta and gamma are above)
+        "underlyingPrice" => json!(152.4),
+        "dividend" => json!(0.55),
+        "interest" => json!(4.75),
         // Greeks
         "delta" => json!(0.65),
         "gamma" => json!(0.05),
@@ -599,6 +603,9 @@ pub mod expected {
     pub const CALL_VOLUME: f64 = 310_000.0;
     pub const PUT_VOLUME: f64 = 465_000.0;
     pub const PUT_CALL_RATIO: f64 = 1.5;
+    pub const UNDERLYING_PRICE: f64 = 152.4;
+    pub const DIVIDEND: f64 = 0.55;
+    pub const INTEREST: f64 = 4.75;
 }
 
 /// Convenience predicates for `wait_for`.
