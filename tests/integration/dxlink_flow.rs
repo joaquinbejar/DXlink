@@ -837,3 +837,103 @@ async fn test_profiles_reach_the_stream_and_the_callback() {
 
     client.disconnect().await.expect("failed to disconnect");
 }
+
+/// Issue #28 asks for two underlyings reaching both delivery paths with their
+/// volatility term structure and volumes intact.
+#[tokio::test]
+async fn test_underlyings_reach_the_stream_and_the_callback() {
+    let server = MockServer::start(Behaviour::Normal).await;
+
+    let mut client = DXLinkClient::new(&server.url(), "test-token");
+    let mut event_stream = client.connect().await.expect("failed to connect");
+
+    let channel_id = client
+        .create_feed_channel("AUTO")
+        .await
+        .expect("failed to create feed channel");
+    client
+        .setup_feed(channel_id, &[EventType::Underlying])
+        .await
+        .expect("failed to set up feed");
+
+    let delivered = Arc::new(Mutex::new(Vec::new()));
+    let sink = delivered.clone();
+    client.on_event("SPX", move |event| {
+        sink.lock().expect("callback lock poisoned").push(event);
+    });
+
+    client
+        .subscribe(
+            channel_id,
+            vec![
+                FeedSubscription {
+                    event_type: "Underlying".to_string(),
+                    symbol: "SPX".to_string(),
+                    from_time: None,
+                    source: None,
+                },
+                FeedSubscription {
+                    event_type: "Underlying".to_string(),
+                    symbol: "NDX".to_string(),
+                    from_time: None,
+                    source: None,
+                },
+            ],
+        )
+        .await
+        .expect("failed to subscribe");
+
+    let events = collect_events(&mut event_stream, 2).await;
+    assert_eq!(events.len(), 2, "expected two underlyings, got {events:?}");
+
+    let symbols: Vec<&str> = events
+        .iter()
+        .map(|event| match event {
+            MarketEvent::Underlying(surface) => surface.event_symbol.as_str(),
+            other => panic!("expected an underlying, got {other:?}"),
+        })
+        .collect();
+    assert!(symbols.contains(&"SPX"), "SPX is missing: {symbols:?}");
+    assert!(symbols.contains(&"NDX"), "NDX is missing: {symbols:?}");
+
+    let surface = events
+        .iter()
+        .find_map(|event| match event {
+            MarketEvent::Underlying(surface) if surface.event_symbol == "SPX" => Some(surface),
+            _ => None,
+        })
+        .expect("no Underlying for SPX reached the stream");
+
+    assert_eq!(surface.event_type, "Underlying");
+    assert_eq!(surface.event_time, expected::EVENT_TIME);
+    assert_eq!(surface.event_flags, expected::EVENT_FLAGS);
+    assert_eq!(surface.index, expected::INDEX);
+    assert_eq!(surface.time, expected::TIME);
+    assert_eq!(surface.sequence, expected::SEQUENCE);
+    assert_eq!(surface.volatility, expected::VOLATILITY);
+    assert_eq!(surface.front_volatility, expected::FRONT_VOLATILITY);
+    assert_eq!(surface.back_volatility, expected::BACK_VOLATILITY);
+    assert_eq!(surface.call_volume, expected::CALL_VOLUME);
+    assert_eq!(surface.put_volume, expected::PUT_VOLUME);
+    assert_eq!(surface.put_call_ratio, expected::PUT_CALL_RATIO);
+
+    // The callback routes through symbol_of, which needed a new arm for this
+    // variant, and it is scoped to SPX so NDX must not appear.
+    let seen: Vec<MarketEvent> = {
+        let events = delivered.lock().expect("callback lock poisoned");
+        events.clone()
+    };
+    match seen.as_slice() {
+        [MarketEvent::Underlying(surface)] => {
+            assert_eq!(surface.event_symbol, "SPX");
+            // The three volatilities are all plausible fractions, so asserting
+            // them here is what catches a shift between the two paths.
+            assert_eq!(surface.volatility, expected::VOLATILITY);
+            assert_eq!(surface.front_volatility, expected::FRONT_VOLATILITY);
+            assert_eq!(surface.back_volatility, expected::BACK_VOLATILITY);
+        }
+        other => panic!("the callback for SPX should have received one underlying, got {other:?}"),
+    }
+
+    client.disconnect().await.expect("failed to disconnect");
+}

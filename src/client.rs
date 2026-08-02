@@ -352,6 +352,7 @@ fn symbol_of(event: &MarketEvent) -> &str {
         MarketEvent::Summary(e) => &e.event_symbol,
         MarketEvent::TimeAndSale(e) => &e.event_symbol,
         MarketEvent::Profile(e) => &e.event_symbol,
+        MarketEvent::Underlying(e) => &e.event_symbol,
     }
 }
 

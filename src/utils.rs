@@ -7,7 +7,7 @@ use crate::MarketEvent;
 use crate::error::{DXLinkError, DXLinkResult};
 use crate::events::{
     CandleEvent, CompactData, EventType, GreeksEvent, ProfileEvent, QuoteEvent, SummaryEvent,
-    TimeAndSaleEvent, TradeEvent,
+    TimeAndSaleEvent, TradeEvent, UnderlyingEvent,
 };
 use serde_json::Value;
 use tracing::warn;
@@ -401,6 +401,24 @@ fn build_event(
                 ex_dividend_day_id: int(17)?,
                 shares: number(18)?,
                 free_float: number(19)?,
+            })
+        }
+        EventType::Underlying => {
+            let int = |index: usize| as_int(row_values, index, header, row, fields[index]);
+            MarketEvent::Underlying(UnderlyingEvent {
+                event_type: header.to_string(),
+                event_symbol: symbol,
+                event_time: int(2)?,
+                event_flags: int(3)?,
+                index: int(4)?,
+                time: int(5)?,
+                sequence: int(6)?,
+                volatility: number(7)?,
+                front_volatility: number(8)?,
+                back_volatility: number(9)?,
+                call_volume: number(10)?,
+                put_volume: number(11)?,
+                put_call_ratio: number(12)?,
             })
         }
         // compact_fields returned Some for this type, so a missing arm here is a
@@ -1451,6 +1469,166 @@ mod profile_tests {
         let back: MarketEvent = serde_json::from_str(&json).expect("deserialize");
         assert!(
             matches!(back, MarketEvent::Profile(_)),
+            "an untagged round trip picked the wrong variant: {back:?}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod underlying_tests {
+    use super::*;
+    use serde_json::json;
+
+    /// The exact 13 columns issue #28 specifies, in order.
+    fn underlying_row(symbol: &str) -> Vec<Value> {
+        vec![
+            json!("Underlying"),         // 0 eventType
+            json!(symbol),               // 1 eventSymbol
+            json!(1_700_000_000_500i64), // 2 eventTime
+            json!(0i64),                 // 3 eventFlags
+            json!(9i64),                 // 4 index
+            json!(1_700_000_000_000i64), // 5 time
+            json!(3i64),                 // 6 sequence
+            json!(0.25),                 // 7 volatility
+            json!(0.28),                 // 8 frontVolatility
+            json!(0.22),                 // 9 backVolatility
+            json!(310_000.0),            // 10 callVolume
+            json!(465_000.0),            // 11 putVolume
+            json!(1.5),                  // 12 putCallRatio
+        ]
+    }
+
+    fn batch(values: Vec<Value>) -> Vec<CompactData> {
+        vec![
+            CompactData::EventType("Underlying".to_string()),
+            CompactData::Values(values),
+        ]
+    }
+
+    #[test]
+    fn test_the_field_list_matches_the_decoder_stride() {
+        let fields = EventType::Underlying
+            .compact_fields()
+            .expect("Underlying has a decoder");
+        assert_eq!(fields.len(), 13, "the layout is 13 columns");
+        assert_eq!(fields.len(), underlying_row("SPX").len());
+    }
+
+    #[test]
+    fn test_two_underlyings_decode_with_the_right_stride() {
+        let mut values = underlying_row("SPX");
+        values.extend(underlying_row("NDX"));
+
+        let events = try_parse_compact_data(&batch(values)).expect("well formed");
+        assert_eq!(events.len(), 2);
+
+        match (&events[0], &events[1]) {
+            (MarketEvent::Underlying(first), MarketEvent::Underlying(second)) => {
+                // The symbols prove the stride of thirteen.
+                assert_eq!(first.event_symbol, "SPX");
+                assert_eq!(second.event_symbol, "NDX");
+                assert_eq!(first.event_time, 1_700_000_000_500);
+                assert_eq!(first.event_flags, 0);
+                assert_eq!(first.index, 9);
+                assert_eq!(first.time, 1_700_000_000_000);
+                assert_eq!(first.sequence, 3);
+                assert_eq!(first.volatility, 0.25);
+                assert_eq!(first.front_volatility, 0.28);
+                assert_eq!(first.back_volatility, 0.22);
+                assert_eq!(first.call_volume, 310_000.0);
+                assert_eq!(first.put_volume, 465_000.0);
+                assert_eq!(first.put_call_ratio, 1.5);
+            }
+            other => panic!("expected two underlyings, got {other:?}"),
+        }
+    }
+
+    /// The three volatilities sit next to each other and are all plausible
+    /// fractions, so a one-column shift there changes the term structure
+    /// without looking wrong.
+    #[test]
+    fn test_the_term_structure_keeps_its_own_columns() {
+        let mut values = underlying_row("SPX");
+        values[7] = json!(0.30);
+        values[8] = json!(0.40);
+        values[9] = json!(0.20);
+
+        let events = try_parse_compact_data(&batch(values)).expect("well formed");
+        match &events[0] {
+            MarketEvent::Underlying(surface) => {
+                assert_eq!(surface.volatility, 0.30);
+                assert_eq!(surface.front_volatility, 0.40);
+                assert_eq!(surface.back_volatility, 0.20);
+                // Backwardation: the front is above the back, which is the case
+                // a shifted layout would hide.
+                assert!(surface.front_volatility > surface.back_volatility);
+            }
+            other => panic!("expected an underlying, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_a_textual_volatility_is_rejected() {
+        let mut values = underlying_row("SPX");
+        // Not a JSONDouble special value, so it must not decode.
+        values[8] = json!("high");
+
+        let error = try_parse_compact_data(&batch(values)).expect_err("the column is a number");
+        assert!(
+            error.to_string().contains("frontVolatility"),
+            "the field is missing: {error}"
+        );
+    }
+
+    #[test]
+    fn test_a_fractional_sequence_is_rejected() {
+        let mut values = underlying_row("SPX");
+        values[6] = json!(3.5);
+
+        let error =
+            try_parse_compact_data(&batch(values)).expect_err("the column is a whole number");
+        assert!(
+            error.to_string().contains("sequence"),
+            "the field is missing: {error}"
+        );
+    }
+
+    #[test]
+    fn test_an_underlying_without_options_traded_decodes() {
+        // With no volume on either side the ratio is undefined, and the protocol
+        // sends NaN rather than omitting the column.
+        let mut values = underlying_row("SPX");
+        values[10] = json!(0.0);
+        values[11] = json!(0.0);
+        values[12] = json!("NaN");
+
+        let events = try_parse_compact_data(&batch(values)).expect("NaN is a value");
+        match &events[0] {
+            MarketEvent::Underlying(surface) => {
+                assert_eq!(surface.call_volume, 0.0);
+                assert_eq!(surface.put_volume, 0.0);
+                assert!(surface.put_call_ratio.is_nan());
+            }
+            other => panic!("expected an underlying, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_a_truncated_underlying_row_is_rejected() {
+        let mut values = underlying_row("SPX");
+        values.pop();
+        assert!(try_parse_compact_data(&batch(values)).is_err());
+    }
+
+    #[test]
+    fn test_an_underlying_is_not_mistaken_for_another_event() {
+        let events = try_parse_compact_data(&batch(underlying_row("SPX"))).expect("well formed");
+        assert!(matches!(events[0], MarketEvent::Underlying(_)));
+
+        let json = serde_json::to_string(&events[0]).expect("serialize");
+        let back: MarketEvent = serde_json::from_str(&json).expect("deserialize");
+        assert!(
+            matches!(back, MarketEvent::Underlying(_)),
             "an untagged round trip picked the wrong variant: {back:?}"
         );
     }

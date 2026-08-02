@@ -502,6 +502,12 @@ fn field_value(field: &str, event_type: &str, symbol: &str) -> Value {
         "exDividendDayId" => json!(20240209i64),
         "shares" => json!(15_552_800_000.0),
         "freeFloat" => json!(15_461_900_000.0),
+        // Underlying (volatility is above, shared with Greeks)
+        "frontVolatility" => json!(0.28),
+        "backVolatility" => json!(0.22),
+        "callVolume" => json!(310_000.0),
+        "putVolume" => json!(465_000.0),
+        "putCallRatio" => json!(1.5),
         // Greeks
         "delta" => json!(0.65),
         "gamma" => json!(0.05),
@@ -588,6 +594,11 @@ pub mod expected {
     pub const EX_DIVIDEND_DAY_ID: i64 = 20240209;
     pub const SHARES: f64 = 15_552_800_000.0;
     pub const FREE_FLOAT: f64 = 15_461_900_000.0;
+    pub const FRONT_VOLATILITY: f64 = 0.28;
+    pub const BACK_VOLATILITY: f64 = 0.22;
+    pub const CALL_VOLUME: f64 = 310_000.0;
+    pub const PUT_VOLUME: f64 = 465_000.0;
+    pub const PUT_CALL_RATIO: f64 = 1.5;
 }
 
 /// Convenience predicates for `wait_for`.

@@ -282,6 +282,21 @@ impl EventType {
                 "buyer",
                 "seller",
             ]),
+            EventType::Underlying => Some(&[
+                "eventType",
+                "eventSymbol",
+                "eventTime",
+                "eventFlags",
+                "index",
+                "time",
+                "sequence",
+                "volatility",
+                "frontVolatility",
+                "backVolatility",
+                "callVolume",
+                "putVolume",
+                "putCallRatio",
+            ]),
             EventType::Greeks => Some(&[
                 "eventType",
                 "eventSymbol",
@@ -297,7 +312,6 @@ impl EventType {
             | EventType::TradeETH
             | EventType::SpreadOrder
             | EventType::TheoPrice
-            | EventType::Underlying
             | EventType::Series
             | EventType::Configuration
             | EventType::Message => None,
@@ -831,6 +845,65 @@ pub struct TimeAndSaleEvent {
     pub seller: String,
 }
 
+/// The option surface over an underlying: implied volatility and the call/put
+/// balance.
+///
+/// Every field the dxFeed AsyncAPI schema defines for an underlying, in the
+/// order the client requests them. `front_volatility` and `back_volatility`
+/// bracket the term structure, and `put_call_ratio` is the positioning number
+/// the raw volumes are usually reduced to.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UnderlyingEvent {
+    /// The type of the event, `Underlying`.
+    #[serde(rename = "eventType")]
+    pub event_type: String,
+
+    /// The underlying symbol.
+    #[serde(rename = "eventSymbol")]
+    pub event_symbol: String,
+
+    /// When the server emitted the event, as epoch milliseconds.
+    #[serde(rename = "eventTime")]
+    pub event_time: i64,
+
+    /// Transactional and snapshot bits for this record.
+    #[serde(rename = "eventFlags")]
+    pub event_flags: i64,
+
+    /// Unique index of the record, ordering it within the stream.
+    pub index: i64,
+
+    /// When the values were computed, as epoch milliseconds.
+    pub time: i64,
+
+    /// Sequence number, separating records that share a millisecond.
+    pub sequence: i64,
+
+    /// 30-day implied volatility for this underlying, as a fraction.
+    #[serde(with = "json_double")]
+    pub volatility: f64,
+
+    /// Implied volatility of the front-month options.
+    #[serde(rename = "frontVolatility", with = "json_double")]
+    pub front_volatility: f64,
+
+    /// Implied volatility of the second-month options.
+    #[serde(rename = "backVolatility", with = "json_double")]
+    pub back_volatility: f64,
+
+    /// Call option volume for the day.
+    #[serde(rename = "callVolume", with = "json_double")]
+    pub call_volume: f64,
+
+    /// Put option volume for the day.
+    #[serde(rename = "putVolume", with = "json_double")]
+    pub put_volume: f64,
+
+    /// Put volume over call volume.
+    #[serde(rename = "putCallRatio", with = "json_double")]
+    pub put_call_ratio: f64,
+}
+
 /// Represents a market event, which can be a quote, trade, or greeks event.
 ///
 /// This enum uses `serde`'s untagged enum serialization, meaning that the serialized
@@ -904,13 +977,15 @@ pub enum MarketEvent {
     /// One execution as it printed, with the surrounding quote.
     TimeAndSale(TimeAndSaleEvent),
     /// Instrument metadata: description, trading status and fundamentals.
+    Profile(ProfileEvent),
+    /// The option surface over an underlying: implied volatility and volumes.
     ///
     /// New variants go last on purpose: `MarketEvent` is `#[serde(untagged)]`,
     /// so serde tries them in declaration order and keeps the first that
     /// deserializes. Appending leaves every variant already in the list
     /// matching exactly as it did. Each type has a round-trip test that would
     /// catch one variant stealing another's payload.
-    Profile(ProfileEvent),
+    Underlying(UnderlyingEvent),
 }
 
 /// Represents compact data, which can be either an event type (string) or a vector of JSON values.
@@ -1612,6 +1687,29 @@ mod event_serde_tests {
         }
     }
 
+    fn underlying() -> UnderlyingEvent {
+        UnderlyingEvent {
+            event_type: "Underlying".to_string(),
+            event_symbol: "SPX".to_string(),
+            event_time: 1_700_000_000_500,
+            event_flags: 0,
+            index: 9,
+            time: 1_700_000_000_000,
+            sequence: 3,
+            volatility: 0.25,
+            front_volatility: 0.28,
+            back_volatility: 0.22,
+            call_volume: 310_000.0,
+            put_volume: 465_000.0,
+            put_call_ratio: 1.5,
+        }
+    }
+
+    #[test]
+    fn test_underlying_serde_names_match_its_layout() {
+        assert_wire_contract(&underlying(), EventType::Underlying);
+    }
+
     #[test]
     fn test_candle_serde_names_match_its_layout() {
         assert_wire_contract(&candle(), EventType::Candle);
@@ -1668,6 +1766,7 @@ mod event_serde_tests {
             MarketEvent::Summary(summary()),
             MarketEvent::TimeAndSale(print()),
             MarketEvent::Profile(profile()),
+            MarketEvent::Underlying(underlying()),
         ] {
             let serialized = to_string(&event).expect("serialize");
             let back: MarketEvent = from_str(&serialized).expect("round trip");
