@@ -91,11 +91,10 @@ impl EventType {
     /// The COMPACT field list this client requests for the event type, in the
     /// exact order the decoder reads it.
     ///
-    /// This is the single source of truth for the `setup_feed` ↔
-    /// `parse_compact_data` contract. The server echoes these fields back in
-    /// `FEED_CONFIG` and then sends rows in this order, so the list, the
-    /// validation of the reply, and the decoder stride all have to come from
-    /// one place. They used to be three separate literals.
+    /// This is what `setup_feed` requests and what the `FEED_CONFIG` reply is
+    /// validated against. The decoder in `utils.rs` still carries its own
+    /// positions, so the contract is not yet enforced from one definition —
+    /// moving the decoder onto this list is the next step.
     ///
     /// `None` means this client has no decoder for the type: it can be named,
     /// but no row can be turned into a [`MarketEvent`](crate::MarketEvent).

@@ -4,7 +4,7 @@
 //! Event delivery is covered in `dxlink_flow.rs`.
 
 use crate::fixture::{Behaviour, MockServer, is_type, is_type_on_channel};
-use dxlink::{DXLinkClient, DXLinkError, EventType};
+use dxlink::{DXLinkClient, DXLinkError, EventType, FeedSubscription};
 use std::time::Duration;
 
 #[tokio::test]
@@ -602,6 +602,58 @@ async fn test_setup_feed_rejects_a_format_it_cannot_decode() {
         }
         other => panic!("a non-COMPACT format must be rejected, got: {other:?}"),
     }
+
+    client.disconnect().await.expect("failed to disconnect");
+}
+
+/// A reconfiguration that fails validation must not leave the previous layout
+/// installed. It used to: the error returned before replacing the entry, and
+/// because the reply went to the waiter the unsolicited-config path never saw
+/// it, so the channel kept decoding against a contract the server had changed.
+#[tokio::test]
+async fn test_a_rejected_reconfiguration_invalidates_the_channel() {
+    let server = MockServer::start(Behaviour::ReorderedFeedConfigOnSecondSetup).await;
+    let mut client = DXLinkClient::new(&server.url(), "test-token");
+    let mut stream = client.connect().await.expect("failed to connect");
+    let channel_id = client
+        .create_feed_channel("AUTO")
+        .await
+        .expect("failed to create feed channel");
+
+    // First setup is honoured.
+    client
+        .setup_feed(channel_id, &[EventType::Quote])
+        .await
+        .expect("the first setup should succeed");
+
+    // Second one comes back reordered and must be refused.
+    assert!(
+        client
+            .setup_feed(channel_id, &[EventType::Quote])
+            .await
+            .is_err(),
+        "a reordered reconfiguration must be refused"
+    );
+
+    // And no data may be decoded afterwards.
+    client
+        .subscribe(
+            channel_id,
+            vec![FeedSubscription {
+                event_type: "Quote".to_string(),
+                symbol: "AAPL".to_string(),
+                from_time: None,
+                source: None,
+            }],
+        )
+        .await
+        .expect("failed to subscribe");
+
+    let event = tokio::time::timeout(Duration::from_millis(700), stream.recv()).await;
+    assert!(
+        event.is_err(),
+        "data was decoded against a layout the server had changed: {event:?}"
+    );
 
     client.disconnect().await.expect("failed to disconnect");
 }

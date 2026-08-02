@@ -231,6 +231,19 @@ fn requested_fields(event_types: &[EventType]) -> ChannelSchema {
         .collect()
 }
 
+/// Whether a `FEED_CONFIG` contradicts a layout already validated for a channel.
+fn config_disagrees(config: &FeedConfigMessage, stored: &ChannelSchema) -> bool {
+    if !config.data_format.eq_ignore_ascii_case("COMPACT") {
+        return true;
+    }
+    let Some(negotiated) = config.event_fields.as_ref() else {
+        return false;
+    };
+    negotiated
+        .iter()
+        .any(|(event_type, fields)| stored.get(event_type).is_some_and(|known| known != fields))
+}
+
 /// Checks that the server agreed to the contract this client asked for.
 ///
 /// The specification says `FEED_CONFIG` reports the *actual* configuration, and
@@ -1018,9 +1031,26 @@ impl DXLinkClient {
                                     // spec allows. The decoder cannot follow it,
                                     // so the channel stops being decodable
                                     // rather than producing shifted values.
-                                    if let Some(ch) = channel
-                                        && recover(&channel_schemas).remove(&ch).is_some()
-                                    {
+                                    if let Some(ch) = channel {
+                                        // Only a real disagreement invalidates.
+                                        // A server may resend an identical
+                                        // FEED_CONFIG, and treating that as a
+                                        // change would stop decoding a channel
+                                        // nothing had happened to.
+                                        let disagrees =
+                                            match serde_json::from_str::<FeedConfigMessage>(&msg) {
+                                                Ok(config) => {
+                                                    let schemas = recover(&channel_schemas);
+                                                    schemas.get(&ch).is_some_and(|stored| {
+                                                        config_disagrees(&config, stored)
+                                                    })
+                                                }
+                                                // Unreadable is not agreement.
+                                                Err(_) => true,
+                                            };
+
+                                        if disagrees
+                                            && recover(&channel_schemas).remove(&ch).is_some()
                                         {
                                             error!(
                                                 "Channel {} was reconfigured by the server; \
@@ -1306,6 +1336,13 @@ impl DXLinkClient {
             accept_data_format: "COMPACT".to_string(),
             accept_event_fields,
         };
+
+        // Drop any layout this channel already had, before the request goes
+        // out. A reconfiguration that then fails validation used to return
+        // early leaving the old entry installed, and because the reply was
+        // routed to the waiter the unsolicited-config path never saw it: the
+        // channel kept decoding against a contract the server had changed.
+        recover(&self.channel_schemas).remove(&channel_id);
 
         // No direct payload log here: Connection::send already logs it through
         // the redacting path, and a second hand-rolled log is exactly how a
