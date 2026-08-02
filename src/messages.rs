@@ -6,6 +6,7 @@
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::fmt;
 
 /// Represents a basic message structure.
 ///
@@ -119,7 +120,7 @@ pub struct KeepaliveMessage {
 /// let json_string = to_string(&auth_message).unwrap();
 /// println!("{}", json_string);
 /// ```
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AuthMessage {
     /// The channel number.
@@ -129,6 +130,22 @@ pub struct AuthMessage {
     pub message_type: String,
     /// The authentication token.
     pub token: String,
+}
+
+/// Redacted by hand rather than derived: a derived `Debug` prints the bearer
+/// token verbatim, so any `{:?}` of this message — in a log line, an error, a
+/// panic message, a test failure — would leak the credential.
+///
+/// Nothing about the token is reported, not its length, prefix or suffix: those
+/// narrow a brute force and are of no diagnostic use. Only whether one is set.
+impl fmt::Debug for AuthMessage {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("AuthMessage")
+            .field("channel", &self.channel)
+            .field("message_type", &self.message_type)
+            .field("has_token", &!self.token.is_empty())
+            .finish()
+    }
 }
 
 /// Represents an authentication state message.  This structure is used for serializing
@@ -558,4 +575,70 @@ pub struct FeedDataMessage<T> {
     pub message_type: String,
     /// The actual data being transmitted in the message.  This can be any serializable type.
     pub data: T,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_auth_message_debug_never_reveals_the_token() {
+        let token = "tastytrade-live-bearer-token";
+        let rendered = format!(
+            "{:?}",
+            AuthMessage {
+                channel: 0,
+                message_type: "AUTH".to_string(),
+                token: token.to_string(),
+            }
+        );
+
+        assert!(!rendered.contains(token), "token leaked: {rendered}");
+        // Not even a fragment: a prefix or suffix narrows a brute force and is
+        // of no diagnostic use.
+        assert!(
+            !rendered.contains("tastytrade"),
+            "token fragment leaked: {rendered}"
+        );
+        assert!(
+            !rendered.contains("token\""),
+            "token field rendered: {rendered}"
+        );
+
+        // The parts that help diagnose are still there.
+        assert!(rendered.contains("AuthMessage"));
+        assert!(rendered.contains("channel: 0"));
+        assert!(rendered.contains("AUTH"));
+        assert!(rendered.contains("has_token: true"));
+    }
+
+    #[test]
+    fn test_auth_message_debug_reports_a_missing_token() {
+        let rendered = format!(
+            "{:?}",
+            AuthMessage {
+                channel: 0,
+                message_type: "AUTH".to_string(),
+                token: String::new(),
+            }
+        );
+        assert!(rendered.contains("has_token: false"), "{rendered}");
+    }
+
+    #[test]
+    fn test_auth_message_still_round_trips_over_the_wire() {
+        // Debug is redacted; serialization is not, the server needs the token.
+        let json = serde_json::to_string(&AuthMessage {
+            channel: 0,
+            message_type: "AUTH".to_string(),
+            token: "secret".to_string(),
+        })
+        .expect("failed to serialize");
+        assert!(json.contains("secret"));
+
+        let back: AuthMessage = serde_json::from_str(&json).expect("failed to deserialize");
+        assert_eq!(back.token, "secret");
+        assert_eq!(back.channel, 0);
+        assert_eq!(back.message_type, "AUTH");
+    }
 }
