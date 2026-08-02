@@ -460,6 +460,17 @@ fn field_value(field: &str, event_type: &str, symbol: &str) -> Value {
         "bidVolume" => json!(600_000.0),
         "askVolume" => json!(634_000.0),
         "impVolatility" => json!(0.31),
+        // Summary
+        "dayOpenPrice" => json!(149.5),
+        "dayHighPrice" => json!(152.0),
+        "dayLowPrice" => json!(148.0),
+        "prevDayClosePrice" => json!(147.75),
+        "dayId" => json!(20240119i64),
+        "dayClosePrice" => json!(150.75),
+        "dayClosePriceType" => json!("Final"),
+        "prevDayId" => json!(20240118i64),
+        "prevDayClosePriceType" => json!("Final"),
+        "prevDayVolume" => json!(58_000_000.0),
         "openInterest" => json!(4_200.0),
         // Greeks
         "delta" => json!(0.65),

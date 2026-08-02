@@ -200,6 +200,22 @@ impl EventType {
                 "askSize",
             ]),
             EventType::Trade => Some(&["eventType", "eventSymbol", "price", "size", "dayVolume"]),
+            EventType::Summary => Some(&[
+                "eventType",
+                "eventSymbol",
+                "eventTime",
+                "dayId",
+                "dayOpenPrice",
+                "dayHighPrice",
+                "dayLowPrice",
+                "dayClosePrice",
+                "dayClosePriceType",
+                "prevDayId",
+                "prevDayClosePrice",
+                "prevDayClosePriceType",
+                "prevDayVolume",
+                "openInterest",
+            ]),
             EventType::Candle => Some(&[
                 "eventType",
                 "eventSymbol",
@@ -231,8 +247,7 @@ impl EventType {
                 "volatility",
             ]),
             // Declared by the protocol, not decoded here.
-            EventType::Summary
-            | EventType::Profile
+            EventType::Profile
             | EventType::Order
             | EventType::TimeAndSale
             | EventType::TradeETH
@@ -519,6 +534,71 @@ pub struct CandleEvent {
     pub open_interest: f64,
 }
 
+/// The session's opening, extremes and closes for an instrument.
+///
+/// Every field the dxFeed AsyncAPI schema defines for a summary, in the order
+/// the client requests them. The `...PriceType` columns say whether a close is
+/// final, indicative or preliminary, which is what stops a consumer treating a
+/// provisional close as settled.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SummaryEvent {
+    /// The type of the event, `Summary`.
+    #[serde(rename = "eventType")]
+    pub event_type: String,
+
+    /// The symbol the summary relates to.
+    #[serde(rename = "eventSymbol")]
+    pub event_symbol: String,
+
+    /// When the server emitted the event, as epoch milliseconds.
+    #[serde(rename = "eventTime")]
+    pub event_time: i64,
+
+    /// Identifier of the current trading day.
+    #[serde(rename = "dayId")]
+    pub day_id: i64,
+
+    /// First price of the current trading day.
+    #[serde(rename = "dayOpenPrice", with = "json_double")]
+    pub day_open_price: f64,
+
+    /// Highest price of the current trading day.
+    #[serde(rename = "dayHighPrice", with = "json_double")]
+    pub day_high_price: f64,
+
+    /// Lowest price of the current trading day.
+    #[serde(rename = "dayLowPrice", with = "json_double")]
+    pub day_low_price: f64,
+
+    /// Closing price of the current trading day so far.
+    #[serde(rename = "dayClosePrice", with = "json_double")]
+    pub day_close_price: f64,
+
+    /// Whether the day's close is final, indicative or preliminary.
+    #[serde(rename = "dayClosePriceType")]
+    pub day_close_price_type: String,
+
+    /// Identifier of the previous trading day.
+    #[serde(rename = "prevDayId")]
+    pub prev_day_id: i64,
+
+    /// Closing price of the previous trading day.
+    #[serde(rename = "prevDayClosePrice", with = "json_double")]
+    pub prev_day_close_price: f64,
+
+    /// Whether the previous day's close is final, indicative or preliminary.
+    #[serde(rename = "prevDayClosePriceType")]
+    pub prev_day_close_price_type: String,
+
+    /// Total volume of the previous trading day.
+    #[serde(rename = "prevDayVolume", with = "json_double")]
+    pub prev_day_volume: f64,
+
+    /// Open interest, for instruments that have it.
+    #[serde(rename = "openInterest", with = "json_double")]
+    pub open_interest: f64,
+}
+
 /// Represents a market event, which can be a quote, trade, or greeks event.
 ///
 /// This enum uses `serde`'s untagged enum serialization, meaning that the serialized
@@ -585,6 +665,8 @@ pub enum MarketEvent {
     /// Represents a Greeks event, containing Greek values (delta, gamma, theta, vega, rho)
     /// for a specific financial instrument.
     Greeks(GreeksEvent),
+    /// A daily summary: open, extremes and the previous close.
+    Summary(SummaryEvent),
     /// One OHLC bar, from a historical or streaming candle subscription.
     ///
     /// Last in the list on purpose: `MarketEvent` is `#[serde(untagged)]`, so

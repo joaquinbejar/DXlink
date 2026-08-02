@@ -5,7 +5,9 @@
 ******************************************************************************/
 use crate::MarketEvent;
 use crate::error::{DXLinkError, DXLinkResult};
-use crate::events::{CandleEvent, CompactData, EventType, GreeksEvent, QuoteEvent, TradeEvent};
+use crate::events::{
+    CandleEvent, CompactData, EventType, GreeksEvent, QuoteEvent, SummaryEvent, TradeEvent,
+};
 use serde_json::Value;
 use tracing::warn;
 
@@ -296,6 +298,28 @@ fn build_event(
                 ask_volume: number(15)?,
                 imp_volatility: number(16)?,
                 open_interest: number(17)?,
+            })
+        }
+        EventType::Summary => {
+            let int = |index: usize| as_int(row_values, index, header, row, fields[index]);
+            let text = |index: usize| {
+                as_text(row_values, index, header, row, fields[index]).map(str::to_string)
+            };
+            MarketEvent::Summary(SummaryEvent {
+                event_type: header.to_string(),
+                event_symbol: symbol,
+                event_time: int(2)?,
+                day_id: int(3)?,
+                day_open_price: number(4)?,
+                day_high_price: number(5)?,
+                day_low_price: number(6)?,
+                day_close_price: number(7)?,
+                day_close_price_type: text(8)?,
+                prev_day_id: int(9)?,
+                prev_day_close_price: number(10)?,
+                prev_day_close_price_type: text(11)?,
+                prev_day_volume: number(12)?,
+                open_interest: number(13)?,
             })
         }
         // compact_fields returned Some for this type, so a missing arm here is a
@@ -602,11 +626,11 @@ mod strict_tests {
 
     #[test]
     fn test_an_undecodable_event_type_is_reported() {
-        // Declared by the protocol, no decoder here. Update this to another
-        // undecoded type when Summary gains one.
-        let error =
-            try_parse_compact_data(&batch("Summary", vec![json!("Summary"), json!("AAPL")]))
-                .expect_err("Summary has no decoder");
+        // Series is deliberately chosen: it is not on the roadmap of types
+        // gaining decoders, so this test stops needing an edit each time one
+        // does.
+        let error = try_parse_compact_data(&batch("Series", vec![json!("Series"), json!("AAPL")]))
+            .expect_err("Series has no decoder");
         assert!(error.to_string().contains("no decoder"), "{error}");
     }
 
@@ -800,6 +824,141 @@ mod candle_tests {
         let back: MarketEvent = serde_json::from_str(&json).expect("deserialize");
         assert!(
             matches!(back, MarketEvent::Candle(_)),
+            "an untagged round trip picked the wrong variant: {back:?}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod summary_tests {
+    use super::*;
+    use serde_json::json;
+
+    /// The exact 14 columns issue #25 specifies, in order.
+    fn summary_row(symbol: &str) -> Vec<Value> {
+        vec![
+            json!("Summary"),            // 0 eventType
+            json!(symbol),               // 1 eventSymbol
+            json!(1_700_000_000_500i64), // 2 eventTime
+            json!(20240119i64),          // 3 dayId
+            json!(149.5),                // 4 dayOpenPrice
+            json!(152.0),                // 5 dayHighPrice
+            json!(148.0),                // 6 dayLowPrice
+            json!(150.75),               // 7 dayClosePrice
+            json!("Final"),              // 8 dayClosePriceType
+            json!(20240118i64),          // 9 prevDayId
+            json!(147.75),               // 10 prevDayClosePrice
+            json!("Final"),              // 11 prevDayClosePriceType
+            json!(58_000_000.0),         // 12 prevDayVolume
+            json!(4_200.0),              // 13 openInterest
+        ]
+    }
+
+    fn batch(values: Vec<Value>) -> Vec<CompactData> {
+        vec![
+            CompactData::EventType("Summary".to_string()),
+            CompactData::Values(values),
+        ]
+    }
+
+    #[test]
+    fn test_the_field_list_matches_the_decoder_stride() {
+        let fields = EventType::Summary
+            .compact_fields()
+            .expect("Summary has a decoder");
+        assert_eq!(fields.len(), 14, "the layout is 14 columns");
+        assert_eq!(fields.len(), summary_row("AAPL").len());
+    }
+
+    #[test]
+    fn test_two_summaries_decode_with_the_right_stride() {
+        let mut values = summary_row("AAPL");
+        values.extend(summary_row("MSFT"));
+
+        let events = try_parse_compact_data(&batch(values)).expect("well formed");
+        assert_eq!(events.len(), 2);
+
+        match (&events[0], &events[1]) {
+            (MarketEvent::Summary(first), MarketEvent::Summary(second)) => {
+                // The symbols prove the stride of fourteen.
+                assert_eq!(first.event_symbol, "AAPL");
+                assert_eq!(second.event_symbol, "MSFT");
+                assert_eq!(first.event_time, 1_700_000_000_500);
+                assert_eq!(first.day_id, 20240119);
+                assert_eq!(first.day_open_price, 149.5);
+                assert_eq!(first.day_high_price, 152.0);
+                assert_eq!(first.day_low_price, 148.0);
+                assert_eq!(first.day_close_price, 150.75);
+                assert_eq!(first.day_close_price_type, "Final");
+                assert_eq!(first.prev_day_id, 20240118);
+                assert_eq!(first.prev_day_close_price, 147.75);
+                assert_eq!(first.prev_day_close_price_type, "Final");
+                assert_eq!(first.prev_day_volume, 58_000_000.0);
+                assert_eq!(first.open_interest, 4_200.0);
+            }
+            other => panic!("expected two summaries, got {other:?}"),
+        }
+    }
+
+    /// The close price type is what stops a consumer treating a provisional
+    /// close as settled.
+    #[test]
+    fn test_a_provisional_close_is_distinguishable() {
+        let mut values = summary_row("AAPL");
+        values[8] = json!("Preliminary");
+
+        let events = try_parse_compact_data(&batch(values)).expect("well formed");
+        match &events[0] {
+            MarketEvent::Summary(summary) => {
+                assert_eq!(summary.day_close_price_type, "Preliminary");
+                assert_eq!(summary.prev_day_close_price_type, "Final");
+            }
+            other => panic!("expected a summary, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_a_numeric_close_price_type_is_rejected() {
+        let mut values = summary_row("AAPL");
+        values[8] = json!(1.0);
+
+        let error = try_parse_compact_data(&batch(values)).expect_err("the type is text");
+        assert!(
+            error.to_string().contains("dayClosePriceType"),
+            "the field is missing: {error}"
+        );
+    }
+
+    #[test]
+    fn test_an_instrument_without_open_interest_decodes() {
+        // Equities have no open interest; the protocol sends NaN rather than
+        // omitting the column.
+        let mut values = summary_row("AAPL");
+        values[13] = json!("NaN");
+
+        let events = try_parse_compact_data(&batch(values)).expect("NaN is a value");
+        match &events[0] {
+            MarketEvent::Summary(summary) => assert!(summary.open_interest.is_nan()),
+            other => panic!("expected a summary, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_a_truncated_summary_row_is_rejected() {
+        let mut values = summary_row("AAPL");
+        values.pop();
+        assert!(try_parse_compact_data(&batch(values)).is_err());
+    }
+
+    #[test]
+    fn test_a_summary_is_not_mistaken_for_another_event() {
+        let events = try_parse_compact_data(&batch(summary_row("AAPL"))).expect("well formed");
+        assert!(matches!(events[0], MarketEvent::Summary(_)));
+
+        let json = serde_json::to_string(&events[0]).expect("serialize");
+        let back: MarketEvent = serde_json::from_str(&json).expect("deserialize");
+        assert!(
+            matches!(back, MarketEvent::Summary(_)),
             "an untagged round trip picked the wrong variant: {back:?}"
         );
     }
