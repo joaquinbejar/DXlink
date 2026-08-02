@@ -315,6 +315,192 @@ impl KeepAliveSender {
 }
 
 #[cfg(test)]
+mod frame_tests {
+    //! Frame-level tests for [`WebSocketConnection::receive`].
+    //!
+    //! These drive the server side with `tokio_tungstenite::accept_async` rather
+    //! than warp, because the whole point is emitting specific frame kinds — a
+    //! Ping, or a Close with a chosen code — which warp does not expose cleanly.
+    //! Every server binds an ephemeral port so the suite stays parallel-safe.
+
+    use super::*;
+    use futures_util::SinkExt;
+    use tokio::net::TcpListener;
+    use tokio_tungstenite::accept_async;
+    use tokio_tungstenite::tungstenite::protocol::frame::CloseFrame;
+    use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
+
+    /// Starts a server that sends `frames` to the first client that connects and
+    /// then keeps the socket open. Returns the URL to connect to.
+    async fn serve_frames(frames: Vec<Message>) -> String {
+        serve_frames_after(frames, Duration::ZERO).await
+    }
+
+    /// As [`serve_frames`], but waits `delay` before sending anything.
+    async fn serve_frames_after(frames: Vec<Message>, delay: Duration) -> String {
+        let listener = TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("failed to bind test server");
+        let addr = listener.local_addr().expect("failed to read local addr");
+
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("failed to accept");
+            let mut ws = accept_async(stream).await.expect("failed to handshake");
+
+            if !delay.is_zero() {
+                tokio::time::sleep(delay).await;
+            }
+
+            for frame in frames {
+                let is_close = matches!(frame, Message::Close(_));
+                ws.send(frame).await.expect("failed to send frame");
+                if is_close {
+                    return;
+                }
+            }
+
+            // Hold the connection open so a timeout test observes silence rather
+            // than a close.
+            tokio::time::sleep(Duration::from_secs(30)).await;
+        });
+
+        format!("ws://{}", addr)
+    }
+
+    #[tokio::test]
+    async fn test_receive_skips_control_frames_and_returns_following_text() {
+        let url = serve_frames(vec![
+            Message::Ping(vec![1, 2, 3].into()),
+            Message::Pong(Vec::new().into()),
+            Message::Text("{\"type\":\"SETUP\"}".into()),
+        ])
+        .await;
+
+        let connection = WebSocketConnection::connect(&url)
+            .await
+            .expect("failed to connect");
+
+        let received = connection
+            .receive()
+            .await
+            .expect("control frames should be skipped, not fatal");
+        assert_eq!(received, "{\"type\":\"SETUP\"}");
+    }
+
+    #[tokio::test]
+    async fn test_receive_reports_close_as_connection_error() {
+        let url = serve_frames(vec![Message::Close(Some(CloseFrame {
+            code: CloseCode::Policy,
+            reason: "invalid token".into(),
+        }))])
+        .await;
+
+        let connection = WebSocketConnection::connect(&url)
+            .await
+            .expect("failed to connect");
+
+        match connection.receive().await {
+            Err(DXLinkError::Connection(msg)) => {
+                // The reason is what tells an operator why the server hung up,
+                // so it has to survive into the error text.
+                assert!(msg.contains("invalid token"), "close reason lost: {msg}");
+            }
+            other => panic!("expected Connection error, got: {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_close_error_is_terminal() {
+        let url = serve_frames(vec![Message::Close(None)]).await;
+
+        let connection = WebSocketConnection::connect(&url)
+            .await
+            .expect("failed to connect");
+
+        let err = connection
+            .receive()
+            .await
+            .expect_err("a close frame must not be reported as success");
+        // This is what stops the message task instead of letting it spin.
+        assert!(err.is_terminal(), "close should be terminal, got: {err:?}");
+    }
+
+    #[tokio::test]
+    async fn test_receive_rejects_binary_frames() {
+        let url = serve_frames(vec![Message::Binary(vec![1, 2, 3].into())]).await;
+
+        let connection = WebSocketConnection::connect(&url)
+            .await
+            .expect("failed to connect");
+
+        match connection.receive().await {
+            Err(DXLinkError::UnexpectedMessage(msg)) => {
+                assert!(msg.contains("binary"), "unhelpful error text: {msg}");
+            }
+            other => panic!("expected UnexpectedMessage error, got: {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_binary_error_is_not_terminal() {
+        let url = serve_frames(vec![Message::Binary(vec![0xff].into())]).await;
+
+        let connection = WebSocketConnection::connect(&url)
+            .await
+            .expect("failed to connect");
+
+        let err = connection
+            .receive()
+            .await
+            .expect_err("a binary frame must be rejected");
+        // One bad frame does not mean the connection is gone.
+        assert!(
+            !err.is_terminal(),
+            "binary frame should not kill the connection: {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_receive_with_timeout_is_not_woken_by_control_frames() {
+        // Ping first, payload only after a delay: a control frame must not make
+        // the call return early with nothing useful.
+        let url = serve_frames_after(
+            vec![
+                Message::Ping(Vec::new().into()),
+                Message::Text("payload".into()),
+            ],
+            Duration::from_millis(50),
+        )
+        .await;
+
+        let connection = WebSocketConnection::connect(&url)
+            .await
+            .expect("failed to connect");
+
+        let received = connection
+            .receive_with_timeout(Duration::from_secs(5))
+            .await
+            .expect("receive_with_timeout failed");
+        assert_eq!(received, Some("payload".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_receive_with_timeout_returns_none_on_silence() {
+        let url = serve_frames(Vec::new()).await;
+
+        let connection = WebSocketConnection::connect(&url)
+            .await
+            .expect("failed to connect");
+
+        let received = connection
+            .receive_with_timeout(Duration::from_millis(100))
+            .await
+            .expect("receive_with_timeout failed");
+        assert_eq!(received, None);
+    }
+}
+
+#[cfg(test)]
 mod redaction_tests {
     use super::*;
     use crate::messages::{AuthMessage, KeepaliveMessage};

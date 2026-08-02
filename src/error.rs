@@ -226,6 +226,30 @@ mod tests {
         }
     }
 
+    #[test]
+    fn test_is_terminal_for_connection_level_failures() {
+        // The transport is gone or the credentials were rejected: reading the
+        // same socket again cannot succeed.
+        assert!(DXLinkError::Connection("closed".to_string()).is_terminal());
+        assert!(DXLinkError::Authentication("bad token".to_string()).is_terminal());
+        assert!(
+            DXLinkError::WebSocket(Box::new(tungstenite::Error::ConnectionClosed)).is_terminal()
+        );
+    }
+
+    #[test]
+    fn test_is_terminal_for_message_level_failures() {
+        // These describe one bad message; the connection is still usable, so a
+        // read loop must skip and keep going rather than tear down.
+        let ser_error = serde_json::from_str::<serde_json::Value>("invalid json").unwrap_err();
+        assert!(!DXLinkError::Serialization(ser_error).is_terminal());
+        assert!(!DXLinkError::Channel("no such channel".to_string()).is_terminal());
+        assert!(!DXLinkError::Protocol("unexpected state".to_string()).is_terminal());
+        assert!(!DXLinkError::Timeout("no CHANNEL_OPENED".to_string()).is_terminal());
+        assert!(!DXLinkError::UnexpectedMessage("binary frame".to_string()).is_terminal());
+        assert!(!DXLinkError::Unknown("something".to_string()).is_terminal());
+    }
+
     // Test error conversion and propagation with ?
     #[test]
     fn test_error_propagation() {

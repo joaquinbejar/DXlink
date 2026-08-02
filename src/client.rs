@@ -1206,6 +1206,57 @@ mod tests {
         }
     }
 
+    /// The message task must stop once the connection is gone, instead of
+    /// re-reading a dead socket every 100ms forever (issue #4).
+    #[tokio::test]
+    async fn test_message_task_stops_when_server_closes() {
+        use tokio::net::TcpListener;
+        use tokio_tungstenite::accept_async;
+
+        // A bare WebSocket server that accepts the handshake and immediately
+        // hangs up. No DXLink handshake is needed: start_message_processing only
+        // requires a live connection.
+        let listener = TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("failed to bind test server");
+        let addr = listener.local_addr().expect("failed to read local addr");
+
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("failed to accept");
+            let ws = accept_async(stream).await.expect("failed to handshake");
+            drop(ws);
+        });
+
+        let mut client = DXLinkClient::new(&format!("ws://{}", addr), "test_token");
+        client.connection = Some(
+            crate::connection::WebSocketConnection::connect(&format!("ws://{}", addr))
+                .await
+                .expect("failed to connect"),
+        );
+
+        client
+            .start_message_processing()
+            .expect("failed to start message processing");
+
+        let handle = client
+            .message_handle
+            .as_ref()
+            .expect("message task should have been spawned");
+
+        // Generous bound: the point is that it terminates at all, not how fast.
+        let stopped = tokio::time::timeout(Duration::from_secs(5), async {
+            while !handle.is_finished() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+
+        assert!(
+            stopped.is_ok(),
+            "message task kept running after the server closed the connection"
+        );
+    }
+
     // Test error cases for connection
     #[test]
     fn test_connection_errors() {
