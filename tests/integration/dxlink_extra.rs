@@ -211,3 +211,350 @@ async fn test_historical_candles_are_requested_and_delivered() {
 
     client.disconnect().await.expect("failed to disconnect");
 }
+
+/// Opens a second feed channel on an already connected client.
+async fn second_feed(client: &mut DXLinkClient, events: &[EventType]) -> u32 {
+    let channel_id = client
+        .create_feed_channel("AUTO")
+        .await
+        .expect("failed to create the second feed channel");
+    client
+        .setup_feed(channel_id, events)
+        .await
+        .expect("failed to set up the second feed");
+    channel_id
+}
+
+#[tokio::test]
+async fn test_two_channels_track_the_same_symbol_independently() {
+    let server = MockServer::start(Behaviour::Normal).await;
+    let (mut client, first) = connected_feed(&server, &[EventType::Quote]).await;
+    let second = second_feed(&mut client, &[EventType::Quote]).await;
+    assert_ne!(first, second, "the channels have to be distinct");
+
+    client
+        .subscribe(first, vec![quote_sub("AAPL")])
+        .await
+        .expect("failed to subscribe on the first channel");
+    client
+        .subscribe(second, vec![quote_sub("AAPL")])
+        .await
+        .expect("failed to subscribe on the second channel");
+
+    // One entry each, not one shared entry: the old global set collapsed these
+    // two into one and could not tell them apart afterwards.
+    assert_eq!(client.subscriptions(first).len(), 1);
+    assert_eq!(client.subscriptions(second).len(), 1);
+    assert_eq!(client.subscribed_channels(), vec![first, second]);
+
+    client.disconnect().await.expect("failed to disconnect");
+}
+
+#[tokio::test]
+async fn test_resetting_one_channel_leaves_the_other_alone() {
+    let server = MockServer::start(Behaviour::Normal).await;
+    let (mut client, first) = connected_feed(&server, &[EventType::Quote]).await;
+    let second = second_feed(&mut client, &[EventType::Quote]).await;
+
+    client
+        .subscribe(first, vec![quote_sub("AAPL"), quote_sub("MSFT")])
+        .await
+        .expect("failed to subscribe on the first channel");
+    client
+        .subscribe(second, vec![quote_sub("TSLA")])
+        .await
+        .expect("failed to subscribe on the second channel");
+
+    client
+        .reset_subscriptions(first)
+        .await
+        .expect("failed to reset");
+
+    assert!(
+        client.subscriptions(first).is_empty(),
+        "the reset channel should be empty"
+    );
+    let survivors = client.subscriptions(second);
+    assert_eq!(survivors.len(), 1, "the other channel lost its state");
+    assert_eq!(survivors[0].symbol, "TSLA");
+    assert_eq!(client.subscribed_channels(), vec![second]);
+
+    client.disconnect().await.expect("failed to disconnect");
+}
+
+#[tokio::test]
+async fn test_closing_a_channel_forgets_only_its_subscriptions() {
+    let server = MockServer::start(Behaviour::Normal).await;
+    let (mut client, first) = connected_feed(&server, &[EventType::Quote]).await;
+    let second = second_feed(&mut client, &[EventType::Quote]).await;
+
+    client
+        .subscribe(first, vec![quote_sub("AAPL")])
+        .await
+        .expect("failed to subscribe on the first channel");
+    client
+        .subscribe(second, vec![quote_sub("TSLA")])
+        .await
+        .expect("failed to subscribe on the second channel");
+
+    client
+        .close_channel(first)
+        .await
+        .expect("failed to close the channel");
+
+    assert!(
+        client.subscriptions(first).is_empty(),
+        "a closed channel delivers nothing, so it holds nothing"
+    );
+    assert_eq!(client.subscriptions(second).len(), 1);
+
+    client.disconnect().await.expect("failed to disconnect");
+}
+
+#[tokio::test]
+async fn test_a_historical_subscription_keeps_its_from_time_and_source() {
+    let server = MockServer::start(Behaviour::Normal).await;
+    let (mut client, channel_id) = connected_feed(&server, &[EventType::Candle]).await;
+
+    let from_time = 1_700_000_000_000;
+    client
+        .subscribe(
+            channel_id,
+            vec![FeedSubscription {
+                event_type: "Candle".to_string(),
+                symbol: "AAPL{=5m}".to_string(),
+                from_time: Some(from_time),
+                source: Some("DEX".to_string()),
+            }],
+        )
+        .await
+        .expect("failed to subscribe");
+
+    // Both have to survive: a replay that dropped them would resubscribe live
+    // where the consumer had asked for history.
+    let tracked = client.subscriptions(channel_id);
+    assert_eq!(tracked.len(), 1);
+    assert_eq!(tracked[0].symbol, "AAPL{=5m}");
+    assert_eq!(tracked[0].from_time, Some(from_time));
+    assert_eq!(tracked[0].source.as_deref(), Some("DEX"));
+
+    client.disconnect().await.expect("failed to disconnect");
+}
+
+#[tokio::test]
+async fn test_resubscribing_replaces_the_earlier_entry() {
+    let server = MockServer::start(Behaviour::Normal).await;
+    let (mut client, channel_id) = connected_feed(&server, &[EventType::Candle]).await;
+
+    let candle = |from_time: i64| FeedSubscription {
+        event_type: "Candle".to_string(),
+        symbol: "AAPL{=5m}".to_string(),
+        from_time: Some(from_time),
+        source: None,
+    };
+
+    client
+        .subscribe(channel_id, vec![candle(1_700_000_000_000)])
+        .await
+        .expect("failed to subscribe");
+    client
+        .subscribe(channel_id, vec![candle(1_700_000_600_000)])
+        .await
+        .expect("failed to resubscribe");
+
+    // The server keys a subscription by type and symbol within a channel, so
+    // the second call supersedes the first. Tracking both would make a replay
+    // send a subscription the server had already replaced.
+    let tracked = client.subscriptions(channel_id);
+    assert_eq!(tracked.len(), 1, "the entry should have been replaced");
+    assert_eq!(tracked[0].from_time, Some(1_700_000_600_000));
+
+    client.disconnect().await.expect("failed to disconnect");
+}
+
+#[tokio::test]
+async fn test_subscriptions_come_back_in_the_order_they_were_asked_for() {
+    let server = MockServer::start(Behaviour::Normal).await;
+    let (mut client, channel_id) = connected_feed(&server, &[EventType::Quote]).await;
+
+    for symbol in ["MSFT", "AAPL", "TSLA", "NVDA"] {
+        client
+            .subscribe(channel_id, vec![quote_sub(symbol)])
+            .await
+            .expect("failed to subscribe");
+    }
+
+    // Not sorted, not hash order: the order the consumer built the session in,
+    // which is the order a replay has to send them back in.
+    let symbols: Vec<String> = client
+        .subscriptions(channel_id)
+        .into_iter()
+        .map(|sub| sub.symbol)
+        .collect();
+    assert_eq!(symbols, ["MSFT", "AAPL", "TSLA", "NVDA"]);
+
+    client.disconnect().await.expect("failed to disconnect");
+}
+
+/// A send that never left the client must not be recorded as one that did.
+#[tokio::test]
+async fn test_a_failed_send_does_not_move_the_tracked_state() {
+    let server = MockServer::start(Behaviour::CloseAfterSubscribe).await;
+    let mut client = DXLinkClient::new(&server.url(), "test-token");
+    let mut stream = client.connect().await.expect("failed to connect");
+    let channel_id = client
+        .create_feed_channel("AUTO")
+        .await
+        .expect("failed to create feed channel");
+    client
+        .setup_feed(channel_id, &[EventType::Quote])
+        .await
+        .expect("failed to set up feed");
+
+    client
+        .subscribe(channel_id, vec![quote_sub("AAPL")])
+        .await
+        .expect("the first subscribe happens before the server hangs up");
+    assert_eq!(client.subscriptions(channel_id).len(), 1);
+
+    // The stream closing is the documented signal that the session is over, so
+    // waiting on it makes the next send deterministically fail.
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        while stream.recv().await.is_some() {}
+    })
+    .await
+    .expect("the stream never closed after the server hung up");
+
+    assert!(
+        client
+            .unsubscribe(channel_id, vec![quote_sub("AAPL")])
+            .await
+            .is_err(),
+        "unsubscribing over a dead socket has to fail"
+    );
+    assert_eq!(
+        client.subscriptions(channel_id).len(),
+        1,
+        "a failed unsubscribe must not forget a live subscription"
+    );
+
+    assert!(
+        client
+            .subscribe(channel_id, vec![quote_sub("MSFT")])
+            .await
+            .is_err(),
+        "subscribing over a dead socket has to fail"
+    );
+    let symbols: Vec<String> = client
+        .subscriptions(channel_id)
+        .into_iter()
+        .map(|sub| sub.symbol)
+        .collect();
+    assert_eq!(
+        symbols,
+        ["AAPL"],
+        "a failed subscribe must not be recorded as one that happened"
+    );
+
+    assert!(
+        client.reset_subscriptions(channel_id).await.is_err(),
+        "resetting over a dead socket has to fail"
+    );
+    assert_eq!(
+        client.subscriptions(channel_id).len(),
+        1,
+        "a failed reset must not clear the tracked state"
+    );
+}
+
+/// An indexed subscription is scoped to its source, so the same type and symbol
+/// from two sources are two subscriptions. Collapsing them made `unsubscribe`
+/// remove the wrong local entry and a replay silently omit one source.
+#[tokio::test]
+async fn test_two_sources_for_one_symbol_are_tracked_separately() {
+    let server = MockServer::start(Behaviour::Normal).await;
+    let (mut client, channel_id) = connected_feed(&server, &[EventType::Quote]).await;
+
+    let from = |source: &str| FeedSubscription {
+        event_type: "Quote".to_string(),
+        symbol: "AAPL".to_string(),
+        from_time: None,
+        source: Some(source.to_string()),
+    };
+
+    client
+        .subscribe(channel_id, vec![from("DEX"), from("NTV")])
+        .await
+        .expect("failed to subscribe");
+
+    let tracked = client.subscriptions(channel_id);
+    assert_eq!(tracked.len(), 2, "the two sources collapsed: {tracked:?}");
+
+    // Removing one leaves the other, which is the assertion a shared key fails.
+    client
+        .unsubscribe(channel_id, vec![from("DEX")])
+        .await
+        .expect("failed to unsubscribe");
+
+    let left = client.subscriptions(channel_id);
+    assert_eq!(left.len(), 1, "unsubscribe removed too much: {left:?}");
+    assert_eq!(left[0].source.as_deref(), Some("NTV"));
+}
+
+/// A subscription with no source is its own identity, not a wildcard that
+/// matches the sourced ones.
+#[tokio::test]
+async fn test_a_sourceless_subscription_is_its_own_entry() {
+    let server = MockServer::start(Behaviour::Normal).await;
+    let (mut client, channel_id) = connected_feed(&server, &[EventType::Quote]).await;
+
+    let sourced = FeedSubscription {
+        event_type: "Quote".to_string(),
+        symbol: "AAPL".to_string(),
+        from_time: None,
+        source: Some("DEX".to_string()),
+    };
+
+    client
+        .subscribe(channel_id, vec![quote_sub("AAPL"), sourced.clone()])
+        .await
+        .expect("failed to subscribe");
+    assert_eq!(client.subscriptions(channel_id).len(), 2);
+
+    client
+        .unsubscribe(channel_id, vec![sourced])
+        .await
+        .expect("failed to unsubscribe");
+
+    let left = client.subscriptions(channel_id);
+    assert_eq!(left.len(), 1);
+    assert_eq!(left[0].source, None, "the wrong entry went: {left:?}");
+}
+
+/// `fromTime` is a parameter of the series rather than part of its identity, so
+/// the same symbol from the same source still replaces rather than accumulates.
+#[tokio::test]
+async fn test_a_new_from_time_replaces_the_same_source() {
+    let server = MockServer::start(Behaviour::Normal).await;
+    let (mut client, channel_id) = connected_feed(&server, &[EventType::Candle]).await;
+
+    let candle = |from_time: i64| FeedSubscription {
+        event_type: "Candle".to_string(),
+        symbol: "AAPL{=5m}".to_string(),
+        from_time: Some(from_time),
+        source: Some("DEX".to_string()),
+    };
+
+    client
+        .subscribe(channel_id, vec![candle(1_700_000_000_000)])
+        .await
+        .expect("failed to subscribe");
+    client
+        .subscribe(channel_id, vec![candle(1_700_000_600_000)])
+        .await
+        .expect("failed to resubscribe");
+
+    let tracked = client.subscriptions(channel_id);
+    assert_eq!(tracked.len(), 1, "the entry should have been replaced");
+    assert_eq!(tracked[0].from_time, Some(1_700_000_600_000));
+}

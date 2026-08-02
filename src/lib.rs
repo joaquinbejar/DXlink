@@ -8,6 +8,11 @@
 //!
 //! - Session lifecycle over the DXLink WebSocket protocol: `SETUP`, token
 //!   authentication, feed channels, `FEED_SETUP`, subscribe and unsubscribe.
+//! - Subscriptions tracked **per channel**, with `fromTime` and `source`, and
+//!   committed only after the outbound send succeeds. Two channels can hold the
+//!   same event and symbol independently, and resetting or closing one leaves
+//!   the others alone. [`DXLinkClient::subscriptions`] reports what the client
+//!   believes is live.
 //! - Automatic keepalives while the connection is open.
 //! - Market events decoded from the `COMPACT` wire format: **`Quote`, `Trade`,
 //!   `Greeks`, `Candle`, `Summary`, `TimeAndSale`, `Profile`, `Underlying` and

@@ -14,7 +14,7 @@ use crate::messages::{
 };
 use crate::try_parse_compact_data;
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::fmt;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -215,6 +215,114 @@ type ChannelSchema = HashMap<String, Vec<String>>;
 /// Validated layouts per channel.
 type ChannelSchemas = Arc<Mutex<HashMap<u32, ChannelSchema>>>;
 
+/// One tracked subscription, with the order it was asked for.
+///
+/// The order is what makes replay reproducible: a map alone would hand the
+/// subscriptions back in an arbitrary order, and a server that applies them in
+/// sequence would see a different session than the consumer built.
+#[derive(Debug, Clone)]
+struct TrackedSubscription {
+    order: u64,
+    subscription: FeedSubscription,
+}
+
+/// What identifies a subscription inside one channel: event type, symbol and
+/// source.
+///
+/// `source` is part of the identity because an indexed subscription is scoped
+/// to it — the same type and symbol from two sources are two subscriptions, and
+/// removing one must not forget the other. `fromTime` is **not**: it is a
+/// parameter of the series, so resubscribing the same symbol from the same
+/// source with a new time replaces the entry rather than adding a second one.
+type SubscriptionKey = (EventType, String, Option<String>);
+
+/// Live subscriptions, per channel, keyed the way the server keys them.
+///
+/// Subscribing twice to the same [`SubscriptionKey`] on one channel
+/// **replaces** the entry: the second call is what the server ends up
+/// honouring, and tracking both would make a replay send a subscription the
+/// server had already superseded.
+///
+/// Per channel, because two feed channels can legitimately hold the same event
+/// and symbol with different aggregation, and closing or resetting one must not
+/// forget the other's.
+#[derive(Debug, Default)]
+struct SubscriptionBook {
+    by_channel: HashMap<u32, HashMap<SubscriptionKey, TrackedSubscription>>,
+    next_order: u64,
+}
+
+/// The identity of a subscription, for tracking it.
+fn key_of(event_type: EventType, subscription: &FeedSubscription) -> SubscriptionKey {
+    (
+        event_type,
+        subscription.symbol.clone(),
+        subscription.source.clone(),
+    )
+}
+
+impl SubscriptionBook {
+    /// Records a subscription, replacing any earlier one with the same identity
+    /// on that channel.
+    fn insert(&mut self, channel_id: u32, event_type: EventType, subscription: FeedSubscription) {
+        let order = self.next_order;
+        self.next_order += 1;
+        let key = key_of(event_type, &subscription);
+        self.by_channel.entry(channel_id).or_default().insert(
+            key,
+            TrackedSubscription {
+                order,
+                subscription,
+            },
+        );
+    }
+
+    /// Forgets one subscription. Unknown entries are ignored: the server treats
+    /// removing something that is not there as a no-op too.
+    fn remove(&mut self, channel_id: u32, event_type: EventType, subscription: &FeedSubscription) {
+        if let Some(channel) = self.by_channel.get_mut(&channel_id) {
+            channel.remove(&key_of(event_type, subscription));
+            if channel.is_empty() {
+                self.by_channel.remove(&channel_id);
+            }
+        }
+    }
+
+    /// Forgets everything on one channel, leaving every other channel alone.
+    fn forget_channel(&mut self, channel_id: u32) {
+        self.by_channel.remove(&channel_id);
+    }
+
+    /// The live subscriptions on a channel, in the order they were asked for.
+    fn of_channel(&self, channel_id: u32) -> Vec<FeedSubscription> {
+        let Some(channel) = self.by_channel.get(&channel_id) else {
+            return Vec::new();
+        };
+        let mut tracked: Vec<&TrackedSubscription> = channel.values().collect();
+        tracked.sort_unstable_by_key(|entry| entry.order);
+        tracked
+            .iter()
+            .map(|entry| entry.subscription.clone())
+            .collect()
+    }
+
+    /// Every channel that has at least one subscription, lowest id first.
+    fn channels(&self) -> Vec<u32> {
+        let mut channels: Vec<u32> = self.by_channel.keys().copied().collect();
+        channels.sort_unstable();
+        channels
+    }
+
+    /// How many subscriptions are live across every channel.
+    fn len(&self) -> usize {
+        self.by_channel.values().map(HashMap::len).sum()
+    }
+
+    fn clear(&mut self) {
+        self.by_channel.clear();
+    }
+}
+
 /// The COMPACT field lists this client requests for a set of event types.
 /// Callers reach this only after refusing types with no decoder, so a type
 /// without one is skipped rather than given the two-field fallback that made
@@ -406,10 +514,11 @@ impl Drop for PendingGuard {
 ///   specific market data symbols.  The callbacks are of type `EventCallback`,
 ///   which are functions that process incoming `MarketEvent` data.  An `Arc<Mutex>`
 ///   is used for thread safety.
-/// * `subscriptions`: A thread-safe set that keeps track of active subscriptions,
-///   identified by pairs of `EventType` and the corresponding market data symbol.
-///   This ensures that duplicate subscriptions are avoided and allows for efficient
-///   management of subscriptions.  It uses `Arc<Mutex>` for thread safety.
+/// * `subscriptions`: The live subscriptions, tracked per channel and keyed by
+///   event type and symbol, carrying `fromTime` and `source` so a session can be
+///   replayed exactly. Committed only after the outbound send succeeds, so a
+///   failed send never leaves the client believing in state the server does not
+///   have. It uses `Arc<Mutex>` for thread safety.
 /// * `event_sender`: A sender for transmitting `MarketEvent` instances.  This is
 ///   optional (`Option<Sender<MarketEvent>>`) and is used to relay events to
 ///   internal processing or external consumers.
@@ -446,8 +555,9 @@ pub struct DXLinkClient {
     channels: Arc<Mutex<HashMap<u32, String>>>, // channel_id -> service
     /// A thread-safe map storing callback functions associated with specific market data symbols.
     callbacks: Arc<Mutex<HashMap<String, Arc<EventCallback>>>>, // symbol -> callback
-    /// A thread-safe set keeping track of active subscriptions, identified by `(EventType, String)`.
-    subscriptions: Arc<Mutex<HashSet<(EventType, String)>>>, // (event_type, symbol)
+    /// Live subscriptions, tracked per channel and committed only after the
+    /// outbound send succeeds.
+    subscriptions: Arc<Mutex<SubscriptionBook>>,
     /// A sender for transmitting `MarketEvent` instances.
     event_sender: Option<Sender<MarketEvent>>,
     /// A handle to the keepalive task.
@@ -504,7 +614,7 @@ impl DXLinkClient {
             next_channel_id: Arc::new(Mutex::new(1)), // Start from 1 as 0 is the main channel
             channels: Arc::new(Mutex::new(HashMap::new())),
             callbacks: Arc::new(Mutex::new(HashMap::new())),
-            subscriptions: Arc::new(Mutex::new(HashSet::new())),
+            subscriptions: Arc::new(Mutex::new(SubscriptionBook::default())),
             event_sender: None,
             keepalive_handle: None,
             message_handle: None,
@@ -1503,12 +1613,11 @@ impl DXLinkClient {
             reset: None,
         };
 
-        // Take the symbols back before the message is moved into the send.
-        let symbols: Vec<String> = subscription_msg
-            .add
-            .as_ref()
-            .map(|subs| subs.iter().map(|sub| sub.symbol.clone()).collect())
-            .unwrap_or_default();
+        // Copy the subscriptions back before the message is moved into the
+        // send: the tracked state carries fromTime and source, not just the
+        // symbol, because a replay that dropped them would resubscribe live
+        // where the consumer had asked for history.
+        let sent: Vec<FeedSubscription> = subscription_msg.add.clone().unwrap_or_default();
 
         let conn = self.get_connection_mut()?;
         conn.send(&subscription_msg).await?;
@@ -1518,8 +1627,8 @@ impl DXLinkClient {
         // is the same divergence this method was fixed to avoid.
         {
             let mut subs = recover(&self.subscriptions);
-            for (event_type, symbol) in parsed.iter().zip(symbols) {
-                subs.insert((*event_type, symbol));
+            for (event_type, subscription) in parsed.iter().zip(sent) {
+                subs.insert(channel_id, *event_type, subscription);
             }
         }
 
@@ -1545,7 +1654,6 @@ impl DXLinkClient {
             ))
         })?;
         let parsed = parse_subscription_types(&subscriptions, channel_id, &configured)?;
-        let symbols: Vec<String> = subscriptions.iter().map(|s| s.symbol.clone()).collect();
 
         let subscription_msg = FeedSubscriptionMessage {
             channel: channel_id,
@@ -1559,11 +1667,13 @@ impl DXLinkClient {
         conn.send(&subscription_msg).await?;
 
         // After the send, for the same reason as subscribe: a failed send must
-        // not leave the client believing it unsubscribed.
-        {
+        // not leave the client believing it unsubscribed. Matched on the whole
+        // identity, source included, so removing one source's subscription does
+        // not forget another's for the same symbol.
+        if let Some(removed) = subscription_msg.remove.as_ref() {
             let mut subs = recover(&self.subscriptions);
-            for (event_type, symbol) in parsed.iter().zip(symbols) {
-                subs.remove(&(*event_type, symbol));
+            for (event_type, subscription) in parsed.iter().zip(removed) {
+                subs.remove(channel_id, *event_type, subscription);
             }
         }
 
@@ -1572,16 +1682,16 @@ impl DXLinkClient {
         Ok(())
     }
 
-    /// Reset all subscriptions on a channel
+    /// Resets the subscriptions on one channel, leaving the subscriptions on
+    /// every other channel untouched.
+    ///
+    /// The reset the server performs is scoped to the channel it arrives on, so
+    /// the tracked state now matches: this used to clear every channel's
+    /// subscriptions, which left the client blind to symbols that were still
+    /// being delivered.
     pub async fn reset_subscriptions(&mut self, channel_id: u32) -> DXLinkResult<()> {
         // Validate channel exists and is a FEED channel
         self.validate_channel(channel_id, "FEED")?;
-
-        // Remove all subscriptions for this channel
-        {
-            let mut subs = recover(&self.subscriptions);
-            subs.clear(); // This is a simplification - in reality you might want to track by channel
-        }
 
         let subscription_msg = FeedSubscriptionMessage {
             channel: channel_id,
@@ -1593,6 +1703,10 @@ impl DXLinkClient {
 
         let conn = self.get_connection_mut()?;
         conn.send(&subscription_msg).await?;
+
+        // After the send, like subscribe and unsubscribe: a reset that never
+        // left the client must not be recorded as one that did.
+        recover(&self.subscriptions).forget_channel(channel_id);
 
         info!("All subscriptions reset on channel {}", channel_id);
 
@@ -1643,6 +1757,12 @@ impl DXLinkClient {
                     let mut channels = recover(&self.channels);
                     channels.remove(&channel_id);
                 }
+                // A closed channel delivers nothing, so its subscriptions and
+                // its validated layouts are gone with it. Leaving them behind
+                // made a later replay resubscribe on a channel that no longer
+                // existed.
+                recover(&self.subscriptions).forget_channel(channel_id);
+                recover(&self.channel_schemas).remove(&channel_id);
 
                 info!("Channel {} closed successfully", channel_id);
                 Ok(())
@@ -1654,6 +1774,27 @@ impl DXLinkClient {
                 "Unexpected response type".to_string(),
             )),
         }
+    }
+
+    /// The subscriptions this client believes are live on a channel, in the
+    /// order they were asked for.
+    ///
+    /// Only what the server acknowledged by accepting the send: a subscription
+    /// whose `FEED_SUBSCRIPTION` failed to go out never appears here. An unknown
+    /// or closed channel gives an empty list rather than an error, because
+    /// "nothing is subscribed there" is the true answer in both cases.
+    ///
+    /// Additive: a new method, no existing signature changes.
+    pub fn subscriptions(&self, channel_id: u32) -> Vec<FeedSubscription> {
+        recover(&self.subscriptions).of_channel(channel_id)
+    }
+
+    /// The channels that currently hold at least one subscription, lowest id
+    /// first.
+    ///
+    /// Additive: a new method, no existing signature changes.
+    pub fn subscribed_channels(&self) -> Vec<u32> {
+        recover(&self.subscriptions).channels()
     }
 
     /// Register a callback function for a specific symbol
