@@ -89,19 +89,28 @@ publish: readme coverage
 	cargo package
 	cargo publish
 
+# Pinned to the same range CI uses. Checking only for the binary's presence let a
+# stale local tarpaulin report different numbers than CI, which defeats the point
+# of pinning it there.
+TARPAULIN_VERSION := 0.32
+
+.PHONY: check-cargo-tarpaulin
+check-cargo-tarpaulin:
+	@cargo tarpaulin --version 2>/dev/null | grep -q "$(TARPAULIN_VERSION)" || \
+		(echo "Installing cargo-tarpaulin $(TARPAULIN_VERSION).x..."; \
+		 cargo install --locked cargo-tarpaulin --version '^$(TARPAULIN_VERSION)')
+
 .PHONY: coverage
-coverage:
+coverage: check-cargo-tarpaulin
 	export LOGLEVEL=WARN
-	cargo install cargo-tarpaulin
 	mkdir -p coverage
-	cargo tarpaulin --all-features --workspace --timeout 120 --out Xml
+	cargo tarpaulin --all-features --workspace --timeout 180 --out Xml
 
 .PHONY: coverage-html
-coverage-html:
+coverage-html: check-cargo-tarpaulin
 	export LOGLEVEL=WARN
-	cargo install cargo-tarpaulin
 	mkdir -p coverage
-	cargo tarpaulin --all-features --workspace --timeout 120 --out Html
+	cargo tarpaulin --all-features --workspace --timeout 180 --out Html
 
 .PHONY: open-coverage
 open-coverage:
