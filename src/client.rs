@@ -439,11 +439,13 @@ impl DXLinkClient {
 
         let receiver = self.event_stream();
 
-        // Start message processing task first so it puede capturar todos los mensajes
-        self.start_message_processing()?;
-
-        // Start keepalive task with a channel
+        // Keepalive first: it owns the shutdown channel the reader needs in
+        // order to stop it when the session dies. Nothing goes out in between,
+        // because the first maintenance tick is a full interval away.
         self.start_keepalive()?;
+
+        // Then the reader, which must be up before any traffic can arrive.
+        self.start_message_processing()?;
 
         receiver
     }
@@ -498,9 +500,12 @@ impl DXLinkClient {
 
     /// Starts the keepalive task.
     ///
-    /// This function spawns a new tokio task that periodically sends keepalive messages
-    /// to the DXLink device.  The interval between keepalive messages is defined by
-    /// the `DEFAULT_KEEPALIVE_INTERVAL` constant.
+    /// This function spawns a new tokio task that periodically sends keepalive
+    /// messages to the DXLink server. The interval is derived from the deadline
+    /// the server negotiated in its `SETUP` reply, not from a fixed constant, so
+    /// a server asking for less than the client would otherwise assume is
+    /// honoured. Maintenance is skipped when ordinary traffic has already reset
+    /// the server's idle timer.
     ///
     /// The keepalive task runs in an infinite loop until either the connection is
     /// dropped or a shutdown signal is received through the `keepalive_sender` channel.
@@ -582,6 +587,10 @@ impl DXLinkClient {
     }
 
     fn start_message_processing(&mut self) -> DXLinkResult<()> {
+        // Cloned so the reader can tear the whole session down, not just itself:
+        // stopping only the reader left the keepalive writing to a socket
+        // nobody was listening to.
+        let shutdown_keepalive = self.keepalive_sender.clone();
         // Asegurarnos de que tenemos una conexión
         if self.connection.is_none() {
             return Err(DXLinkError::Connection(
@@ -743,6 +752,13 @@ impl DXLinkClient {
                         tokio::time::sleep(Duration::from_millis(100)).await;
                     }
                 }
+            }
+
+            // This task only ever exits because the session is dead, so the
+            // socket is gone: stop writing to it as well.
+            if let Some(stop) = shutdown_keepalive {
+                let _ = stop.send(()).await;
+                debug!("Asked the keepalive task to stop, the session is dead");
             }
         });
 
@@ -1443,6 +1459,52 @@ mod tests {
         joined.expect("message task panicked instead of stopping cleanly");
     }
 
+    /// A dead session must stop both owned tasks. Stopping only the reader left
+    /// the keepalive writing to a socket nobody was listening to, which is the
+    /// dead-but-open state this was meant to end.
+    #[tokio::test]
+    async fn test_session_death_stops_both_tasks() {
+        use tokio::net::TcpListener;
+        use tokio_tungstenite::accept_async;
+
+        let listener = TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("failed to bind test server");
+        let addr = listener.local_addr().expect("failed to read local addr");
+
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("failed to accept");
+            let ws = accept_async(stream).await.expect("failed to handshake");
+            drop(ws);
+        });
+
+        let mut client = DXLinkClient::new(&format!("ws://{}", addr), "test_token");
+        client.connection = Some(
+            crate::connection::WebSocketConnection::connect(&format!("ws://{}", addr))
+                .await
+                .expect("failed to connect"),
+        );
+
+        client.start_keepalive().expect("failed to start keepalive");
+        client
+            .start_message_processing()
+            .expect("failed to start message processing");
+
+        let message = client.message_handle.take().expect("no message task");
+        let keepalive = client.keepalive_handle.take().expect("no keepalive task");
+
+        tokio::time::timeout(Duration::from_secs(5), message)
+            .await
+            .expect("the reader kept running after the server closed")
+            .expect("the reader panicked");
+
+        // The reader is responsible for telling the writer to stop as well.
+        tokio::time::timeout(Duration::from_secs(5), keepalive)
+            .await
+            .expect("the keepalive kept writing to a dead socket")
+            .expect("the keepalive panicked");
+    }
+
     // Test error cases for connection
     #[test]
     fn test_connection_errors() {
@@ -1518,7 +1580,9 @@ mod keepalive_tests {
         // Nothing negotiated yet: fall back to what we advertise.
         assert_eq!(
             client.keepalive_interval(),
-            Duration::from_secs(u64::from(DEFAULT_KEEPALIVE_TIMEOUT).div_ceil(3))
+            Duration::from_secs(
+                u64::from(DEFAULT_KEEPALIVE_TIMEOUT).div_ceil(u64::from(KEEPALIVE_DIVISOR))
+            )
         );
 
         // A server asking for less than the old fixed 15s must be honoured, or
@@ -1527,7 +1591,10 @@ mod keepalive_tests {
         assert_eq!(client.keepalive_interval(), Duration::from_secs(1));
 
         client.server_keepalive_timeout = Some(60);
-        assert_eq!(client.keepalive_interval(), Duration::from_secs(20));
+        assert_eq!(
+            client.keepalive_interval(),
+            Duration::from_secs(60 / u64::from(KEEPALIVE_DIVISOR))
+        );
     }
 
     #[test]

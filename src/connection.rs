@@ -318,21 +318,29 @@ impl WebSocketConnection {
     }
 
     /// Records that something has just gone out on this socket.
+    ///
+    /// A poisoned lock is recovered rather than ignored: dropping the update
+    /// would leave `since_last_send` reporting a stale instant, and reporting a
+    /// zero elapsed time suppresses every future keepalive.
     fn mark_sent(&self) {
-        if let Ok(mut last) = self.last_sent.lock() {
-            *last = Instant::now();
-        }
+        let mut last = self
+            .last_sent
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *last = Instant::now();
     }
 
     /// How long since anything was last written to this socket.
     ///
     /// A caller scheduling keepalives uses this to avoid sending one when
-    /// ordinary traffic has already reset the server's idle timer.
+    /// ordinary traffic has already reset the server's idle timer. Recovering
+    /// from a poisoned lock matters here: returning a zero would look like the
+    /// socket was just used and silence the keepalive permanently.
     pub fn since_last_send(&self) -> Duration {
         self.last_sent
             .lock()
-            .map(|last| last.elapsed())
-            .unwrap_or_default()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .elapsed()
     }
 
     /// Creates a new `KeepAliveSender` instance.
