@@ -36,24 +36,26 @@ pub struct BaseMessage {
 /// use serde_json::json;
 /// use dxlink::messages::SetupMessage;
 ///
+/// // SETUP always travels on channel 0, the type is upper case on the wire,
+/// // and the timeouts are seconds.
 /// let setup_message = SetupMessage {
-///     channel: 1,
-///     message_type: "setup".to_string(),
-///     keepalive_timeout: 30000,
-///     accept_keepalive_timeout: 35000,
-///     version: "1.0".to_string(),
+///     channel: 0,
+///     message_type: "SETUP".to_string(),
+///     keepalive_timeout: 60,
+///     accept_keepalive_timeout: 60,
+///     version: "0.1-dxlink-rs/0.3.0".to_string(),
 /// };
 ///
 /// let json_representation = serde_json::to_string(&setup_message).unwrap();
-/// assert_eq!(json_representation, r#"{"channel":1,"type":"setup","keepaliveTimeout":30000,"acceptKeepaliveTimeout":35000,"version":"1.0"}"#);
+/// assert_eq!(json_representation, r#"{"channel":0,"type":"SETUP","keepaliveTimeout":60,"acceptKeepaliveTimeout":60,"version":"0.1-dxlink-rs/0.3.0"}"#);
 ///
 /// // You can also create it from a JSON string.
 /// let setup_message: SetupMessage = serde_json::from_value(json!({
-///     "channel": 1,
-///     "type": "setup",
-///     "keepaliveTimeout": 30000,
-///     "acceptKeepaliveTimeout": 35000,
-///     "version": "1.0"
+///     "channel": 0,
+///     "type": "SETUP",
+///     "keepaliveTimeout": 60,
+///     "acceptKeepaliveTimeout": 60,
+///     "version": "0.1-dxlink-rs/0.3.0"
 /// })).unwrap();
 /// ```
 #[derive(Debug, Serialize, Deserialize)]
@@ -61,12 +63,12 @@ pub struct BaseMessage {
 pub struct SetupMessage {
     /// The channel number.
     pub channel: u32,
-    /// The type of the message.  Should be "setup".
+    /// The type of the message, `SETUP` on the wire.
     #[serde(rename = "type")]
     pub message_type: String,
-    /// The keepalive timeout, in seconds (the unit DXLink uses on the wire).
+    /// The keepalive timeout value in milliseconds.
     pub keepalive_timeout: u32,
-    /// The largest keepalive timeout this peer accepts, in seconds.
+    /// The timeout value for accepting a keepalive message.
     pub accept_keepalive_timeout: u32,
     /// The version of the protocol.
     pub version: String,
