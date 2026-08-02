@@ -217,7 +217,6 @@ fn symbol_of(event: &MarketEvent) -> &str {
     }
 }
 
-
 /// Records why a session ended, keeping the first reason rather than the last.
 ///
 /// The first failure is the cause; anything after it is a consequence of a
