@@ -193,6 +193,16 @@ async fn expect_handshake_message(
     Ok(raw)
 }
 
+/// Locks client state, recovering instead of panicking if it is poisoned.
+///
+/// State that describes a dead connection has to be cleared on disconnect, and a
+/// prior panic elsewhere is no reason to keep it around.
+fn recover<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mutex
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 /// Removes a pending response registration when it goes out of scope.
 ///
 /// Registrations used to survive timeouts, cancelled futures and failed sends.
@@ -978,8 +988,19 @@ impl DXLinkClient {
         if let Some(sender) = self.keepalive_sender.take() {
             let _ = sender.send(()).await;
         }
-        if let Some(handle) = self.keepalive_handle.take() {
-            let _ = tokio::time::timeout(SHUTDOWN_GRACE, handle).await;
+        if let Some(mut handle) = self.keepalive_handle.take() {
+            // Borrow the handle rather than moving it into the timeout: a moved
+            // handle is dropped when the timeout elapses, which detaches the
+            // task instead of stopping it. Connection::send has no deadline, so
+            // that task could sit in an await and keep using the socket after
+            // disconnect returned, with nothing left to stop it.
+            if tokio::time::timeout(SHUTDOWN_GRACE, &mut handle)
+                .await
+                .is_err()
+            {
+                warn!("Keepalive task did not stop within {SHUTDOWN_GRACE:?}; aborting it");
+                handle.abort();
+            }
         }
 
         // 2. Close the channels while the reader is still alive to route the
@@ -1028,23 +1049,25 @@ impl DXLinkClient {
         Ok(())
     }
 
-    /// Drops everything tied to one session, leaving the client reusable.
+    /// Drops everything tied to one session.
     ///
     /// Channels, subscriptions and pending responses all describe a connection
     /// that no longer exists; carrying them across a disconnect made a later
     /// reconnect look like it already had channels open.
+    ///
+    /// This clears the per-session bookkeeping, which is what a future
+    /// reconnect will need. It does not by itself make a
+    /// disconnect-then-connect cycle work: `connect` hands out the event
+    /// stream and that is still single-shot.
     fn clear_session_state(&mut self) {
-        if let Ok(mut channels) = self.channels.lock() {
-            channels.clear();
-        }
-        if let Ok(mut subscriptions) = self.subscriptions.lock() {
-            subscriptions.clear();
-        }
-        if let Ok(mut requests) = self.response_requests.lock() {
-            // Dropping the senders wakes every waiter instead of leaving it to
-            // time out against a connection that is already gone.
-            requests.clear();
-        }
+        // Recovering from poisoning rather than skipping: state that describes a
+        // dead connection has to go, and a prior panic elsewhere is no reason to
+        // keep it.
+        recover(&self.channels).clear();
+        recover(&self.subscriptions).clear();
+        // Dropping the senders wakes every waiter instead of leaving it to time
+        // out against a connection that is already gone.
+        recover(&self.response_requests).clear();
     }
 
     /// Create a channel for receiving market data
