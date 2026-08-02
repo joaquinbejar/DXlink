@@ -448,3 +448,72 @@ async fn test_a_failed_send_leaves_no_pending_request() {
         "a failed send left a registration behind"
     );
 }
+
+// --- Shutdown ordering (issue #8) ------------------------------------------
+
+/// Disconnect used to abort the reader before closing channels, so every
+/// close_channel waited out its full timeout for a reply nobody could route:
+/// five seconds per open channel. With three channels that is fifteen seconds.
+#[tokio::test]
+async fn test_disconnect_closes_channels_without_waiting_out_timeouts() {
+    let server = MockServer::start(Behaviour::Normal).await;
+    let mut client = DXLinkClient::new(&server.url(), "test-token");
+    client.connect().await.expect("failed to connect");
+
+    let mut channels = Vec::new();
+    for _ in 0..3 {
+        channels.push(
+            client
+                .create_feed_channel("AUTO")
+                .await
+                .expect("failed to create feed channel"),
+        );
+    }
+
+    let started = std::time::Instant::now();
+    client.disconnect().await.expect("failed to disconnect");
+    let elapsed = started.elapsed();
+
+    assert!(
+        elapsed < Duration::from_secs(3),
+        "disconnect took {elapsed:?}, it waited out per-channel timeouts"
+    );
+
+    // Every channel was actually cancelled on the wire, not just forgotten.
+    let cancels = server
+        .received()
+        .iter()
+        .filter(|m| m["type"] == "CHANNEL_CANCEL")
+        .count();
+    assert_eq!(cancels, channels.len(), "not every channel was cancelled");
+}
+
+/// A second disconnect must be a no-op, and the client must not claim to still
+/// have the channels of a session that is gone.
+#[tokio::test]
+async fn test_disconnect_is_idempotent_and_clears_session_state() {
+    let server = MockServer::start(Behaviour::Normal).await;
+    let mut client = DXLinkClient::new(&server.url(), "test-token");
+    client.connect().await.expect("failed to connect");
+
+    let channel_id = client
+        .create_feed_channel("AUTO")
+        .await
+        .expect("failed to create feed channel");
+
+    client.disconnect().await.expect("first disconnect failed");
+    client.disconnect().await.expect("second disconnect failed");
+
+    assert_eq!(
+        client.pending_response_count(),
+        0,
+        "pending responses survived the disconnect"
+    );
+
+    // The channel belonged to a connection that no longer exists.
+    let result = client.setup_feed(channel_id, &[EventType::Quote]).await;
+    assert!(
+        result.is_err(),
+        "a channel from the closed session was still usable"
+    );
+}
