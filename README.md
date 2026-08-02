@@ -29,11 +29,15 @@ to DXLink servers, subscribing to market events, and processing real-time market
   letting a consumer read that as a quiet market.
 - A lost connection is observable: the event stream closes, and
   [`DXLinkClient::disconnect_reason`] says why.
+- **Opt-in reconnection.** Off by default. Install a
+  [`ReconnectPolicy`] with [`DXLinkClient::with_reconnect`] before
+  connecting and a terminal socket failure is followed by exponential
+  backoff, a fresh handshake, and a replay of every channel, feed
+  configuration and subscription. A rejected token is not retried.
+  [`DXLinkClient::connection_states`] reports what is happening.
 
 ### What is not supported yet
 
-- **No reconnection.** If the connection drops, the client reports the error
-  and stops; re-establishing the session is the caller's job.
 - [`EventType`] declares more variants than the library can decode. Only
   `Quote`, `Trade`, `Greeks`, `Candle`, `Summary`, `TimeAndSale`, `Profile`,
   `Underlying` and `TheoPrice` produce a [`MarketEvent`], and

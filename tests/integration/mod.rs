@@ -8,4 +8,5 @@ mod fixture;
 mod dxlink_extra;
 mod dxlink_flow;
 mod dxlink_real;
+mod dxlink_reconnect;
 mod dxlink_test;
