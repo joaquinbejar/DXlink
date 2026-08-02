@@ -30,8 +30,8 @@ futures-util = "0.3"
 tracing = "0.1"
 
 [dev-dependencies]
-warp = { version = "0.4", features = ["websocket", "server"] }
-chrono = "0.4"
+# test-util drives virtual time so the keepalive test does not spend 20 real seconds.
+tokio = { version = "1.53", features = ["full", "test-util"] }
 tracing-subscriber = { version = "0.3", features = ["fmt"] }
 
 [[test]]
