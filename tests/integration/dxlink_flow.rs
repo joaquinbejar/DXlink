@@ -360,7 +360,10 @@ async fn test_session_sends_the_expected_protocol_messages() {
 /// A slow callback must not stop socket reads. It used to run on the same task
 /// that routes protocol responses, so an unrelated channel operation timed out
 /// because somebody's callback was busy.
-#[tokio::test]
+// Multi-threaded on purpose: the point is that a blocking callback does not
+// stall protocol work, and the default single-threaded test runtime would make
+// the result depend on the executor rather than on the decoupling.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_a_slow_callback_does_not_block_protocol_operations() {
     let server = MockServer::start(Behaviour::Normal).await;
 
@@ -413,7 +416,7 @@ async fn test_a_slow_callback_does_not_block_protocol_operations() {
 
 /// A panicking callback used to take the whole task down, and with it every
 /// protocol response.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_a_panicking_callback_does_not_kill_the_session() {
     let server = MockServer::start(Behaviour::Normal).await;
 

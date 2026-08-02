@@ -463,12 +463,15 @@ impl DXLinkClient {
 
                 if let Some(callback) = callback {
                     let delivered = event.clone();
-                    // A panicking callback used to take the whole task with it,
-                    // and with it every protocol response.
-                    if std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
-                        callback(delivered)
-                    }))
-                    .is_err()
+                    // Run it on the blocking pool, not here. A callback that
+                    // blocks the thread would otherwise stall this task's
+                    // executor thread, and on a current-thread runtime that is
+                    // the same thread the protocol reader needs. spawn_blocking
+                    // also turns a panic into a JoinError instead of unwinding
+                    // through the task.
+                    if tokio::task::spawn_blocking(move || callback(delivered))
+                        .await
+                        .is_err()
                     {
                         error!("Callback for {} panicked; continuing delivery", symbol);
                     }
@@ -888,14 +891,27 @@ impl DXLinkClient {
                                         // stream stop the socket reads that every
                                         // channel operation depends on.
                                         for event in parse_compact_data(&data_msg.data) {
-                                            if delivery_tx.try_send(event).is_err() {
-                                                dropped_events += 1;
-                                                if dropped_events.is_power_of_two() {
-                                                    warn!(
-                                                        "Delivery queue full, {} event(s) dropped so far; \
-                                                         the consumer is slower than the feed",
-                                                        dropped_events
+                                            match delivery_tx.try_send(event) {
+                                                Ok(()) => {}
+                                                Err(mpsc::error::TrySendError::Full(_)) => {
+                                                    dropped_events += 1;
+                                                    if dropped_events.is_power_of_two() {
+                                                        warn!(
+                                                            "Delivery queue full, {} event(s) dropped so far; \
+                                                             the consumer is slower than the feed",
+                                                            dropped_events
+                                                        );
+                                                    }
+                                                }
+                                                Err(mpsc::error::TrySendError::Closed(_)) => {
+                                                    // Delivery has stopped entirely, which is a
+                                                    // different thing from falling behind and
+                                                    // must not be reported as backpressure.
+                                                    error!(
+                                                        "Delivery worker is gone; no further events \
+                                                         will reach callbacks or the stream"
                                                     );
+                                                    break;
                                                 }
                                             }
                                         }
@@ -1299,6 +1315,16 @@ impl DXLinkClient {
     /// receiver is dropped the stream cannot be re-taken: delivery continues to
     /// registered callbacks only, and the loss is logged once rather than per
     /// event.
+    ///
+    /// # Backpressure
+    ///
+    /// The stream is bounded and **events are dropped when the consumer falls
+    /// behind**, rather than the library blocking to preserve them. A blocked
+    /// consumer would otherwise stall the socket reader and make unrelated
+    /// channel operations time out, and a quote that arrives late is worth less
+    /// than the connection staying responsive. Drops are logged. If you cannot
+    /// afford to miss events, drain this receiver into your own unbounded
+    /// buffer as soon as it yields.
     pub fn event_stream(&mut self) -> DXLinkResult<Receiver<MarketEvent>> {
         if self.event_sender.is_none() {
             let (tx, rx) = mpsc::channel(100); // Buffer of 100 events
