@@ -155,26 +155,45 @@ async fn test_error_non_existent_channel() {
     client.disconnect().await.expect("failed to disconnect");
 }
 
-/// The client must keep the session alive on its own. Virtual time drives the
-/// interval so the suite does not spend 20 real seconds proving it.
+/// The client must keep the session alive on the deadline the server
+/// negotiated, not on a fixed schedule of its own. The fixture asks for 3
+/// seconds here, below the 15 the client used to assume: with the old fixed
+/// interval the server would have timed the connection out before the first
+/// keepalive went out.
 #[tokio::test]
-async fn test_client_sends_keepalives() {
+async fn test_client_honors_a_short_negotiated_keepalive() {
+    let server = MockServer::start(Behaviour::ShortKeepalive).await;
+
+    let mut client = DXLinkClient::new(&server.url(), "test-token");
+    client.connect().await.expect("failed to connect");
+
+    // 3s deadline means maintenance every second; well inside wait_for's bound.
+    server.wait_for("KEEPALIVE", is_type("KEEPALIVE")).await;
+
+    client.disconnect().await.expect("failed to disconnect");
+}
+
+/// The first tick of a tokio interval is immediate, which used to fire a
+/// redundant KEEPALIVE the instant the session opened.
+#[tokio::test]
+async fn test_no_keepalive_is_sent_immediately_after_connecting() {
     let server = MockServer::start(Behaviour::Normal).await;
 
     let mut client = DXLinkClient::new(&server.url(), "test-token");
-    // Connect in real time: the handshake is bounded by a timeout that virtual
-    // time would fire before the socket finished being established.
     client.connect().await.expect("failed to connect");
 
-    // Past one keepalive interval; with time paused this costs nothing.
-    tokio::time::pause();
-    tokio::time::advance(Duration::from_secs(20)).await;
+    // The handshake is done; nothing should follow it straight away.
+    tokio::time::sleep(Duration::from_millis(300)).await;
 
-    // Back to real time before waiting: delivering the keepalive is real socket
-    // I/O, and a virtual-time timeout would expire before it lands.
-    tokio::time::resume();
-
-    server.wait_for("KEEPALIVE", is_type("KEEPALIVE")).await;
+    let types: Vec<String> = server
+        .received()
+        .iter()
+        .filter_map(|m| m["type"].as_str().map(String::from))
+        .collect();
+    assert!(
+        !types.contains(&"KEEPALIVE".to_string()),
+        "a keepalive went out immediately after connecting: {types:?}"
+    );
 
     client.disconnect().await.expect("failed to disconnect");
 }
