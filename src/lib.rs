@@ -10,7 +10,7 @@
 //!   authentication, feed channels, `FEED_SETUP`, subscribe and unsubscribe.
 //! - Automatic keepalives while the connection is open.
 //! - Market events decoded from the `COMPACT` wire format: **`Quote`, `Trade`,
-//!   `Greeks` and `Candle`**, each with the full field set the dxFeed schema
+//!   `Greeks`, `Candle` and `Summary`**, each with the full field set the dxFeed schema
 //!   defines for it.
 //! - Both delivery styles: a per-symbol callback and a single event stream.
 //! - Historical data via `from_time` on a `Candle` subscription, decoded into
@@ -28,7 +28,8 @@
 //! - **No reconnection.** If the connection drops, the client reports the error
 //!   and stops; re-establishing the session is the caller's job.
 //! - [`EventType`] declares more variants than the library can decode. Only
-//!   `Quote`, `Trade`, `Greeks` and `Candle` produce a [`MarketEvent`], and
+//!   `Quote`, `Trade`, `Greeks`, `Candle` and `Summary` produce a
+//!   [`MarketEvent`], and
 //!   configuring or subscribing to any other type is **refused** rather than
 //!   accepted into a stream that can never produce.
 //!
@@ -193,10 +194,11 @@
 //! | `Quote`  | `bidPrice`, `askPrice`, `bidSize`, `askSize` |
 //! | `Trade`  | `price`, `size`, `dayVolume` |
 //! | `Greeks` | `delta`, `gamma`, `theta`, `vega`, `rho`, `volatility` |
-//! | `Candle` | `time`, `open`, `high`, `low`, `close`, `volume` |
+//! | `Candle` | the full 18-column layout: OHLCV plus VWAP, bid/ask volume, implied volatility, open interest and the snapshot flags |
+//! | `Summary` | the full 14-column layout: day and previous-day prices, their price types, volume and open interest |
 //!
-//! Configuring or subscribing to any other variant (`Summary`, `Profile`,
-//! `TimeAndSale`, …) is **refused**, rather than accepted into a stream that can
+//! Configuring or subscribing to any other variant (`Profile`, `TimeAndSale`,
+//! …) is **refused**, rather than accepted into a stream that can
 //! never produce.
 //!
 //!
