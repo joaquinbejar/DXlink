@@ -50,10 +50,11 @@
 //! #[tokio::main]
 //! async fn main() -> Result<(), Box<dyn Error>> {
 //!     
-//!     // Create a new DXLink client with the API token
-//!     // (typically obtained from tastytrade API)
 //!     use tracing::info;
-//! let token = "your_api_token_here";
+//!
+//!     // Create a new DXLink client with the API token
+//!     // (typically obtained from the tastytrade API)
+//!     let token = "your_api_token_here";
 //!     let url = "wss://tasty-demo-dxlink-md-ws.dxfeed.com/delayed";
 //!     let mut client = DXLinkClient::new(url, token);
 //!     
