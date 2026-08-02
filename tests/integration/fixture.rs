@@ -243,10 +243,36 @@ impl MockServer {
             Ok(found) => found,
             Err(_) => panic!(
                 "timed out waiting for {what}; server received: {:#?}",
-                self.received()
+                redacted(self.received())
             ),
         }
     }
+}
+
+/// Masks credential fields before a failure dump reaches the test output.
+///
+/// The server records the client's outbound `AUTH`, so dumping everything it
+/// received would print the bearer token. Harmless with the fixed test token,
+/// not harmless the day someone points this fixture at a real one.
+fn redacted(mut messages: Vec<Value>) -> Vec<Value> {
+    fn mask(value: &mut Value) {
+        match value {
+            Value::Object(map) => {
+                for (key, field) in map.iter_mut() {
+                    if key.eq_ignore_ascii_case("token") {
+                        *field = Value::String("<redacted>".to_string());
+                    } else {
+                        mask(field);
+                    }
+                }
+            }
+            Value::Array(items) => items.iter_mut().for_each(mask),
+            _ => {}
+        }
+    }
+
+    messages.iter_mut().for_each(mask);
+    messages
 }
 
 /// The value the server reports for one COMPACT column.
@@ -303,5 +329,27 @@ pub fn is_type(kind: &str) -> impl Fn(&Value) -> bool + '_ {
 pub fn is_type_on_channel(kind: &str, channel: u32) -> impl Fn(&Value) -> bool + '_ {
     move |m: &Value| {
         m["type"].as_str() == Some(kind) && m["channel"].as_u64() == Some(channel as u64)
+    }
+}
+
+#[cfg(test)]
+mod redaction_tests {
+    use super::redacted;
+    use serde_json::json;
+
+    #[test]
+    fn test_failure_dumps_do_not_carry_the_token() {
+        let dumped = format!(
+            "{:#?}",
+            redacted(vec![
+                json!({"type": "AUTH", "channel": 0, "token": "real-secret"})
+            ])
+        );
+
+        assert!(!dumped.contains("real-secret"), "token leaked: {dumped}");
+        assert!(dumped.contains("<redacted>"));
+        // The rest of the message still has to be readable, that is the point
+        // of the dump.
+        assert!(dumped.contains("AUTH"));
     }
 }
