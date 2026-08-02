@@ -2,6 +2,9 @@
 name = "dxlink"
 version = "0.3.0"
 edition = "2024"
+# Measured, not guessed: 1.87 rejects the let-chains this crate uses.
+# Raising this is a compatibility break for consumers and belongs in release notes.
+rust-version = "1.88"
 license = "MIT"
 description = "Rust client for the DXLink WebSocket protocol: real-time market data from tastytrade/dxFeed"
 repository = "https://github.com/joaquinbejar/DXlink"
