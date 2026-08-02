@@ -46,7 +46,7 @@
 //!     // (typically obtained from tastytrade API)
 //!     use tracing::info;
 //! let token = "your_api_token_here";
-//!     let url = "wss://tasty-openapi-ws.dxfeed.com/realtime";
+//!     let url = "wss://tasty-demo-dxlink-md-ws.dxfeed.com/delayed";
 //!     let mut client = DXLinkClient::new(url, token);
 //!     
 //!     // Connect to the DXLink server. This returns the event stream; there is
