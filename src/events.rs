@@ -203,12 +203,22 @@ impl EventType {
             EventType::Candle => Some(&[
                 "eventType",
                 "eventSymbol",
+                "eventTime",
+                "eventFlags",
+                "index",
                 "time",
+                "sequence",
+                "count",
                 "open",
                 "high",
                 "low",
                 "close",
                 "volume",
+                "VWAP",
+                "bidVolume",
+                "askVolume",
+                "impVolatility",
+                "openInterest",
             ]),
             EventType::Greeks => Some(&[
                 "eventType",
@@ -429,7 +439,10 @@ pub struct GreeksEvent {
 /// One OHLC bar for a period, the shape historical data comes back in.
 ///
 /// Candle symbols carry the period, for example `AAPL{=5m}` for five minute
-/// bars. Field names and their meaning follow the dxFeed AsyncAPI schema.
+/// bars. Every field the dxFeed AsyncAPI schema defines for a candle is here,
+/// in the order the client requests them: `eventFlags` and `index` in
+/// particular mark where a historical snapshot starts and ends, and a consumer
+/// that only ever sees OHLC cannot tell a snapshot from live updates.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CandleEvent {
     /// The type of the event, `Candle`.
@@ -440,9 +453,30 @@ pub struct CandleEvent {
     #[serde(rename = "eventSymbol")]
     pub event_symbol: String,
 
+    /// When the server emitted the event, as epoch milliseconds.
+    #[serde(rename = "eventTime")]
+    pub event_time: i64,
+
+    /// Snapshot and transaction bits. Non-zero values delimit a historical
+    /// snapshot; see the dxFeed event flags documentation.
+    #[serde(rename = "eventFlags")]
+    pub event_flags: i64,
+
+    /// Unique index of the bar within its subscription.
+    #[serde(rename = "index")]
+    pub index: i64,
+
     /// Start of the bar, as epoch milliseconds.
     #[serde(rename = "time")]
     pub time: i64,
+
+    /// Sequence number, disambiguating bars sharing a timestamp.
+    #[serde(rename = "sequence")]
+    pub sequence: i64,
+
+    /// Number of events aggregated into the bar.
+    #[serde(rename = "count")]
+    pub count: i64,
 
     /// First price in the bar.
     #[serde(rename = "open", with = "json_double")]
@@ -463,6 +497,26 @@ pub struct CandleEvent {
     /// Total volume traded during the bar.
     #[serde(rename = "volume", with = "json_double")]
     pub volume: f64,
+
+    /// Volume weighted average price for the bar.
+    #[serde(rename = "VWAP", with = "json_double")]
+    pub vwap: f64,
+
+    /// Volume traded at the bid during the bar.
+    #[serde(rename = "bidVolume", with = "json_double")]
+    pub bid_volume: f64,
+
+    /// Volume traded at the ask during the bar.
+    #[serde(rename = "askVolume", with = "json_double")]
+    pub ask_volume: f64,
+
+    /// Implied volatility over the bar, for instruments that have it.
+    #[serde(rename = "impVolatility", with = "json_double")]
+    pub imp_volatility: f64,
+
+    /// Open interest at the end of the bar.
+    #[serde(rename = "openInterest", with = "json_double")]
+    pub open_interest: f64,
 }
 
 /// Represents a market event, which can be a quote, trade, or greeks event.

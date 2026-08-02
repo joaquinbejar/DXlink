@@ -9,8 +9,9 @@
 //! - Session lifecycle over the DXLink WebSocket protocol: `SETUP`, token
 //!   authentication, feed channels, `FEED_SETUP`, subscribe and unsubscribe.
 //! - Automatic keepalives while the connection is open.
-//! - Market events decoded from the `COMPACT` wire format: **`Quote`, `Trade`
-//!   and `Greeks`**.
+//! - Market events decoded from the `COMPACT` wire format: **`Quote`, `Trade`,
+//!   `Greeks` and `Candle`**, each with the full field set the dxFeed schema
+//!   defines for it.
 //! - Both delivery styles: a per-symbol callback and a single event stream.
 //! - Historical data via `from_time` on a `Candle` subscription, decoded into
 //!   OHLC bars.

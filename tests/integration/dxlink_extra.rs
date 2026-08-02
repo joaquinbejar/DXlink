@@ -160,12 +160,22 @@ async fn test_historical_candles_are_requested_and_delivered() {
     match event {
         MarketEvent::Candle(candle) => {
             assert_eq!(candle.event_symbol, "AAPL{=5m}");
+            assert_eq!(candle.event_time, expected::EVENT_TIME);
+            assert_eq!(candle.event_flags, expected::EVENT_FLAGS);
+            assert_eq!(candle.index, expected::INDEX);
             assert_eq!(candle.time, expected::TIME);
+            assert_eq!(candle.sequence, expected::SEQUENCE);
+            assert_eq!(candle.count, expected::COUNT);
             assert_eq!(candle.open, expected::OPEN);
             assert_eq!(candle.high, expected::HIGH);
             assert_eq!(candle.low, expected::LOW);
             assert_eq!(candle.close, expected::CLOSE);
             assert_eq!(candle.volume, expected::VOLUME);
+            assert_eq!(candle.vwap, expected::VWAP);
+            assert_eq!(candle.bid_volume, expected::BID_VOLUME);
+            assert_eq!(candle.ask_volume, expected::ASK_VOLUME);
+            assert_eq!(candle.imp_volatility, expected::IMP_VOLATILITY);
+            assert_eq!(candle.open_interest, expected::OPEN_INTEREST);
         }
         other => panic!("expected a candle, got {other:?}"),
     }
