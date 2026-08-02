@@ -635,8 +635,10 @@ async fn test_a_rejected_reconfiguration_invalidates_the_channel() {
         "a reordered reconfiguration must be refused"
     );
 
-    // And no data may be decoded afterwards.
-    client
+    // And the channel is no longer usable at all: with its layout gone there is
+    // nothing to decode against, so the refusal comes before anything is sent
+    // rather than after data arrives.
+    let result = client
         .subscribe(
             channel_id,
             vec![FeedSubscription {
@@ -646,14 +648,13 @@ async fn test_a_rejected_reconfiguration_invalidates_the_channel() {
                 source: None,
             }],
         )
-        .await
-        .expect("failed to subscribe");
-
-    let event = tokio::time::timeout(Duration::from_millis(700), stream.recv()).await;
+        .await;
     assert!(
-        event.is_err(),
-        "data was decoded against a layout the server had changed: {event:?}"
+        result.is_err(),
+        "a channel whose reconfiguration was refused must not accept subscriptions"
     );
+
+    let _ = &mut stream;
 
     client.disconnect().await.expect("failed to disconnect");
 }
@@ -748,6 +749,173 @@ async fn test_a_batch_with_one_bad_type_is_rejected_whole() {
             .count(),
         0,
         "a partially valid batch still went out"
+    );
+
+    client.disconnect().await.expect("failed to disconnect");
+}
+
+// --- No silent empty streams (issue #30) -----------------------------------
+
+/// Configuring a type this client cannot decode used to succeed: the wildcard
+/// asked for two fields, the server agreed, the subscription was accepted, and
+/// then nothing ever arrived. An empty stream looks exactly like a quiet market.
+#[tokio::test]
+async fn test_setup_feed_refuses_a_type_it_cannot_decode() {
+    let server = MockServer::start(Behaviour::Normal).await;
+    let mut client = DXLinkClient::new(&server.url(), "test-token");
+    client.connect().await.expect("failed to connect");
+    let channel_id = client
+        .create_feed_channel("AUTO")
+        .await
+        .expect("failed to create feed channel");
+
+    match client.setup_feed(channel_id, &[EventType::Candle]).await {
+        Err(DXLinkError::Protocol(msg)) => {
+            assert!(msg.contains("Candle"), "the type is missing: {msg}");
+            // The error has to say what does work, or it is a dead end.
+            assert!(msg.contains("Quote"), "the usable types are missing: {msg}");
+        }
+        other => panic!("an undecodable type must be refused, got: {other:?}"),
+    }
+
+    // Nothing was configured on the wire either.
+    assert_eq!(
+        server
+            .received()
+            .iter()
+            .filter(|m| m["type"] == "FEED_SETUP")
+            .count(),
+        0,
+        "a refused setup still went out"
+    );
+
+    client.disconnect().await.expect("failed to disconnect");
+}
+
+/// The same applies to subscribing, which is the other way to end up waiting
+/// for events that cannot arrive.
+#[tokio::test]
+async fn test_subscribe_refuses_a_type_it_cannot_decode() {
+    let server = MockServer::start(Behaviour::Normal).await;
+    let mut client = DXLinkClient::new(&server.url(), "test-token");
+    client.connect().await.expect("failed to connect");
+    let channel_id = client
+        .create_feed_channel("AUTO")
+        .await
+        .expect("failed to create feed channel");
+    client
+        .setup_feed(channel_id, &[EventType::Quote])
+        .await
+        .expect("failed to set up feed");
+
+    let result = client
+        .subscribe(
+            channel_id,
+            vec![FeedSubscription {
+                event_type: "Summary".to_string(),
+                symbol: "AAPL".to_string(),
+                from_time: None,
+                source: None,
+            }],
+        )
+        .await;
+
+    match result {
+        Err(DXLinkError::Protocol(msg)) => {
+            assert!(msg.contains("Summary"), "the type is missing: {msg}");
+            assert!(msg.contains("AAPL"), "the symbol is missing: {msg}");
+        }
+        other => panic!("an undecodable subscription must be refused, got: {other:?}"),
+    }
+
+    // Returning Err while still sending would be the same bug wearing an error.
+    assert_eq!(
+        server
+            .received()
+            .iter()
+            .filter(|m| m["type"] == "FEED_SUBSCRIPTION")
+            .count(),
+        0,
+        "a refused subscription still went out"
+    );
+
+    client.disconnect().await.expect("failed to disconnect");
+}
+
+/// Decodable is not enough: the layout must be one this channel negotiated.
+/// Subscribing Trade on a Quote-configured channel used to pass, and the
+/// reader's channel-level gate then decoded Trade rows against a layout that
+/// was never agreed.
+#[tokio::test]
+async fn test_subscribe_refuses_a_type_the_channel_was_not_configured_for() {
+    let server = MockServer::start(Behaviour::Normal).await;
+    let mut client = DXLinkClient::new(&server.url(), "test-token");
+    client.connect().await.expect("failed to connect");
+    let channel_id = client
+        .create_feed_channel("AUTO")
+        .await
+        .expect("failed to create feed channel");
+    client
+        .setup_feed(channel_id, &[EventType::Quote])
+        .await
+        .expect("failed to set up feed");
+
+    let result = client
+        .subscribe(
+            channel_id,
+            vec![FeedSubscription {
+                event_type: "Trade".to_string(),
+                symbol: "AAPL".to_string(),
+                from_time: None,
+                source: None,
+            }],
+        )
+        .await;
+
+    match result {
+        Err(DXLinkError::Protocol(msg)) => {
+            assert!(msg.contains("Trade"), "the type is missing: {msg}");
+            assert!(msg.contains("setup_feed"), "no way forward given: {msg}");
+        }
+        other => panic!("Trade on a Quote channel must be refused, got: {other:?}"),
+    }
+
+    assert_eq!(
+        server
+            .received()
+            .iter()
+            .filter(|m| m["type"] == "FEED_SUBSCRIPTION")
+            .count(),
+        0,
+        "a refused subscription still went out"
+    );
+
+    client.disconnect().await.expect("failed to disconnect");
+}
+
+/// An empty configuration subscribes to nothing and can never deliver.
+#[tokio::test]
+async fn test_setup_feed_refuses_an_empty_event_type_list() {
+    let server = MockServer::start(Behaviour::Normal).await;
+    let mut client = DXLinkClient::new(&server.url(), "test-token");
+    client.connect().await.expect("failed to connect");
+    let channel_id = client
+        .create_feed_channel("AUTO")
+        .await
+        .expect("failed to create feed channel");
+
+    assert!(
+        client.setup_feed(channel_id, &[]).await.is_err(),
+        "an empty event type list must be refused"
+    );
+    assert_eq!(
+        server
+            .received()
+            .iter()
+            .filter(|m| m["type"] == "FEED_SETUP")
+            .count(),
+        0,
+        "a refused setup still went out"
     );
 
     client.disconnect().await.expect("failed to disconnect");

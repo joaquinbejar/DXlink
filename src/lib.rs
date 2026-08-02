@@ -12,8 +12,8 @@
 //! - Market events decoded from the `COMPACT` wire format: **`Quote`, `Trade`
 //!   and `Greeks`**.
 //! - Both delivery styles: a per-symbol callback and a single event stream.
-//! - `Candle` subscriptions carry `from_time` to the wire, so historical data
-//!   can be requested — but the rows that come back are not decoded yet.
+//! - Historical data via `from_time` on a subscription, for event types this
+//!   client can decode.
 //! - Typed errors ([`DXLinkError`]) with [`DXLinkError::is_terminal`] to tell a
 //!   lost connection from one bad message.
 //! - Strict decoding: [`try_parse_compact_data`] reports a short row, a wrong
@@ -27,8 +27,10 @@
 //! - **No reconnection.** If the connection drops, the client reports the error
 //!   and stops; re-establishing the session is the caller's job.
 //! - [`EventType`] declares more variants than the library can decode. Only
-//!   `Quote`, `Trade` and `Greeks` produce a [`MarketEvent`]; subscribing to any
-//!   other type is accepted by the server but never delivers events here.
+//!   `Quote`, `Trade` and `Greeks` produce a [`MarketEvent`], and configuring or
+//!   subscribing to any other type is **refused** rather than accepted into a
+//!   stream that can never produce. `Candle` included: historical requests come
+//!   back when its decoder lands.
 //!
 //! ## Minimum supported Rust version
 //!
@@ -134,12 +136,12 @@
 //!
 //! ## Working with historical data
 //!
-//! DXLink supports subscribing to historical data through Candle events.
-//! When subscribing to candle events, you specify the period, type, and a
-//! timestamp from which to fetch the data.
+//! DXLink supports subscribing to historical data through Candle events, by
+//! specifying the period, type, and a timestamp to fetch from.
 //!
-//! Note the subscription reaches the server, but `Candle` rows are not decoded
-//! into a [`MarketEvent`] yet, so nothing arrives on the stream for them:
+//! Note this client has no `Candle` decoder yet, so such a subscription is
+//! currently **refused**: it would otherwise be accepted and then deliver
+//! nothing. The shape of the request is:
 //!
 //! ```rust,no_run
 //! use dxlink::FeedSubscription;
@@ -367,6 +369,6 @@ mod utils;
 
 pub use client::DXLinkClient;
 pub use error::DXLinkError;
-pub use events::{EventType, MarketEvent};
+pub use events::{ALL_EVENT_TYPES, EventType, MarketEvent};
 pub use messages::FeedSubscription;
 pub use utils::{parse_compact_data, try_parse_compact_data};

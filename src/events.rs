@@ -97,6 +97,30 @@ impl From<&str> for EventType {
     }
 }
 
+/// Every event type the protocol declares.
+///
+/// Written out by hand, which an added variant does **not** force anyone to
+/// update — the array still compiles while missing it. What catches that is the
+/// round-trip test below, which walks this list and would stop covering a new
+/// variant, so the list and the test have to be updated together.
+pub const ALL_EVENT_TYPES: [EventType; 15] = [
+    EventType::Quote,
+    EventType::Trade,
+    EventType::Summary,
+    EventType::Profile,
+    EventType::Order,
+    EventType::TimeAndSale,
+    EventType::Candle,
+    EventType::TradeETH,
+    EventType::SpreadOrder,
+    EventType::Greeks,
+    EventType::TheoPrice,
+    EventType::Underlying,
+    EventType::Series,
+    EventType::Configuration,
+    EventType::Message,
+];
+
 impl std::str::FromStr for EventType {
     type Err = crate::DXLinkError;
 
@@ -803,5 +827,42 @@ mod tests {
             }
             _ => panic!("Expected CompactData::Values"),
         }
+    }
+}
+
+#[cfg(test)]
+mod wire_name_tests {
+    use super::*;
+
+    /// Every declared type must survive Display then FromStr.
+    ///
+    /// This is what a maintainer adding an `EventType` variant has to update:
+    /// `from_wire_name` matches on `&str`, so a new variant compiles without it
+    /// and then fails this round trip.
+    #[test]
+    fn test_every_event_type_round_trips_through_its_wire_name() {
+        for event_type in ALL_EVENT_TYPES {
+            let name = event_type.to_string();
+            assert_eq!(
+                EventType::from_wire_name(&name),
+                Some(event_type),
+                "`{name}` does not parse back; from_wire_name is missing an arm"
+            );
+        }
+    }
+
+    /// The array itself must not silently fall behind the enum.
+    #[test]
+    fn test_all_event_types_covers_every_declared_name() {
+        // Each entry is distinct, so a copy-paste omission shows up as a
+        // duplicate or a short list rather than passing quietly.
+        let mut names: Vec<String> = ALL_EVENT_TYPES.iter().map(|e| e.to_string()).collect();
+        names.sort();
+        names.dedup();
+        assert_eq!(
+            names.len(),
+            ALL_EVENT_TYPES.len(),
+            "ALL_EVENT_TYPES contains a duplicate"
+        );
     }
 }

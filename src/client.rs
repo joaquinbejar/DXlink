@@ -6,7 +6,7 @@
 
 use crate::connection::{WebSocketConnection, sanitize_server_text};
 use crate::error::{DXLinkError, DXLinkResult};
-use crate::events::{CompactData, EventType, MarketEvent};
+use crate::events::{ALL_EVENT_TYPES, CompactData, EventType, MarketEvent};
 use crate::messages::{
     AuthMessage, AuthStateMessage, BaseMessage, ChannelRequestMessage, ErrorMessage,
     FeedConfigMessage, FeedDataMessage, FeedSetupMessage, FeedSubscription,
@@ -216,17 +216,19 @@ type ChannelSchema = HashMap<String, Vec<String>>;
 type ChannelSchemas = Arc<Mutex<HashMap<u32, ChannelSchema>>>;
 
 /// The COMPACT field lists this client requests for a set of event types.
+/// Callers reach this only after refusing types with no decoder, so a type
+/// without one is skipped rather than given the two-field fallback that made
+/// the old half-configured behaviour possible.
 fn requested_fields(event_types: &[EventType]) -> ChannelSchema {
     event_types
         .iter()
-        .map(|event_type| {
+        .filter_map(|event_type| {
             let fields = event_type
-                .compact_fields()
-                .unwrap_or(&["eventType", "eventSymbol"])
+                .compact_fields()?
                 .iter()
                 .map(|f| (*f).to_string())
                 .collect();
-            (event_type.to_string(), fields)
+            Some((event_type.to_string(), fields))
         })
         .collect()
 }
@@ -287,16 +289,56 @@ fn validate_feed_config(
     Ok(())
 }
 
+/// The event types this client can turn into a [`MarketEvent`], for error text.
+fn decodable_type_names() -> String {
+    ALL_EVENT_TYPES
+        .iter()
+        .filter(|event_type| event_type.compact_fields().is_some())
+        .map(|event_type| event_type.to_string())
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 /// Parses every subscription's event type, rejecting the whole batch if any is
 /// unknown.
 ///
 /// All or nothing on purpose: sending half a batch and recording the other half
 /// leaves the client and the server disagreeing about what is subscribed, which
 /// is worse than refusing the call.
-fn parse_subscription_types(subscriptions: &[FeedSubscription]) -> DXLinkResult<Vec<EventType>> {
+fn parse_subscription_types(
+    subscriptions: &[FeedSubscription],
+    channel_id: u32,
+    configured: &ChannelSchema,
+) -> DXLinkResult<Vec<EventType>> {
     subscriptions
         .iter()
-        .map(|sub| sub.event_type.parse::<EventType>())
+        .map(|sub| {
+            let event_type = sub.event_type.parse::<EventType>()?;
+
+            if event_type.compact_fields().is_none() {
+                return Err(DXLinkError::Protocol(format!(
+                    "this client cannot decode {event_type} events, so subscribing `{}` to \
+                     them would return nothing. Decoded types: {}",
+                    sub.symbol,
+                    decodable_type_names()
+                )));
+            }
+
+            // Decodable is not enough: the layout has to be one this channel
+            // negotiated. Subscribing Trade on a Quote-configured channel used
+            // to pass, and the reader's channel-level gate then decoded Trade
+            // rows against a layout that was never agreed.
+            if !configured.contains_key(&event_type.to_string()) {
+                return Err(DXLinkError::Protocol(format!(
+                    "channel {channel_id} was not configured for {event_type}; call \
+                     setup_feed with it before subscribing `{}`. Configured: {}",
+                    sub.symbol,
+                    configured.keys().cloned().collect::<Vec<_>>().join(", ")
+                )));
+            }
+
+            Ok(event_type)
+        })
         .collect()
 }
 
@@ -1340,18 +1382,30 @@ impl DXLinkClient {
         // Validate channel exists and is a FEED channel
         self.validate_channel(channel_id, "FEED")?;
 
+        if event_types.is_empty() {
+            return Err(DXLinkError::Protocol(format!(
+                "setup_feed on channel {channel_id} needs at least one event type; an empty \
+                 configuration subscribes to nothing and can never deliver"
+            )));
+        }
+
         // Create event fields
         let mut accept_event_fields = HashMap::new();
 
         for event_type in event_types {
-            // One source of truth: the same list validates the server's reply
-            // and drives the decoder stride.
-            let fields: Vec<String> = event_type
-                .compact_fields()
-                .unwrap_or(&["eventType", "eventSymbol"])
-                .iter()
-                .map(|f| (*f).to_string())
-                .collect();
+            // Refuse rather than half-configure. The wildcard this replaces
+            // requested only eventType and eventSymbol for anything without a
+            // decoder, so the server accepted the setup, accepted the
+            // subscription, and then nothing ever arrived: an empty stream that
+            // looks exactly like a quiet market.
+            let Some(fields) = event_type.compact_fields() else {
+                return Err(DXLinkError::Protocol(format!(
+                    "this client cannot decode {event_type} events, so configuring channel \
+                     {channel_id} for them would deliver nothing. Decoded types: {}",
+                    decodable_type_names()
+                )));
+            };
+            let fields: Vec<String> = fields.iter().map(|f| (*f).to_string()).collect();
 
             accept_event_fields.insert(event_type.to_string(), fields);
         }
@@ -1427,7 +1481,13 @@ impl DXLinkClient {
         // Reject before sending, not after. A misspelled type used to go out on
         // the wire verbatim while being recorded locally as Quote, so the client
         // believed in a subscription it had never made.
-        let parsed = parse_subscription_types(&subscriptions)?;
+        let configured = recover(&self.channel_schemas).get(&channel_id).cloned();
+        let configured = configured.ok_or_else(|| {
+            DXLinkError::Channel(format!(
+                "channel {channel_id} has no validated feed configuration; call setup_feed first"
+            ))
+        })?;
+        let parsed = parse_subscription_types(&subscriptions, channel_id, &configured)?;
 
         let subscription_msg = FeedSubscriptionMessage {
             channel: channel_id,
@@ -1472,7 +1532,13 @@ impl DXLinkClient {
         self.validate_channel(channel_id, "FEED")?;
 
         // Update internal subscriptions tracking
-        let parsed = parse_subscription_types(&subscriptions)?;
+        let configured = recover(&self.channel_schemas).get(&channel_id).cloned();
+        let configured = configured.ok_or_else(|| {
+            DXLinkError::Channel(format!(
+                "channel {channel_id} has no validated feed configuration; call setup_feed first"
+            ))
+        })?;
+        let parsed = parse_subscription_types(&subscriptions, channel_id, &configured)?;
         let symbols: Vec<String> = subscriptions.iter().map(|s| s.symbol.clone()).collect();
 
         let subscription_msg = FeedSubscriptionMessage {
