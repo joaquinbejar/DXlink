@@ -36,3 +36,26 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --workspace --all-features
+
+  # RustSec advisory scan. Cargo.lock is deliberately not committed for this
+  # library, so the graph is resolved fresh here: this is what a consumer
+  # actually gets, not a snapshot pinned months ago.
+  #
+  # Advisory exceptions: none are configured, and an unsoundness or memory
+  # corruption advisory must never be ignored. If a non-exploitable advisory
+  # ever needs to be waived, add it to a `[advisories] ignore` list in
+  # `audit.toml` together with the RUSTSEC id, the reason, and a review date no
+  # more than 90 days out. An entry past its review date is a bug, not a policy.
+  audit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install cargo-audit
+        run: cargo install --locked cargo-audit --version ^0.22
+      - name: Resolve the dependency graph from scratch
+        run: cargo generate-lockfile
+      # Covers dev-dependencies too: a compromised test-only crate still runs
+      # on CI machines with repository credentials in scope.
+      - run: cargo audit --deny warnings
