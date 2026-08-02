@@ -52,6 +52,8 @@ pub enum Behaviour {
     MalformedSetup,
     /// Answer SETUP with a protocol ERROR frame.
     ErrorOnSetup,
+    /// Answer SETUP with an ERROR whose message echoes a credential back.
+    ErrorEchoingToken,
 }
 
 pub struct MockServer {
@@ -127,6 +129,18 @@ impl MockServer {
                     }
                     (Behaviour::MalformedSetup, "SETUP") => {
                         let _ = ws.send(Message::Text("not json at all".into())).await;
+                        continue;
+                    }
+                    (Behaviour::ErrorEchoingToken, "SETUP") => {
+                        let echoed = value["token"].as_str().unwrap_or("");
+                        let _ = ws
+                            .send(Message::Text(
+                                json!({"channel": 0, "type": "ERROR", "error": "UNAUTHORIZED",
+                                       "message": format!("rejected token {echoed}")})
+                                .to_string()
+                                .into(),
+                            ))
+                            .await;
                         continue;
                     }
                     (Behaviour::ErrorOnSetup, "SETUP") => {

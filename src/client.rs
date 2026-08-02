@@ -4,7 +4,7 @@
    Date: 7/3/25
 ******************************************************************************/
 
-use crate::connection::WebSocketConnection;
+use crate::connection::{WebSocketConnection, sanitize_server_text};
 use crate::error::{DXLinkError, DXLinkResult};
 use crate::events::{CompactData, EventType, MarketEvent};
 use crate::messages::{
@@ -31,9 +31,19 @@ const DEFAULT_KEEPALIVE_TIMEOUT: u32 = 60;
 /// send a keep-alive message at least this often to maintain the connection.
 const DEFAULT_KEEPALIVE_INTERVAL: u32 = 15;
 
-/// Default client version string.  This is used to identify the client
-/// software version to the server.
-const DEFAULT_CLIENT_VERSION: &str = "1.0.2-dxlink-0.1.3";
+/// The `version` advertised in `SETUP`.
+///
+/// The specification's format is `<protocol-version>-<implementation>/<client-version>`
+/// (for example `0.1-js/1.0.0`): protocol `0.1`, this implementation identified
+/// as `dxlink-rs`, and the crate version.
+///
+/// Built from `CARGO_PKG_VERSION` at compile time so bumping the crate updates
+/// what the server sees without a second edit. The previous hardcoded
+/// `1.0.2-dxlink-0.1.3` named a crate version three releases stale and did not
+/// follow the format, which leaves a client unidentifiable in server-side
+/// diagnostics. `concat!` needs literals, so the protocol and implementation
+/// tokens are spelled out here rather than composed from constants.
+const DEFAULT_CLIENT_VERSION: &str = concat!("0.1-dxlink-rs/", env!("CARGO_PKG_VERSION"));
 
 /// How long any single handshake response may take before `connect()` gives up.
 ///
@@ -126,8 +136,12 @@ async fn expect_handshake_message(
 
     // A server ERROR here is the server telling us why, not an unexpected frame.
     if received_type == "ERROR" {
-        let code = value["error"].as_str().unwrap_or("unknown");
-        let message = value["message"].as_str().unwrap_or("");
+        // Both fields are free text chosen by the server and end up in an error
+        // the caller will very likely log, so they get the same treatment as a
+        // close reason: a server echoing the token back must not turn our own
+        // error reporting into a credential leak.
+        let code = sanitize_server_text(value["error"].as_str().unwrap_or("unknown"));
+        let message = sanitize_server_text(value["message"].as_str().unwrap_or(""));
         let detail = format!("during {state}, the server returned {code}: {message}");
         return Err(if code.eq_ignore_ascii_case("UNAUTHORIZED") {
             DXLinkError::Authentication(detail)
@@ -1361,5 +1375,38 @@ mod tests {
             Err(DXLinkError::Connection(_)) => {}
             _ => panic!("Expected Connection error"),
         }
+    }
+}
+
+#[cfg(test)]
+mod version_tests {
+    use super::DEFAULT_CLIENT_VERSION;
+
+    /// The exact string the server sees. Pinned because a malformed version is
+    /// invisible in normal operation and only shows up in someone else's
+    /// telemetry.
+    #[test]
+    fn test_setup_version_follows_the_spec_format() {
+        let (protocol_and_impl, client_version) = DEFAULT_CLIENT_VERSION
+            .split_once('/')
+            .expect("version must be <protocol>-<implementation>/<client-version>");
+
+        let (protocol, implementation) = protocol_and_impl
+            .split_once('-')
+            .expect("the part before / must be <protocol>-<implementation>");
+
+        assert_eq!(protocol, "0.1", "protocol version token");
+        assert_eq!(implementation, "dxlink-rs", "implementation token");
+
+        // Bumping Cargo.toml must move this without another edit.
+        assert_eq!(
+            client_version,
+            env!("CARGO_PKG_VERSION"),
+            "the advertised version must be the crate version"
+        );
+        assert!(
+            !client_version.is_empty() && client_version.contains('.'),
+            "prerelease and normal versions alike are carried verbatim: {client_version}"
+        );
     }
 }

@@ -33,7 +33,7 @@ const MAX_CLOSE_REASON_LEN: usize = 120;
 /// of short words; anything longer has the shape of a credential.
 const MAX_CLOSE_REASON_WORD_LEN: usize = 32;
 
-/// Returns a close reason that is safe to log and to embed in an error.
+/// Returns server-supplied text that is safe to log and to embed in an error.
 ///
 /// The reason is free text chosen by the server, and it reaches both the logs
 /// and [`DXLinkError::Connection`]. The close path is also the authentication
@@ -41,7 +41,7 @@ const MAX_CLOSE_REASON_WORD_LEN: usize = 32;
 /// error reporting into a credential leak. Control characters are dropped, runs
 /// too long to be a word are masked with [`REDACTED_PLACEHOLDER`], and the
 /// result is truncated. The close code is a protocol enum and is always kept.
-fn sanitize_close_reason(reason: &str) -> String {
+pub(crate) fn sanitize_server_text(reason: &str) -> String {
     let printable: String = reason.chars().filter(|c| !c.is_control()).collect();
 
     let masked = printable
@@ -238,7 +238,7 @@ impl WebSocketConnection {
                         Some(frame) => format!(
                             "code {}, reason: {}",
                             frame.code,
-                            sanitize_close_reason(&frame.reason)
+                            sanitize_server_text(&frame.reason)
                         ),
                         None => "no close frame".to_string(),
                     };
@@ -846,19 +846,19 @@ mod redaction_tests {
     }
 
     #[test]
-    fn test_sanitize_close_reason_keeps_ordinary_text() {
+    fn test_sanitize_server_text_keeps_ordinary_text() {
         // The diagnostic value of a close reason is the whole point of keeping
         // it, so normal wording must survive untouched.
         assert_eq!(
-            sanitize_close_reason("invalid token, please re-authenticate"),
+            sanitize_server_text("invalid token, please re-authenticate"),
             "invalid token, please re-authenticate"
         );
     }
 
     #[test]
-    fn test_sanitize_close_reason_masks_credential_shaped_runs() {
+    fn test_sanitize_server_text_masks_credential_shaped_runs() {
         let token = "a".repeat(64);
-        let sanitized = sanitize_close_reason(&format!("rejected token {token} for user bob"));
+        let sanitized = sanitize_server_text(&format!("rejected token {token} for user bob"));
 
         assert!(!sanitized.contains(&token), "token survived: {sanitized}");
         assert!(sanitized.contains(REDACTED_PLACEHOLDER));
@@ -868,8 +868,8 @@ mod redaction_tests {
     }
 
     #[test]
-    fn test_sanitize_close_reason_drops_control_characters() {
-        let sanitized = sanitize_close_reason("bad\u{0}token\nsecond line\u{7}");
+    fn test_sanitize_server_text_drops_control_characters() {
+        let sanitized = sanitize_server_text("bad\u{0}token\nsecond line\u{7}");
 
         assert!(!sanitized.contains('\u{0}'));
         assert!(!sanitized.contains('\u{7}'));
@@ -877,18 +877,18 @@ mod redaction_tests {
     }
 
     #[test]
-    fn test_sanitize_close_reason_is_bounded() {
+    fn test_sanitize_server_text_is_bounded() {
         // Many short words: nothing is credential-shaped, so only the overall
         // length limit applies.
         let long = "word ".repeat(200);
-        let sanitized = sanitize_close_reason(&long);
+        let sanitized = sanitize_server_text(&long);
 
         assert_eq!(sanitized.chars().count(), MAX_CLOSE_REASON_LEN);
     }
 
     #[test]
-    fn test_sanitize_close_reason_handles_empty_input() {
-        assert_eq!(sanitize_close_reason(""), "");
+    fn test_sanitize_server_text_handles_empty_input() {
+        assert_eq!(sanitize_server_text(""), "");
     }
 
     /// A `MakeWriter` that captures log output into a shared buffer so tests

@@ -280,3 +280,22 @@ async fn test_failed_handshake_leaves_the_client_disconnected() {
         .await
         .expect("disconnect after a failed handshake should be safe");
 }
+
+/// A server that echoes the credential back in its error message must not get
+/// it into an error the caller will log.
+#[tokio::test]
+async fn test_handshake_error_cannot_leak_an_echoed_token() {
+    let token = "tastytrade-live-bearer-token-long-enough-to-be-a-secret";
+    let server = MockServer::start(Behaviour::ErrorEchoingToken).await;
+    let mut client = DXLinkClient::new(&server.url(), token);
+
+    let err = client
+        .connect()
+        .await
+        .expect_err("the server rejected the handshake");
+
+    let text = err.to_string();
+    assert!(!text.contains(token), "token leaked into the error: {text}");
+    // The actionable part survives.
+    assert!(text.contains("UNAUTHORIZED"), "error code lost: {text}");
+}
