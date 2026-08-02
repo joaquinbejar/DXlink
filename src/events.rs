@@ -182,10 +182,10 @@ impl EventType {
     /// The COMPACT field list this client requests for the event type, in the
     /// exact order the decoder reads it.
     ///
-    /// This is what `setup_feed` requests and what the `FEED_CONFIG` reply is
-    /// validated against. The decoder in `utils.rs` still carries its own
-    /// positions, so the contract is not yet enforced from one definition —
-    /// moving the decoder onto this list is the next step.
+    /// This is what `setup_feed` requests, what the `FEED_CONFIG` reply is
+    /// validated against, and what drives the decoder's stride in `utils.rs` —
+    /// one definition, so the request and the layout being read cannot drift
+    /// apart.
     ///
     /// `None` means this client has no decoder for the type: it can be named,
     /// but no row can be turned into a [`MarketEvent`](crate::MarketEvent).
@@ -236,6 +236,30 @@ impl EventType {
                 "impVolatility",
                 "openInterest",
             ]),
+            EventType::TimeAndSale => Some(&[
+                "eventType",
+                "eventSymbol",
+                "eventTime",
+                "eventFlags",
+                "index",
+                "time",
+                "timeNanoPart",
+                "sequence",
+                "exchangeCode",
+                "price",
+                "size",
+                "bidPrice",
+                "askPrice",
+                "exchangeSaleConditions",
+                "tradeThroughExempt",
+                "aggressorSide",
+                "spreadLeg",
+                "extendedTradingHours",
+                "validTick",
+                "type",
+                "buyer",
+                "seller",
+            ]),
             EventType::Greeks => Some(&[
                 "eventType",
                 "eventSymbol",
@@ -249,7 +273,6 @@ impl EventType {
             // Declared by the protocol, not decoded here.
             EventType::Profile
             | EventType::Order
-            | EventType::TimeAndSale
             | EventType::TradeETH
             | EventType::SpreadOrder
             | EventType::TheoPrice
@@ -599,6 +622,105 @@ pub struct SummaryEvent {
     pub open_interest: f64,
 }
 
+/// One execution as it printed, with the quote that stood around it.
+///
+/// Every field the dxFeed AsyncAPI schema defines for a trade print, in the
+/// order the client requests them. The metadata is the reason to use this
+/// instead of `Trade`: `exchange_sale_conditions` and `sale_type` say whether a
+/// print is eligible for the consolidated tape or is a correction of an earlier
+/// one, and `valid_tick` says whether it should move the last price at all.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TimeAndSaleEvent {
+    /// The type of the event, `TimeAndSale`.
+    #[serde(rename = "eventType")]
+    pub event_type: String,
+
+    /// The symbol that traded.
+    #[serde(rename = "eventSymbol")]
+    pub event_symbol: String,
+
+    /// When the server emitted the event, as epoch milliseconds.
+    #[serde(rename = "eventTime")]
+    pub event_time: i64,
+
+    /// Transactional and snapshot bits for this print.
+    ///
+    /// Time and sale is an indexed event, so a subscription with `fromTime`
+    /// replays history as a snapshot delimited by these flags.
+    #[serde(rename = "eventFlags")]
+    pub event_flags: i64,
+
+    /// Unique index of the print, ordering it within the stream.
+    pub index: i64,
+
+    /// When the print happened, as epoch milliseconds.
+    pub time: i64,
+
+    /// Sub-millisecond part of `time`, in nanoseconds.
+    #[serde(rename = "timeNanoPart")]
+    pub time_nano_part: i64,
+
+    /// Sequence number, separating prints that share a millisecond.
+    pub sequence: i64,
+
+    /// Exchange the print came from, as its single-character code.
+    #[serde(rename = "exchangeCode")]
+    pub exchange_code: String,
+
+    /// Execution price.
+    #[serde(with = "json_double")]
+    pub price: f64,
+
+    /// Executed size.
+    #[serde(with = "json_double")]
+    pub size: f64,
+
+    /// Bid at the time of the print, `NaN` when it was not known.
+    #[serde(rename = "bidPrice", with = "json_double")]
+    pub bid_price: f64,
+
+    /// Ask at the time of the print, `NaN` when it was not known.
+    #[serde(rename = "askPrice", with = "json_double")]
+    pub ask_price: f64,
+
+    /// Sale conditions the exchange reported, as their raw codes.
+    #[serde(rename = "exchangeSaleConditions")]
+    pub exchange_sale_conditions: String,
+
+    /// Trade-through exempt flag, as the single-character regulatory code.
+    #[serde(rename = "tradeThroughExempt")]
+    pub trade_through_exempt: String,
+
+    /// Which side initiated the trade: `Buy`, `Sell` or `Undefined`.
+    #[serde(rename = "aggressorSide")]
+    pub aggressor_side: String,
+
+    /// Whether the print is one leg of a spread.
+    #[serde(rename = "spreadLeg")]
+    pub spread_leg: bool,
+
+    /// Whether the print happened outside regular trading hours.
+    #[serde(rename = "extendedTradingHours")]
+    pub extended_trading_hours: bool,
+
+    /// Whether the print is eligible to update the last price.
+    #[serde(rename = "validTick")]
+    pub valid_tick: bool,
+
+    /// Whether this is a new print, a correction, or a cancellation.
+    ///
+    /// Named `sale_type` because the wire name `type` is a Rust keyword; the
+    /// serialized field is still `type`.
+    #[serde(rename = "type")]
+    pub sale_type: String,
+
+    /// Buying party, when the venue discloses it.
+    pub buyer: String,
+
+    /// Selling party, when the venue discloses it.
+    pub seller: String,
+}
+
 /// Represents a market event, which can be a quote, trade, or greeks event.
 ///
 /// This enum uses `serde`'s untagged enum serialization, meaning that the serialized
@@ -668,13 +790,15 @@ pub enum MarketEvent {
     /// A daily summary: open, extremes and the previous close.
     Summary(SummaryEvent),
     /// One OHLC bar, from a historical or streaming candle subscription.
+    Candle(CandleEvent),
+    /// One execution as it printed, with the surrounding quote.
     ///
     /// New variants go last on purpose: `MarketEvent` is `#[serde(untagged)]`,
     /// so serde tries them in declaration order and keeps the first that
     /// deserializes. Appending leaves every variant already in the list
     /// matching exactly as it did. Each type has a round-trip test that would
     /// catch one variant stealing another's payload.
-    Candle(CandleEvent),
+    TimeAndSale(TimeAndSaleEvent),
 }
 
 /// Represents compact data, which can be either an event type (string) or a vector of JSON values.
