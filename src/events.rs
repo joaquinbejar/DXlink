@@ -229,12 +229,15 @@ impl EventType {
 
 /// Serde for DXLink's JSONDouble encoding.
 ///
+/// Crate-private: it exists to wire `#[serde(with = ...)]` on the event structs,
+/// and exposing it would commit the crate to supporting its surface forever.
+///
 /// JSON has no literal for a non-finite number, so the protocol sends them as
 /// the strings `"NaN"`, `"Infinity"` and `"-Infinity"`. These are ordinary
 /// values in market data, not anomalies: an option with no bid has a `NaN`
 /// price. Deriving plain `f64` meant such a payload failed to deserialize, and
 /// serializing one produced JSON the protocol does not accept.
-pub mod json_double {
+pub(crate) mod json_double {
     use serde::de::{Error, Unexpected};
     use serde::{Deserialize, Deserializer, Serializer};
     use serde_json::Value;
@@ -254,18 +257,33 @@ pub mod json_double {
         }
     }
 
+    /// Reads a JSONDouble from a JSON value.
+    ///
+    /// The one place the number-or-special-string mapping lives. Both this
+    /// module, which handles FULL payloads, and the COMPACT decoder in
+    /// `utils.rs` go through it, so a future addition to the protocol's set of
+    /// specials cannot be applied to one format and forgotten in the other.
+    pub(crate) fn from_value(value: &Value) -> Option<f64> {
+        if let Some(number) = value.as_f64() {
+            return Some(number);
+        }
+        match value.as_str()? {
+            "NaN" => Some(f64::NAN),
+            "Infinity" => Some(f64::INFINITY),
+            "-Infinity" => Some(f64::NEG_INFINITY),
+            _ => None,
+        }
+    }
+
     /// Accepts a JSON number or one of the protocol's non-finite strings.
     pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<f64, D::Error> {
         let value = Value::deserialize(deserializer)?;
 
-        if let Some(number) = value.as_f64() {
+        if let Some(number) = from_value(&value) {
             return Ok(number);
         }
 
         match value.as_str() {
-            Some("NaN") => Ok(f64::NAN),
-            Some("Infinity") => Ok(f64::INFINITY),
-            Some("-Infinity") => Ok(f64::NEG_INFINITY),
             Some(other) => Err(D::Error::invalid_value(
                 Unexpected::Str(other),
                 &"a number, or \"NaN\", \"Infinity\" or \"-Infinity\"",
