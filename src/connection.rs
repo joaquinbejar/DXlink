@@ -921,8 +921,10 @@ mod redaction_tests {
                 .with_max_level(tracing::Level::DEBUG)
                 .with_writer(buffer.clone())
                 .finish();
-            // Another test may have won the race; either way a subscriber that
-            // writes into this buffer is installed.
+            // If some other code already installed a global subscriber this call
+            // fails and the buffer stays empty. That is why the test asserts it
+            // captured something before asserting on the contents: it fails
+            // loudly rather than passing vacuously.
             let _ = tracing::subscriber::set_global_default(subscriber);
             buffer
         })
