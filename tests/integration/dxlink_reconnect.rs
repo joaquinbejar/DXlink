@@ -11,6 +11,7 @@ use dxlink::{
     ConnectionState, DXLinkClient, EventType, FeedSubscription, MarketEvent, ReconnectPolicy,
 };
 use std::time::Duration;
+use tokio::sync::broadcast;
 
 /// Fast and jitter-free, so a test asserts on behaviour rather than on timing.
 fn prompt_policy() -> ReconnectPolicy {
@@ -33,7 +34,7 @@ fn quote_sub(symbol: &str) -> FeedSubscription {
 
 /// Waits for a state, failing rather than hanging if it never comes.
 async fn wait_for_state(
-    states: &mut tokio::sync::mpsc::Receiver<ConnectionState>,
+    states: &mut broadcast::Receiver<ConnectionState>,
     what: &str,
     matches: impl Fn(&ConnectionState) -> bool,
 ) -> ConnectionState {
@@ -41,10 +42,15 @@ async fn wait_for_state(
     let deadline = std::time::Instant::now() + Duration::from_secs(40);
     loop {
         let remaining = deadline.saturating_duration_since(std::time::Instant::now());
-        let state = tokio::time::timeout(remaining, states.recv())
-            .await
-            .unwrap_or_else(|_| panic!("timed out waiting for {what}"))
-            .unwrap_or_else(|| panic!("the state stream closed before {what}"));
+        let state = match tokio::time::timeout(remaining, states.recv()).await {
+            Ok(Ok(state)) => state,
+            // Falling behind is not a failure, it is the documented behaviour.
+            Ok(Err(broadcast::error::RecvError::Lagged(_))) => continue,
+            Ok(Err(broadcast::error::RecvError::Closed)) => {
+                panic!("the state stream closed before {what}")
+            }
+            Err(_) => panic!("timed out waiting for {what}"),
+        };
         if matches(&state) {
             return state;
         }
@@ -72,6 +78,24 @@ async fn wait_until(
             "timed out waiting for {what}"
         );
         tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+/// Waits for the state stream to close, which is how a consumer learns the
+/// session is over for good. Lagged is skipped: falling behind is not closing.
+async fn expect_stream_closed(
+    states: &mut broadcast::Receiver<ConnectionState>,
+    within: Duration,
+    what: &str,
+) {
+    let deadline = std::time::Instant::now() + within;
+    loop {
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        match tokio::time::timeout(remaining, states.recv()).await {
+            Ok(Err(broadcast::error::RecvError::Closed)) => return,
+            Ok(Err(broadcast::error::RecvError::Lagged(_))) | Ok(Ok(_)) => continue,
+            Err(_) => panic!("{what}"),
+        }
     }
 }
 
@@ -314,13 +338,12 @@ async fn test_disconnect_cancels_a_running_backoff() {
         .expect("failed to disconnect");
 
     // The supervisor is gone, so its end of the state stream is closed.
-    assert!(
-        tokio::time::timeout(Duration::from_secs(5), states.recv())
-            .await
-            .expect("the state stream should close promptly")
-            .is_none(),
-        "the supervisor is still running after disconnect"
-    );
+    expect_stream_closed(
+        &mut states,
+        Duration::from_secs(5),
+        "the supervisor is still running after disconnect",
+    )
+    .await;
 }
 
 /// Sets up a session that is about to be dropped, returning the channel and the
@@ -332,7 +355,7 @@ async fn dropped_session(
     DXLinkClient,
     u32,
     tokio::sync::mpsc::Receiver<MarketEvent>,
-    tokio::sync::mpsc::Receiver<ConnectionState>,
+    broadcast::Receiver<ConnectionState>,
 ) {
     let mut client = DXLinkClient::new(&server.url(), "test-token");
     client.with_reconnect(policy);
@@ -513,13 +536,12 @@ async fn test_dropping_a_client_stops_a_supervisor_mid_attempt() {
     drop(client);
 
     // Well under the handshake deadline it would otherwise be sitting in.
-    assert!(
-        tokio::time::timeout(Duration::from_secs(3), states.recv())
-            .await
-            .expect("the supervisor was still inside its attempt after the client was dropped")
-            .is_none(),
-        "the supervisor outlived the client"
-    );
+    expect_stream_closed(
+        &mut states,
+        Duration::from_secs(3),
+        "the supervisor was still inside its attempt after the client was dropped",
+    )
+    .await;
     drop(events);
 }
 
@@ -548,13 +570,12 @@ async fn test_dropping_a_client_stops_its_supervisor() {
 
     // Both streams end because the supervisor was aborted and released the
     // senders it held. Without the Drop teardown it would still be sleeping.
-    assert!(
-        tokio::time::timeout(Duration::from_secs(5), states.recv())
-            .await
-            .expect("the state stream should close when the client is dropped")
-            .is_none(),
-        "the supervisor outlived the client"
-    );
+    expect_stream_closed(
+        &mut states,
+        Duration::from_secs(5),
+        "the state stream should close when the client is dropped",
+    )
+    .await;
     drop(events);
 }
 
@@ -583,4 +604,64 @@ async fn test_a_zero_delay_policy_does_not_spin() {
         ),
         other => panic!("expected Reconnecting, got {other:?}"),
     }
+}
+
+/// The property issue #60 is about: a consumer that does not read during a long
+/// reconnect loses the middle of it, not the end.
+///
+/// The old `mpsc` did the reverse — a full queue dropped the state being sent,
+/// so the buffer filled with early `Reconnecting` and the `GaveUp` that
+/// actually matters never arrived.
+#[tokio::test]
+async fn test_a_slow_consumer_loses_the_middle_not_the_end() {
+    let server = MockServer::start(Behaviour::RefuseAfterFirstSession).await;
+    // Far more attempts than the stream can hold, each refused at once because
+    // the server stops listening, so this overflows quickly.
+    let attempts = 40;
+    let (_client, _channel_id, _events, mut states) = dropped_session(
+        &server,
+        ReconnectPolicy {
+            initial_delay: Duration::from_millis(1),
+            max_delay: Duration::from_millis(1),
+            max_attempts: Some(attempts),
+            jitter: false,
+        },
+    )
+    .await;
+
+    // Deliberately not reading while the attempts pile up.
+    tokio::time::sleep(Duration::from_secs(5)).await;
+
+    let mut lagged = 0u64;
+    let mut seen = Vec::new();
+    // Bounded: with the old drop-the-newest behaviour the terminal state never
+    // arrives and the stream never closes, so an unbounded drain would hang
+    // instead of reporting.
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let outcome = loop {
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        match tokio::time::timeout(remaining, states.recv()).await {
+            Ok(Ok(ConnectionState::GaveUp { reason })) => break Some(reason),
+            Ok(Ok(state)) => seen.push(state),
+            Ok(Err(broadcast::error::RecvError::Lagged(missed))) => lagged += missed,
+            Ok(Err(broadcast::error::RecvError::Closed)) | Err(_) => break None,
+        }
+    };
+
+    let reason = outcome.unwrap_or_else(|| {
+        panic!(
+            "the terminal state never arrived, which is the whole defect: \
+             saw {} state(s) and missed {lagged}",
+            seen.len()
+        )
+    });
+    assert!(
+        reason.contains(&format!("after {attempts} attempt(s)")),
+        "the client should have stopped on its limit: {reason}"
+    );
+    assert!(
+        lagged > 0,
+        "the queue never overflowed, so this proves nothing: saw {} state(s)",
+        seen.len()
+    );
 }

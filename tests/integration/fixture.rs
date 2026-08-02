@@ -81,6 +81,10 @@ pub enum Behaviour {
     /// nothing, so a reconnect times out mid-handshake instead of failing to
     /// connect.
     SilentOnReconnect,
+    /// Serve one full session, hang up once the feed is subscribed, then stop
+    /// listening entirely so every reconnect is refused at once. Lets a test
+    /// run many fast attempts.
+    RefuseAfterFirstSession,
     /// Like `DropFirstSession`, but ignore `FEED_SETUP` on the second
     /// connection and answer normally on the third, so a replay times out
     /// partway and the next attempt has to rebuild from scratch.
@@ -363,6 +367,7 @@ impl MockServer {
                                         | Behaviour::RejectAuthOnReconnect
                                         | Behaviour::SilentOnReconnect
                                         | Behaviour::IgnoreFeedSetupOnReconnect
+                                        | Behaviour::RefuseAfterFirstSession
                                 ) && sessions_served == 1);
                         }
                         "CHANNEL_CANCEL" => responses.push(json!({
@@ -390,6 +395,12 @@ impl MockServer {
 
                     if close_after {
                         let _ = ws.send(Message::Close(None)).await;
+                        if behaviour == Behaviour::RefuseAfterFirstSession {
+                            // Dropping the listener with the task is the point:
+                            // every later connect is refused immediately rather
+                            // than waiting out a timeout.
+                            return;
+                        }
                         continue 'accept;
                     }
                 }
