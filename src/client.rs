@@ -70,6 +70,12 @@ const SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
 /// unrelated channel operations time out.
 const DELIVERY_QUEUE_CAPACITY: usize = 1024;
 
+/// How many connection-state changes to buffer for a consumer.
+///
+/// Small on purpose: a consumer that is not reading these does not want a
+/// backlog of them, and the supervisor must never block on one.
+const CONNECTION_STATE_CAPACITY: usize = 16;
+
 /// The main communication channel identifier. This is likely used for
 /// primary message exchange between client and server.
 const MAIN_CHANNEL: u32 = 0;
@@ -194,6 +200,843 @@ async fn expect_handshake_message(
     Ok(raw)
 }
 
+/// Clones the live connection out of a shared slot.
+fn live_connection(slot: &SharedConnection) -> DXLinkResult<WebSocketConnection> {
+    slot.lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone()
+        .ok_or_else(|| DXLinkError::Connection("Not connected to DXLink server".to_string()))
+}
+
+/// Spawns the maintenance task and returns its handle plus the channel that
+/// stops it.
+///
+/// Free-standing so both the initial connect and a reconnect build the same
+/// task, rather than a reconnect growing its own slightly different copy.
+fn spawn_keepalive(
+    connection: WebSocketConnection,
+    keepalive_interval: Duration,
+) -> (JoinHandle<()>, mpsc::Sender<()>) {
+    // Crear un canal para señales de cierre
+    let (tx, mut rx) = mpsc::channel::<()>(1);
+
+    let keepalive_handle = tokio::spawn(async move {
+        // Start one interval out: tokio's first tick is immediate, which
+        // fired a redundant KEEPALIVE the instant the session opened.
+        let mut interval = tokio::time::interval_at(
+            tokio::time::Instant::now() + keepalive_interval,
+            keepalive_interval,
+        );
+
+        loop {
+            tokio::select! {
+                _ = interval.tick() => {
+                    // Any outbound message resets the server's idle timer,
+                    // so traffic that already went out covers this beat.
+                    if connection.since_last_send() < keepalive_interval {
+                        debug!("Skipping keepalive, the socket was used recently");
+                        continue;
+                    }
+
+                    let keepalive_msg = KeepaliveMessage {
+                        channel: MAIN_CHANNEL,
+                        message_type: "KEEPALIVE".to_string(),
+                    };
+
+                    match connection.send(&keepalive_msg).await {
+                        Ok(_) => {
+                            debug!("Sent keepalive message");
+                        },
+                        Err(e) => {
+                            error!("Failed to send keepalive: {}", e);
+                            break;
+                        }
+                    }
+                }
+                _ = rx.recv() => {
+                    // Recibimos una señal para terminar
+                    debug!("Keepalive task received shutdown signal");
+                    break;
+                }
+            }
+        }
+
+        debug!("Keepalive task terminated");
+    });
+
+    (keepalive_handle, tx)
+}
+
+/// What the protocol reader needs to run one session.
+///
+/// A struct rather than eight positional arguments: the reader is spawned from
+/// two places now, and a swapped pair of `Arc`s there would be a silent routing
+/// bug rather than a type error.
+struct ReaderSetup {
+    connection: WebSocketConnection,
+    shutdown_keepalive: Option<mpsc::Sender<()>>,
+    delivery_tx: Sender<MarketEvent>,
+    disconnect_reason: Arc<Mutex<Option<String>>>,
+    response_requests: Arc<Mutex<Vec<ResponseRequest>>>,
+    channel_schemas: ChannelSchemas,
+    receive_deadline: Duration,
+    /// Told once, when the session dies of a terminal failure.
+    ///
+    /// `None` for a client with no reconnect policy, which is what keeps the
+    /// default behaviour exactly as it was: the task exits and nothing tries to
+    /// rebuild anything.
+    session_lost: Option<mpsc::Sender<String>>,
+}
+
+/// Spawns the task that reads the socket and routes protocol traffic.
+///
+/// Free-standing so the initial connect and a reconnect run the same reader
+/// rather than a reconnect growing its own slightly different copy.
+fn spawn_reader(setup: ReaderSetup) -> JoinHandle<()> {
+    let ReaderSetup {
+        connection,
+        shutdown_keepalive,
+        delivery_tx,
+        disconnect_reason,
+        response_requests,
+        channel_schemas,
+        receive_deadline,
+        session_lost,
+    } = setup;
+
+    tokio::spawn(async move {
+        // Set only where the session is actually over, which is not every error
+        // the loop can see: a malformed frame is not a dead socket.
+        #[allow(unused_assignments)]
+        let mut terminal_reason: Option<String> = None;
+        let mut dropped_events: u64 = 0;
+
+        loop {
+            let received = match connection.receive_with_timeout(receive_deadline).await {
+                Ok(Some(msg)) => Ok(msg),
+                Ok(None) => {
+                    // Silence past the advertised deadline means the peer is
+                    // gone even though the socket is still open. Terminal
+                    // here specifically: a bare read timeout is not terminal
+                    // in general, which is why this does not go through
+                    // is_terminal().
+                    let reason = DXLinkError::Timeout(format!(
+                        "no message received on channel {} for {}s, the connection is assumed dead",
+                        MAIN_CHANNEL,
+                        receive_deadline.as_secs()
+                    ));
+                    error!("{}", reason);
+                    record_reason(&disconnect_reason, &reason);
+                    terminal_reason = Some(reason.to_string());
+                    break;
+                }
+                Err(e) => Err(e),
+            };
+
+            match received {
+                Ok(msg) => {
+                    debug!("Received message: {}", msg);
+
+                    // Procesar el mensaje
+                    if let Ok(value) = serde_json::from_str::<serde_json::Value>(&msg) {
+                        // Identificar el tipo de mensaje
+                        let msg_type = value.get("type").and_then(|v| v.as_str()).unwrap_or("");
+                        let channel = value
+                            .get("channel")
+                            .and_then(|v| v.as_u64())
+                            .map(|c| c as u32);
+
+                        // Route to a waiter first. A channel-scoped ERROR
+                        // answers whatever operation is pending on that
+                        // channel, whichever success message it asked for:
+                        // otherwise the caller sat until its timeout while
+                        // the reason was only logged.
+                        {
+                            let mut delivered = false;
+                            {
+                                let mut requests = recover(&response_requests);
+                                let is_error = msg_type == "ERROR";
+
+                                while let Some(idx) = requests.iter().position(|req| {
+                                    let channel_matches =
+                                        req.channel_id.is_none() || req.channel_id == channel;
+                                    channel_matches
+                                        && (req.expected_type == msg_type
+                                            || (is_error && channel.is_some()))
+                                }) {
+                                    let request = requests.remove(idx);
+
+                                    let response = match msg_type {
+                                        "CHANNEL_OPENED" => {
+                                            ResponseType::ChannelOpened(channel.unwrap_or(0))
+                                        }
+                                        "FEED_CONFIG" => {
+                                            match serde_json::from_str::<FeedConfigMessage>(&msg) {
+                                                Ok(config) => {
+                                                    ResponseType::FeedConfig(Box::new(config))
+                                                }
+                                                Err(e) => ResponseType::Error(
+                                                    "MALFORMED_FEED_CONFIG".to_string(),
+                                                    e.to_string(),
+                                                ),
+                                            }
+                                        }
+                                        "CHANNEL_CLOSED" => {
+                                            ResponseType::ChannelClosed(channel.unwrap_or(0))
+                                        }
+                                        "ERROR" => {
+                                            let error = value
+                                                .get("error")
+                                                .and_then(|v| v.as_str())
+                                                .unwrap_or("unknown");
+                                            let message = value
+                                                .get("message")
+                                                .and_then(|v| v.as_str())
+                                                .unwrap_or("");
+                                            ResponseType::Error(
+                                                sanitize_server_text(error),
+                                                sanitize_server_text(message),
+                                            )
+                                        }
+                                        _ => ResponseType::Other(msg.clone()),
+                                    };
+
+                                    // A gone receiver means that caller
+                                    // already walked away. Keep looking
+                                    // rather than swallowing a response a
+                                    // live waiter is still owed.
+                                    if request.response_sender.send(response).is_ok() {
+                                        delivered = true;
+                                        break;
+                                    }
+                                    debug!("Dropping a stale response registration");
+                                }
+                            }
+
+                            if delivered {
+                                continue;
+                            }
+                        }
+
+                        // Si nadie esperaba este mensaje específicamente, procesarlo normalmente
+                        match msg_type {
+                            "FEED_CONFIG" => {
+                                // Nobody was waiting: this is the server
+                                // changing the layout mid-session, which the
+                                // spec allows. The decoder cannot follow it,
+                                // so the channel stops being decodable
+                                // rather than producing shifted values.
+                                if let Some(ch) = channel {
+                                    // Only a real disagreement invalidates.
+                                    // A server may resend an identical
+                                    // FEED_CONFIG, and treating that as a
+                                    // change would stop decoding a channel
+                                    // nothing had happened to.
+                                    let disagrees =
+                                        match serde_json::from_str::<FeedConfigMessage>(&msg) {
+                                            Ok(config) => {
+                                                let schemas = recover(&channel_schemas);
+                                                schemas.get(&ch).is_some_and(|stored| {
+                                                    config_disagrees(&config, stored)
+                                                })
+                                            }
+                                            // Unreadable is not agreement.
+                                            Err(_) => true,
+                                        };
+
+                                    if disagrees && recover(&channel_schemas).remove(&ch).is_some()
+                                    {
+                                        error!(
+                                            "Channel {} was reconfigured by the server; \
+                                                 its data will be dropped rather than decoded \
+                                                 against the old layout",
+                                            ch
+                                        );
+                                    }
+                                }
+                            }
+                            "FEED_DATA" => {
+                                // Only decode against a layout the server
+                                // agreed to.
+                                let decodable = channel
+                                    .map(|ch| recover(&channel_schemas).contains_key(&ch))
+                                    .unwrap_or(false);
+
+                                if !decodable {
+                                    debug!(
+                                        "Dropping FEED_DATA for channel {:?}: no validated layout",
+                                        channel
+                                    );
+                                } else if let Ok(data_msg) =
+                                    serde_json::from_str::<FeedDataMessage<Vec<CompactData>>>(&msg)
+                                {
+                                    // Hand off and keep reading. Delivery is
+                                    // somebody else's job: doing it here let
+                                    // one slow callback or a full consumer
+                                    // stream stop the socket reads that every
+                                    // channel operation depends on.
+                                    let decoded = match try_parse_compact_data(&data_msg.data) {
+                                        Ok(events) => events,
+                                        Err(e) => {
+                                            // Report it rather than
+                                            // delivering a partial batch
+                                            // that looks complete.
+                                            error!(
+                                                "Malformed COMPACT data on channel {:?}: {e}",
+                                                channel
+                                            );
+                                            continue;
+                                        }
+                                    };
+
+                                    for event in decoded {
+                                        match delivery_tx.try_send(event) {
+                                            Ok(()) => {}
+                                            Err(mpsc::error::TrySendError::Full(_)) => {
+                                                dropped_events += 1;
+                                                if dropped_events.is_power_of_two() {
+                                                    warn!(
+                                                        "Delivery queue full, {} event(s) dropped so far; \
+                                                             the consumer is slower than the feed",
+                                                        dropped_events
+                                                    );
+                                                }
+                                            }
+                                            Err(mpsc::error::TrySendError::Closed(_)) => {
+                                                // Delivery has stopped entirely, which is a
+                                                // different thing from falling behind and
+                                                // must not be reported as backpressure.
+                                                error!(
+                                                    "Delivery worker is gone; no further events \
+                                                         will reach callbacks or the stream"
+                                                );
+                                                break;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            "ERROR" => {
+                                if let Ok(error_msg) = serde_json::from_str::<ErrorMessage>(&msg) {
+                                    error!(
+                                        "Received error from server: {} - {}",
+                                        error_msg.error, error_msg.message
+                                    );
+                                }
+                            }
+                            "KEEPALIVE" => {
+                                // Simplemente registrar keepalives
+                                debug!("Received KEEPALIVE message");
+                            }
+                            _ => {
+                                debug!("Received unhandled message type: {}", msg_type);
+                            }
+                        }
+                    }
+                }
+                // The connection is gone: reading the same dead socket again
+                // can only fail, so stop instead of spinning forever.
+                Err(e) if e.is_terminal() => {
+                    error!("Connection lost, stopping message processing: {}", e);
+                    record_reason(&disconnect_reason, &e);
+                    terminal_reason = Some(e.to_string());
+                    break;
+                }
+                Err(e) => {
+                    error!("Error receiving message: {}", e);
+                    // A short pause so repeated errors do not flood the logs
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+            }
+        }
+
+        // This task only ever exits because the session is dead, so the
+        // socket is gone: stop writing to it as well.
+        if let Some(stop) = shutdown_keepalive {
+            let _ = stop.send(()).await;
+            debug!("Asked the keepalive task to stop, the session is dead");
+        }
+
+        // Tell the supervisor, if there is one. Sent after the keepalive has
+        // been asked to stop, so a rebuild never races the old session's writer.
+        if let (Some(tx), Some(reason)) = (session_lost, terminal_reason) {
+            let _ = tx.send(reason).await;
+        }
+    })
+}
+
+/// Sends `message` and waits for `expected_type` on `channel`, cleaning the
+/// registration up on every exit path.
+///
+/// The registration goes in *before* the send: the reader task is already
+/// running, so registering afterwards is a lost-wakeup race. A guard removes it
+/// on timeout, on send failure, and if the caller's future is dropped mid-wait,
+/// none of which used to clean up.
+///
+/// Free-standing so a reconnect can rebuild a session — reopen channels,
+/// reconfigure feeds, replay subscriptions — without a `&self` it does not have.
+#[allow(clippy::too_many_arguments)]
+async fn request_response<T: serde::Serialize>(
+    connection: &WebSocketConnection,
+    response_requests: &Arc<Mutex<Vec<ResponseRequest>>>,
+    next_request_id: &Arc<Mutex<u64>>,
+    message: &T,
+    operation: &str,
+    expected_type: &str,
+    channel: u32,
+    wait: Duration,
+) -> DXLinkResult<ResponseType> {
+    let (tx, rx) = oneshot::channel();
+
+    let id = {
+        let mut next = next_request_id
+            .lock()
+            .map_err(|_| DXLinkError::Unknown("request id lock poisoned".to_string()))?;
+        *next += 1;
+        *next
+    };
+
+    {
+        let mut requests = response_requests
+            .lock()
+            .map_err(|_| DXLinkError::Unknown("response request lock poisoned".to_string()))?;
+        requests.push(ResponseRequest {
+            id,
+            expected_type: expected_type.to_string(),
+            channel_id: Some(channel),
+            response_sender: tx,
+        });
+    }
+
+    let _guard = PendingGuard {
+        requests: Arc::clone(response_requests),
+        id,
+    };
+
+    connection.send(message).await?;
+
+    match tokio::time::timeout(wait, rx).await {
+        Ok(Ok(ResponseType::Error(code, message))) => {
+            let detail = format!(
+                "during {operation} on channel {channel}, waiting for {expected_type}, \
+                     the server returned {code}: {message}"
+            );
+            // Pick the variant from the code: an UNAUTHORIZED here means the
+            // same thing it means during the handshake, and collapsing it to
+            // Protocol would lose the terminal classification a caller needs
+            // to know it must re-authenticate rather than retry.
+            Err(match code.to_ascii_uppercase().as_str() {
+                "UNAUTHORIZED" => DXLinkError::Authentication(detail),
+                // The channel itself is the problem, as opposed to the
+                // action, which is a protocol violation and falls through.
+                "INVALID_CHANNEL" | "UNKNOWN_CHANNEL" => DXLinkError::Channel(detail),
+                "TIMEOUT" => DXLinkError::Timeout(detail),
+                _ => DXLinkError::Protocol(detail),
+            })
+        }
+        Ok(Ok(response)) => Ok(response),
+        Ok(Err(_)) => Err(DXLinkError::Protocol(format!(
+            "during {operation} on channel {channel}, the response channel closed"
+        ))),
+        Err(_) => Err(DXLinkError::Timeout(format!(
+            "timed out after {}s waiting for {expected_type} on channel {channel} during {operation}",
+            wait.as_secs()
+        ))),
+    }
+}
+
+/// Opens a socket and takes it through `SETUP` and `AUTH`.
+///
+/// Returns the live connection and the keepalive deadline the server
+/// negotiated, `None` when it did not name one. A zero is treated as "not
+/// negotiated" rather than trusted: it would schedule maintenance in a tight
+/// loop.
+///
+/// Every read is bounded and validated, and `connection` is dropped on any
+/// failure, so a partial handshake never leaves a half-established socket
+/// behind. Free-standing so a reconnect performs exactly the same handshake as
+/// the first connect.
+async fn handshake(
+    url: &str,
+    token: &str,
+    keepalive_timeout: u32,
+) -> DXLinkResult<(WebSocketConnection, Option<u32>)> {
+    let connection = WebSocketConnection::connect(url).await?;
+
+    let setup_msg = SetupMessage {
+        channel: MAIN_CHANNEL,
+        message_type: "SETUP".to_string(),
+        keepalive_timeout,
+        accept_keepalive_timeout: keepalive_timeout,
+        version: DEFAULT_CLIENT_VERSION.to_string(),
+    };
+
+    connection.send(&setup_msg).await?;
+
+    let response = expect_handshake_message(&connection, "SETUP", "SETUP", MAIN_CHANNEL).await?;
+    let server_setup: ServerSetupMessage = serde_json::from_str(&response)?;
+    debug!(
+        "Server SETUP: version={:?}, keepaliveTimeout={:?}",
+        server_setup.version, server_setup.keepalive_timeout
+    );
+    let negotiated = server_setup.keepalive_timeout.filter(|t| *t > 0);
+
+    let response =
+        expect_handshake_message(&connection, "SETUP", "AUTH_STATE", MAIN_CHANNEL).await?;
+    let auth_state: AuthStateMessage = serde_json::from_str(&response)?;
+
+    // Already authorized means the token was accepted on the connection.
+    if auth_state.state == "AUTHORIZED" {
+        info!("Already authorized to DXLink server");
+    } else if auth_state.state == "UNAUTHORIZED" {
+        let auth_msg = AuthMessage {
+            channel: MAIN_CHANNEL,
+            message_type: "AUTH".to_string(),
+            token: token.to_string(),
+        };
+
+        connection.send(&auth_msg).await?;
+
+        let response =
+            expect_handshake_message(&connection, "AUTH", "AUTH_STATE", MAIN_CHANNEL).await?;
+        let auth_state: AuthStateMessage = serde_json::from_str(&response)?;
+
+        if auth_state.state != "AUTHORIZED" {
+            return Err(DXLinkError::Authentication(format!(
+                "during AUTH, the server reported state {} instead of AUTHORIZED",
+                auth_state.state
+            )));
+        }
+
+        info!("Successfully authenticated to DXLink server");
+    } else {
+        return Err(DXLinkError::Protocol(format!(
+            "during SETUP, the server reported an unknown authentication state: {}",
+            auth_state.state
+        )));
+    }
+
+    info!("Successfully connected to DXLink server");
+
+    Ok((connection, negotiated))
+}
+
+/// How the client should behave when a live session dies.
+///
+/// **Reconnection is off unless this is installed** with
+/// [`DXLinkClient::with_reconnect`]. The library does not retry behind a
+/// consumer's back: a hidden policy is the kind of behaviour that turns one
+/// outage into a thundering herd.
+#[derive(Debug, Clone)]
+pub struct ReconnectPolicy {
+    /// Wait before the first attempt. Doubles each attempt after that.
+    pub initial_delay: Duration,
+    /// Ceiling for the backoff, so it stops doubling somewhere.
+    pub max_delay: Duration,
+    /// How many attempts before giving up. `None` retries forever.
+    pub max_attempts: Option<u32>,
+    /// Spread the delay over `[0, delay]` instead of using it exactly.
+    ///
+    /// On for good reason: without it, every client an outage knocked over
+    /// comes back at the same instant.
+    pub jitter: bool,
+}
+
+impl Default for ReconnectPolicy {
+    fn default() -> Self {
+        Self {
+            initial_delay: Duration::from_secs(1),
+            max_delay: Duration::from_secs(30),
+            max_attempts: None,
+            jitter: true,
+        }
+    }
+}
+
+impl ReconnectPolicy {
+    /// The delay before `attempt`, counting from 1.
+    ///
+    /// `seed` is only read when jitter is on; the caller advances it so a run
+    /// of attempts does not repeat the same spread.
+    fn delay_for(&self, attempt: u32, seed: &mut u64) -> Duration {
+        // Saturating rather than wrapping: a long outage must not fold the
+        // backoff back round to zero and start hammering.
+        let factor = 2u32.saturating_pow(attempt.saturating_sub(1).min(31));
+        let delay = self
+            .initial_delay
+            .saturating_mul(factor)
+            .min(self.max_delay);
+
+        if !self.jitter {
+            return delay;
+        }
+
+        // xorshift64: enough spread to break up a herd, and no dependency.
+        *seed ^= *seed << 13;
+        *seed ^= *seed >> 7;
+        *seed ^= *seed << 17;
+        let nanos = delay.as_nanos() as u64;
+        if nanos == 0 {
+            return delay;
+        }
+        Duration::from_nanos(*seed % nanos.saturating_add(1))
+    }
+}
+
+/// What happened to the connection.
+///
+/// Delivered on its own stream rather than through [`MarketEvent`]: a
+/// connection event is not market data, and a consumer matching on market
+/// events should not have to care that this exists.
+///
+/// `#[non_exhaustive]`: a future state must not break a downstream match.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ConnectionState {
+    /// The session died. Carries the reason, the same text
+    /// [`DXLinkClient::disconnect_reason`] reports.
+    Lost {
+        /// Why the session ended.
+        reason: String,
+    },
+    /// About to try again, after waiting `delay`.
+    Reconnecting {
+        /// Attempt number, counting from 1.
+        attempt: u32,
+        /// How long the client waited before this attempt.
+        delay: Duration,
+    },
+    /// The session is live again, with every channel and subscription replayed.
+    Reconnected,
+    /// No more attempts will be made, and the event stream is closing.
+    GaveUp {
+        /// Why the client stopped trying.
+        reason: String,
+    },
+}
+
+/// The shared state a reconnect needs to rebuild a session.
+///
+/// Every field is a handle to state the client also holds, so a rebuild is
+/// visible to the caller's `subscriptions()` and `disconnect()` without any
+/// copying back.
+#[derive(Clone)]
+struct ReconnectContext {
+    url: String,
+    token: String,
+    keepalive_timeout: u32,
+    connection: SharedConnection,
+    channels: Arc<Mutex<HashMap<u32, String>>>,
+    channel_contracts: Arc<Mutex<HashMap<u32, String>>>,
+    channel_schemas: ChannelSchemas,
+    subscriptions: Arc<Mutex<SubscriptionBook>>,
+    response_requests: Arc<Mutex<Vec<ResponseRequest>>>,
+    next_request_id: Arc<Mutex<u64>>,
+    disconnect_reason: Arc<Mutex<Option<String>>>,
+    delivery_tx: Sender<MarketEvent>,
+}
+
+/// Rebuilds a session on the connection that is already installed: reopens
+/// every known channel, reconfigures its feed, and replays its subscriptions.
+///
+/// Order matters. Channels come back before their feeds, feeds before their
+/// subscriptions, and subscriptions go out in the order the consumer asked for
+/// them, because a server applying them in sequence would otherwise see a
+/// different session than the one that was lost.
+async fn replay_session(ctx: &ReconnectContext) -> DXLinkResult<()> {
+    let connection = live_connection(&ctx.connection)?;
+
+    // Snapshot under the lock, then release it: everything below awaits.
+    let known: Vec<(u32, String, String)> = {
+        let channels = recover(&ctx.channels);
+        let contracts = recover(&ctx.channel_contracts);
+        let mut known: Vec<(u32, String, String)> = channels
+            .iter()
+            .map(|(id, service)| {
+                let contract = contracts
+                    .get(id)
+                    .cloned()
+                    .unwrap_or_else(|| "AUTO".to_string());
+                (*id, service.clone(), contract)
+            })
+            .collect();
+        // Lowest first, so a replay is reproducible rather than hash-ordered.
+        known.sort_unstable_by_key(|(id, _, _)| *id);
+        known
+    };
+
+    for (channel_id, service, contract) in known {
+        let mut params = HashMap::new();
+        params.insert("contract".to_string(), contract);
+        let channel_request = ChannelRequestMessage {
+            channel: channel_id,
+            message_type: "CHANNEL_REQUEST".to_string(),
+            service: service.clone(),
+            parameters: params,
+        };
+
+        match request_response(
+            &connection,
+            &ctx.response_requests,
+            &ctx.next_request_id,
+            &channel_request,
+            "reconnect: reopen channel",
+            "CHANNEL_OPENED",
+            channel_id,
+            Duration::from_secs(10),
+        )
+        .await?
+        {
+            ResponseType::ChannelOpened(opened) if opened == channel_id => {}
+            other => {
+                return Err(DXLinkError::Channel(format!(
+                    "reopening channel {channel_id} answered with {other:?}"
+                )));
+            }
+        }
+
+        // The layout the channel was configured with. A channel that never got
+        // as far as a validated feed has nothing to reconfigure and no
+        // subscriptions to replay.
+        let stored = recover(&ctx.channel_schemas).get(&channel_id).cloned();
+        let Some(stored) = stored else {
+            continue;
+        };
+
+        // Back through EventType so the request and the validation come from
+        // compact_fields, exactly as setup_feed builds them. Names in the store
+        // are this client's own, so an unknown one is a bug here rather than
+        // bad input.
+        let mut event_types: Vec<EventType> = Vec::with_capacity(stored.len());
+        for name in stored.keys() {
+            let Some(event_type) = EventType::from_wire_name(name) else {
+                return Err(DXLinkError::Protocol(format!(
+                    "channel {channel_id} was configured for `{name}`, which is not a DXLink \
+                     event type"
+                )));
+            };
+            event_types.push(event_type);
+        }
+        event_types.sort_unstable_by_key(|event_type| event_type.to_string());
+
+        let feed_setup = FeedSetupMessage {
+            channel: channel_id,
+            message_type: "FEED_SETUP".to_string(),
+            accept_aggregation_period: 0.1,
+            accept_data_format: "COMPACT".to_string(),
+            accept_event_fields: requested_fields(&event_types),
+        };
+
+        // Drop the old layout before asking for a new one: a reconfiguration
+        // that fails validation must not leave the channel decoding against a
+        // contract nobody agreed to.
+        recover(&ctx.channel_schemas).remove(&channel_id);
+
+        match request_response(
+            &connection,
+            &ctx.response_requests,
+            &ctx.next_request_id,
+            &feed_setup,
+            "reconnect: reconfigure feed",
+            "FEED_CONFIG",
+            channel_id,
+            Duration::from_secs(10),
+        )
+        .await?
+        {
+            ResponseType::FeedConfig(config) => {
+                validate_feed_config(&config, channel_id, &event_types)?;
+                recover(&ctx.channel_schemas).insert(channel_id, requested_fields(&event_types));
+            }
+            other => {
+                return Err(DXLinkError::Protocol(format!(
+                    "reconfiguring channel {channel_id} answered with {other:?}"
+                )));
+            }
+        }
+
+        let to_replay = recover(&ctx.subscriptions).of_channel(channel_id);
+        if to_replay.is_empty() {
+            continue;
+        }
+
+        let subscription_msg = FeedSubscriptionMessage {
+            channel: channel_id,
+            message_type: "FEED_SUBSCRIPTION".to_string(),
+            add: Some(to_replay),
+            remove: None,
+            reset: None,
+        };
+        connection.send(&subscription_msg).await?;
+    }
+
+    Ok(())
+}
+
+/// Runs one reconnect cycle: back off, handshake, rebuild, restart the tasks.
+///
+/// Returns the handles of the session it established. An error means this
+/// attempt failed; whether to try again is the caller's decision, because only
+/// it knows the policy and the attempt count.
+async fn reconnect_once(
+    ctx: &ReconnectContext,
+    session_lost: mpsc::Sender<String>,
+) -> DXLinkResult<(JoinHandle<()>, JoinHandle<()>, mpsc::Sender<()>)> {
+    let (connection, negotiated) = handshake(&ctx.url, &ctx.token, ctx.keepalive_timeout).await?;
+    *recover(&ctx.connection) = Some(connection.clone());
+
+    // The reader has to be up before the rebuild sends anything, because it is
+    // the only thing that routes the replies the rebuild waits on.
+    let interval = keepalive_interval_for(ctx.keepalive_timeout, negotiated);
+    let (keepalive_handle, keepalive_stop) = spawn_keepalive(connection.clone(), interval);
+    let reader = spawn_reader(ReaderSetup {
+        connection,
+        shutdown_keepalive: Some(keepalive_stop.clone()),
+        delivery_tx: ctx.delivery_tx.clone(),
+        disconnect_reason: ctx.disconnect_reason.clone(),
+        response_requests: ctx.response_requests.clone(),
+        channel_schemas: ctx.channel_schemas.clone(),
+        receive_deadline: Duration::from_secs(u64::from(ctx.keepalive_timeout)),
+        session_lost: Some(session_lost),
+    });
+
+    match replay_session(ctx).await {
+        Ok(()) => Ok((reader, keepalive_handle, keepalive_stop)),
+        Err(e) => {
+            // A half-rebuilt session is worse than none: it would deliver some
+            // channels and silently miss others. Tear it down and let the
+            // caller decide whether to try again.
+            let _ = keepalive_stop.send(()).await;
+            reader.abort();
+            keepalive_handle.abort();
+            *recover(&ctx.connection) = None;
+            Err(e)
+        }
+    }
+}
+
+/// How often to send maintenance, given what we advertised and what the server
+/// negotiated.
+///
+/// Free-standing because a reconnect has to derive the same interval from the
+/// value the new handshake negotiated, without a `&self`.
+fn keepalive_interval_for(advertised: u32, negotiated: Option<u32>) -> Duration {
+    let deadline = negotiated.unwrap_or(advertised);
+    Duration::from_secs(u64::from(deadline.div_ceil(KEEPALIVE_DIVISOR))).max(MIN_KEEPALIVE_INTERVAL)
+}
+
+/// Reports a connection-state change, dropping it if the consumer is behind.
+///
+/// States are advisory and the supervisor's job is to reconnect, not to block
+/// on a consumer that stopped reading.
+fn notify(states: &Option<Sender<ConnectionState>>, state: ConnectionState) {
+    if let Some(tx) = states
+        && tx.try_send(state.clone()).is_err()
+    {
+        debug!("Dropping connection state {state:?}: nobody is reading them");
+    }
+}
+
 /// Locks a client-state mutex, recovering rather than panicking if it is
 /// poisoned.
 ///
@@ -214,6 +1057,15 @@ type ChannelSchema = HashMap<String, Vec<String>>;
 
 /// Validated layouts per channel.
 type ChannelSchemas = Arc<Mutex<HashMap<u32, ChannelSchema>>>;
+
+/// The live socket, in a slot a background task can swap.
+///
+/// Shared rather than owned so a reconnect can replace the connection under the
+/// methods that use it. The guard is only ever held long enough to clone the
+/// handle out — `WebSocketConnection` is itself `Arc`-backed — so it never
+/// crosses an `.await`, which is the rule for every `std::sync::Mutex` in this
+/// file.
+type SharedConnection = Arc<Mutex<Option<WebSocketConnection>>>;
 
 /// One tracked subscription, with the order it was asked for.
 ///
@@ -541,8 +1393,9 @@ pub struct DXLinkClient {
     url: String,
     /// The authentication token for accessing the DXLink service.
     token: String,
-    /// The active WebSocket connection, if established.  `None` indicates no active connection.
-    connection: Option<WebSocketConnection>,
+    /// The active WebSocket connection, if established. `None` indicates no
+    /// active connection. Shared so a reconnect task can replace it.
+    connection: SharedConnection,
     /// The keepalive timeout this client advertises, in seconds. Also the
     /// deadline after which inbound silence is treated as a dead connection.
     keepalive_timeout: u32,
@@ -581,6 +1434,31 @@ pub struct DXLinkClient {
     /// The field layout validated for each configured channel. A channel with
     /// no entry has no agreed layout, so its rows must not be decoded.
     channel_schemas: ChannelSchemas,
+    /// The contract each channel was opened with, so a replay reopens it the
+    /// same way rather than guessing.
+    channel_contracts: Arc<Mutex<HashMap<u32, String>>>,
+    /// The reconnection policy, if the consumer installed one. `None` is the
+    /// default and means the client never retries.
+    reconnect: Option<ReconnectPolicy>,
+    /// The connection-state stream, until the consumer takes it.
+    state_receiver: Option<Receiver<ConnectionState>>,
+    /// The sending half, kept so the supervisor can be handed a clone.
+    state_sender: Option<Sender<ConnectionState>>,
+    /// A handle to the reconnect supervisor, when one is running.
+    supervisor_handle: Option<JoinHandle<()>>,
+    /// Stops the supervisor, including a backoff it is in the middle of.
+    supervisor_shutdown: Option<mpsc::Sender<()>>,
+    /// Handed to each reader so it can report a terminal failure once.
+    session_lost_sender: Option<mpsc::Sender<String>>,
+    /// The receiving half, until the supervisor takes it.
+    session_lost_receiver: Option<mpsc::Receiver<String>>,
+    /// Hand-off slot for the delivery queue, between spawning the reader and
+    /// spawning the supervisor.
+    ///
+    /// **Taken, never held.** The delivery worker stops when its last sender
+    /// drops, and that is what closes the consumer's stream — a client keeping
+    /// a clone would hold the stream open forever over a dead socket.
+    pending_delivery_tx: Option<Sender<MarketEvent>>,
 }
 
 impl DXLinkClient {
@@ -608,7 +1486,7 @@ impl DXLinkClient {
         Self {
             url: url.to_string(),
             token: token.to_string(),
-            connection: None,
+            connection: Arc::new(Mutex::new(None)),
             keepalive_timeout: DEFAULT_KEEPALIVE_TIMEOUT,
             server_keepalive_timeout: None,
             next_channel_id: Arc::new(Mutex::new(1)), // Start from 1 as 0 is the main channel
@@ -625,6 +1503,15 @@ impl DXLinkClient {
             response_requests: Arc::new(Mutex::new(Vec::new())),
             next_request_id: Arc::new(Mutex::new(0)),
             channel_schemas: Arc::new(Mutex::new(HashMap::new())),
+            channel_contracts: Arc::new(Mutex::new(HashMap::new())),
+            reconnect: None,
+            state_receiver: None,
+            state_sender: None,
+            supervisor_handle: None,
+            supervisor_shutdown: None,
+            session_lost_sender: None,
+            session_lost_receiver: None,
+            pending_delivery_tx: None,
         }
     }
 
@@ -643,72 +1530,26 @@ impl DXLinkClient {
         channel: u32,
         wait: Duration,
     ) -> DXLinkResult<ResponseType> {
-        let (tx, rx) = oneshot::channel();
-
-        let id = {
-            let mut next = self
-                .next_request_id
-                .lock()
-                .map_err(|_| DXLinkError::Unknown("request id lock poisoned".to_string()))?;
-            *next += 1;
-            *next
-        };
-
-        {
-            let mut requests = self
-                .response_requests
-                .lock()
-                .map_err(|_| DXLinkError::Unknown("response request lock poisoned".to_string()))?;
-            requests.push(ResponseRequest {
-                id,
-                expected_type: expected_type.to_string(),
-                channel_id: Some(channel),
-                response_sender: tx,
-            });
-        }
-
-        let _guard = PendingGuard {
-            requests: Arc::clone(&self.response_requests),
-            id,
-        };
-
-        self.get_connection()?.send(message).await?;
-
-        match tokio::time::timeout(wait, rx).await {
-            Ok(Ok(ResponseType::Error(code, message))) => {
-                let detail = format!(
-                    "during {operation} on channel {channel}, waiting for {expected_type}, \
-                     the server returned {code}: {message}"
-                );
-                // Pick the variant from the code: an UNAUTHORIZED here means the
-                // same thing it means during the handshake, and collapsing it to
-                // Protocol would lose the terminal classification a caller needs
-                // to know it must re-authenticate rather than retry.
-                Err(match code.to_ascii_uppercase().as_str() {
-                    "UNAUTHORIZED" => DXLinkError::Authentication(detail),
-                    // The channel itself is the problem, as opposed to the
-                    // action, which is a protocol violation and falls through.
-                    "INVALID_CHANNEL" | "UNKNOWN_CHANNEL" => DXLinkError::Channel(detail),
-                    "TIMEOUT" => DXLinkError::Timeout(detail),
-                    _ => DXLinkError::Protocol(detail),
-                })
-            }
-            Ok(Ok(response)) => Ok(response),
-            Ok(Err(_)) => Err(DXLinkError::Protocol(format!(
-                "during {operation} on channel {channel}, the response channel closed"
-            ))),
-            Err(_) => Err(DXLinkError::Timeout(format!(
-                "timed out after {}s waiting for {expected_type} on channel {channel} during {operation}",
-                wait.as_secs()
-            ))),
-        }
+        request_response(
+            &self.get_connection()?,
+            &self.response_requests,
+            &self.next_request_id,
+            message,
+            operation,
+            expected_type,
+            channel,
+            wait,
+        )
+        .await
     }
 
-    /// Borrows the live connection.
-    fn get_connection(&self) -> DXLinkResult<&WebSocketConnection> {
-        self.connection
-            .as_ref()
-            .ok_or_else(|| DXLinkError::Connection("Not connected to DXLink server".to_string()))
+    /// A handle to the live connection.
+    ///
+    /// Cloned out of the slot rather than borrowed: the clone is cheap, and
+    /// holding the lock while sending would block a reconnect swapping the
+    /// socket underneath.
+    fn get_connection(&self) -> DXLinkResult<WebSocketConnection> {
+        live_connection(&self.connection)
     }
 
     /// How many response registrations are currently pending.
@@ -802,7 +1643,58 @@ impl DXLinkClient {
         });
 
         self.delivery_handle = Some(handle);
+        // Parked for the supervisor, which is spawned right after the reader
+        // and takes it. A rebuilt session feeds this same worker: it owns the
+        // consumer's sender, so restarting it would close the stream the
+        // reconnect exists to preserve.
+        self.pending_delivery_tx = Some(delivery_tx.clone());
         delivery_tx
+    }
+
+    /// Turns on reconnection, with the policy given.
+    ///
+    /// Off by default and never enabled implicitly. Call this **before**
+    /// [`connect`](Self::connect): a policy installed afterwards has nothing to
+    /// supervise, because the supervisor is spawned as part of connecting.
+    ///
+    /// The retry classification is deliberate. Only a terminal connection
+    /// failure triggers a reconnect: a dead socket or inbound silence past the
+    /// keepalive deadline. An authentication rejection is **not** retried,
+    /// because the token will be rejected just as fast the second time, and a
+    /// local protocol or configuration error is not retried either.
+    ///
+    /// Additive: a new method, no existing signature changes.
+    ///
+    /// # Example
+    ///
+    /// ```rust,no_run
+    /// use dxlink::{DXLinkClient, ReconnectPolicy};
+    /// use std::time::Duration;
+    ///
+    /// let mut client = DXLinkClient::new("wss://example.com/dxlink-ws", "token");
+    /// client.with_reconnect(ReconnectPolicy {
+    ///     max_attempts: Some(5),
+    ///     ..ReconnectPolicy::default()
+    /// });
+    /// ```
+    pub fn with_reconnect(&mut self, policy: ReconnectPolicy) {
+        self.reconnect = Some(policy);
+    }
+
+    /// Takes the stream of connection-state changes.
+    ///
+    /// There is one per client and it is handed out once; a second call
+    /// returns `None`. Only useful with a reconnect policy installed, since
+    /// without one the session never comes back and the closing event stream
+    /// already says so.
+    ///
+    /// The stream is bounded and **drops the oldest state rather than blocking**
+    /// the supervisor. States are advisory; the authority on whether the client
+    /// is live is whether events are still arriving.
+    ///
+    /// Additive: a new method, no existing signature changes.
+    pub fn connection_states(&mut self) -> Option<Receiver<ConnectionState>> {
+        self.state_receiver.take()
     }
 
     /// Sets the keepalive timeout this client advertises, in seconds.
@@ -838,11 +1730,7 @@ impl DXLinkClient {
     /// deadline. Falls back to the advertised timeout when the server did not
     /// negotiate one.
     fn keepalive_interval(&self) -> Duration {
-        let deadline = self
-            .server_keepalive_timeout
-            .unwrap_or(self.keepalive_timeout);
-        Duration::from_secs(u64::from(deadline.div_ceil(KEEPALIVE_DIVISOR)))
-            .max(MIN_KEEPALIVE_INTERVAL)
+        keepalive_interval_for(self.keepalive_timeout, self.server_keepalive_timeout)
     }
 
     /// Establishes a connection to the DXLink server.
@@ -887,74 +1775,24 @@ impl DXLinkClient {
         // a healthy connection look dead.
         *recover(&self.disconnect_reason) = None;
 
-        // Connect to WebSocket
-        let connection = WebSocketConnection::connect(&self.url).await?;
+        let (connection, negotiated) =
+            handshake(&self.url, &self.token, self.keepalive_timeout).await?;
+        self.server_keepalive_timeout = negotiated;
 
-        // Send SETUP message
-        let setup_msg = SetupMessage {
-            channel: MAIN_CHANNEL,
-            message_type: "SETUP".to_string(),
-            keepalive_timeout: self.keepalive_timeout,
-            accept_keepalive_timeout: self.keepalive_timeout,
-            version: DEFAULT_CLIENT_VERSION.to_string(),
-        };
-
-        connection.send(&setup_msg).await?;
-
-        // Every read below is bounded and validated. On any failure `connection`
-        // is dropped here, so a partial handshake never leaves the client
-        // holding a half-established socket.
-        let response =
-            expect_handshake_message(&connection, "SETUP", "SETUP", MAIN_CHANNEL).await?;
-        let server_setup: ServerSetupMessage = serde_json::from_str(&response)?;
-        debug!(
-            "Server SETUP: version={:?}, keepaliveTimeout={:?}",
-            server_setup.version, server_setup.keepalive_timeout
-        );
-        // A zero would schedule maintenance in a tight loop; treat it as "not
-        // negotiated" rather than trusting it.
-        self.server_keepalive_timeout = server_setup.keepalive_timeout.filter(|t| *t > 0);
-
-        let response =
-            expect_handshake_message(&connection, "SETUP", "AUTH_STATE", MAIN_CHANNEL).await?;
-        let auth_state: AuthStateMessage = serde_json::from_str(&response)?;
-
-        // Already authorized means the token was accepted on the connection.
-        if auth_state.state == "AUTHORIZED" {
-            info!("Already authorized to DXLink server");
-        } else if auth_state.state == "UNAUTHORIZED" {
-            let auth_msg = AuthMessage {
-                channel: MAIN_CHANNEL,
-                message_type: "AUTH".to_string(),
-                token: self.token.clone(),
-            };
-
-            connection.send(&auth_msg).await?;
-
-            let response =
-                expect_handshake_message(&connection, "AUTH", "AUTH_STATE", MAIN_CHANNEL).await?;
-            let auth_state: AuthStateMessage = serde_json::from_str(&response)?;
-
-            if auth_state.state != "AUTHORIZED" {
-                return Err(DXLinkError::Authentication(format!(
-                    "during AUTH, the server reported state {} instead of AUTHORIZED",
-                    auth_state.state
-                )));
-            }
-
-            info!("Successfully authenticated to DXLink server");
-        } else {
-            return Err(DXLinkError::Protocol(format!(
-                "during SETUP, the server reported an unknown authentication state: {}",
-                auth_state.state
-            )));
-        }
-
-        info!("Successfully connected to DXLink server");
-
-        self.connection = Some(connection);
+        *recover(&self.connection) = Some(connection);
 
         let receiver = self.event_stream();
+
+        // Before any task: the reader is handed the session-lost sender as it
+        // is spawned, so the channel has to exist first.
+        if self.reconnect.is_some() && self.session_lost_sender.is_none() {
+            let (lost_tx, lost_rx) = mpsc::channel::<String>(1);
+            self.session_lost_sender = Some(lost_tx);
+            self.session_lost_receiver = Some(lost_rx);
+            let (state_tx, state_rx) = mpsc::channel::<ConnectionState>(CONNECTION_STATE_CAPACITY);
+            self.state_sender = Some(state_tx);
+            self.state_receiver = Some(state_rx);
+        }
 
         // Keepalive first: it owns the shutdown channel the reader needs in
         // order to stop it when the session dies. Nothing goes out in between,
@@ -963,6 +1801,11 @@ impl DXLinkClient {
 
         // Then the reader, which must be up before any traffic can arrive.
         self.start_message_processing()?;
+
+        // Last, and only if the consumer asked for it. Without a policy nothing
+        // is spawned and the behaviour is exactly what it was: the session dies
+        // and stays dead.
+        self.start_reconnect_supervisor();
 
         receiver
     }
@@ -986,18 +1829,9 @@ impl DXLinkClient {
     ///
     fn start_keepalive(&mut self) -> DXLinkResult<()> {
         // Asegurarnos de que tenemos una conexión
-        if self.connection.is_none() {
-            return Err(DXLinkError::Connection(
-                "Cannot start keepalive without a connection".to_string(),
-            ));
-        }
-
-        // Crear un canal para señales de cierre
-        let (tx, mut rx) = mpsc::channel::<()>(1);
-        self.keepalive_sender = Some(tx);
-
-        // Obtener la conexión
-        let connection = self.connection.as_ref().unwrap().clone();
+        let connection = self.get_connection().map_err(|_| {
+            DXLinkError::Connection("Cannot start keepalive without a connection".to_string())
+        })?;
 
         // Derived from what the server negotiated, not from a fixed constant.
         let keepalive_interval = self.keepalive_interval();
@@ -1006,340 +1840,183 @@ impl DXLinkClient {
             keepalive_interval, self.server_keepalive_timeout
         );
 
-        let keepalive_handle = tokio::spawn(async move {
-            // Start one interval out: tokio's first tick is immediate, which
-            // fired a redundant KEEPALIVE the instant the session opened.
-            let mut interval = tokio::time::interval_at(
-                tokio::time::Instant::now() + keepalive_interval,
-                keepalive_interval,
-            );
-
-            loop {
-                tokio::select! {
-                    _ = interval.tick() => {
-                        // Any outbound message resets the server's idle timer,
-                        // so traffic that already went out covers this beat.
-                        if connection.since_last_send() < keepalive_interval {
-                            debug!("Skipping keepalive, the socket was used recently");
-                            continue;
-                        }
-
-                        let keepalive_msg = KeepaliveMessage {
-                            channel: MAIN_CHANNEL,
-                            message_type: "KEEPALIVE".to_string(),
-                        };
-
-                        match connection.send(&keepalive_msg).await {
-                            Ok(_) => {
-                                debug!("Sent keepalive message");
-                            },
-                            Err(e) => {
-                                error!("Failed to send keepalive: {}", e);
-                                break;
-                            }
-                        }
-                    }
-                    _ = rx.recv() => {
-                        // Recibimos una señal para terminar
-                        debug!("Keepalive task received shutdown signal");
-                        break;
-                    }
-                }
-            }
-
-            debug!("Keepalive task terminated");
-        });
-
-        self.keepalive_handle = Some(keepalive_handle);
+        let (handle, stop) = spawn_keepalive(connection, keepalive_interval);
+        self.keepalive_sender = Some(stop);
+        self.keepalive_handle = Some(handle);
 
         Ok(())
     }
 
     fn start_message_processing(&mut self) -> DXLinkResult<()> {
         // Check first: nothing may be spawned on a client that is not connected.
-        if self.connection.is_none() {
-            return Err(DXLinkError::Connection(
+        let connection = self.get_connection().map_err(|_| {
+            DXLinkError::Connection(
                 "Cannot start message processing without a connection".to_string(),
-            ));
-        }
+            )
+        })?;
 
-        let connection = self.connection.as_ref().unwrap().clone();
-
-        // Cloned so the reader can tear the whole session down, not just itself:
-        // stopping only the reader left the keepalive writing to a socket
-        // nobody was listening to.
-        let shutdown_keepalive = self.keepalive_sender.clone();
         let delivery_tx = self.start_event_delivery();
-        let disconnect_reason = self.disconnect_reason.clone();
+        self.message_handle = Some(spawn_reader(ReaderSetup {
+            connection,
+            // Cloned so the reader can tear the whole session down, not just
+            // itself: stopping only the reader left the keepalive writing to a
+            // socket nobody was listening to.
+            shutdown_keepalive: self.keepalive_sender.clone(),
+            delivery_tx,
+            disconnect_reason: self.disconnect_reason.clone(),
+            // The reader only routes protocol traffic now; callbacks and the
+            // consumer stream belong to the delivery worker.
+            response_requests: self.response_requests.clone(),
+            channel_schemas: self.channel_schemas.clone(),
+            // Inbound silence past our advertised deadline means the peer is
+            // gone, even though the socket is still open. Without this the task
+            // waits on a dead connection forever.
+            receive_deadline: Duration::from_secs(u64::from(self.keepalive_timeout)),
+            // Only when a supervisor is going to listen. A sender with no
+            // receiver would make the reader do work for nobody.
+            session_lost: self.session_lost_sender.clone(),
+        }));
 
-        // The reader only routes protocol traffic now; callbacks and the
-        // consumer stream belong to the delivery worker.
-        let response_requests = self.response_requests.clone();
-        let channel_schemas = self.channel_schemas.clone();
+        Ok(())
+    }
 
-        // Iniciar la tarea de procesamiento de mensajes
-        // Inbound silence past our advertised deadline means the peer is gone,
-        // even though the socket is still open. Without this the task waits on a
-        // dead connection forever.
-        let receive_deadline = Duration::from_secs(u64::from(self.keepalive_timeout));
+    /// Spawns the task that rebuilds the session after a terminal failure.
+    ///
+    /// Does nothing without a policy, which is what keeps "no automatic
+    /// reconnection" the default.
+    fn start_reconnect_supervisor(&mut self) {
+        // Taken first, and unconditionally. Holding this clone past here would
+        // keep the delivery worker alive on a dead session, and the closing
+        // stream is how a consumer without a policy learns the session is over.
+        let delivery_tx = self.pending_delivery_tx.take();
 
-        let message_handle = tokio::spawn(async move {
-            let mut dropped_events: u64 = 0;
+        let Some(policy) = self.reconnect.clone() else {
+            return;
+        };
+        let Some(session_lost) = self.session_lost_sender.clone() else {
+            return;
+        };
+        let Some(mut lost_rx) = self.session_lost_receiver.take() else {
+            return;
+        };
+        let Some(delivery_tx) = delivery_tx else {
+            return;
+        };
 
+        let ctx = ReconnectContext {
+            url: self.url.clone(),
+            token: self.token.clone(),
+            keepalive_timeout: self.keepalive_timeout,
+            connection: self.connection.clone(),
+            channels: self.channels.clone(),
+            channel_contracts: self.channel_contracts.clone(),
+            channel_schemas: self.channel_schemas.clone(),
+            subscriptions: self.subscriptions.clone(),
+            response_requests: self.response_requests.clone(),
+            next_request_id: self.next_request_id.clone(),
+            disconnect_reason: self.disconnect_reason.clone(),
+            delivery_tx,
+        };
+
+        // Taken, not cloned: the supervisor becomes the only sender, so when it
+        // returns the state stream closes. A client holding a clone would leave
+        // a consumer waiting on states that can never come.
+        let states = self.state_sender.take();
+        let (shutdown_tx, mut shutdown_rx) = mpsc::channel::<()>(1);
+        self.supervisor_shutdown = Some(shutdown_tx);
+
+        // Seeded off the wall clock so two clients started together do not pick
+        // the same jitter. Only ever used to spread a delay, never for
+        // anything that has to be unpredictable.
+        let mut seed = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|since| since.subsec_nanos() as u64)
+            .unwrap_or(0x2545_F491_4F6C_DD1D)
+            | 1;
+
+        let handle = tokio::spawn(async move {
             loop {
-                let received = match connection.receive_with_timeout(receive_deadline).await {
-                    Ok(Some(msg)) => Ok(msg),
-                    Ok(None) => {
-                        // Silence past the advertised deadline means the peer is
-                        // gone even though the socket is still open. Terminal
-                        // here specifically: a bare read timeout is not terminal
-                        // in general, which is why this does not go through
-                        // is_terminal().
-                        let reason = DXLinkError::Timeout(format!(
-                            "no message received on channel {} for {}s, the connection is assumed dead",
-                            MAIN_CHANNEL,
-                            receive_deadline.as_secs()
-                        ));
-                        error!("{}", reason);
-                        record_reason(&disconnect_reason, &reason);
-                        break;
+                let reason = tokio::select! {
+                    _ = shutdown_rx.recv() => {
+                        debug!("Reconnect supervisor asked to stop");
+                        return;
                     }
-                    Err(e) => Err(e),
+                    lost = lost_rx.recv() => match lost {
+                        Some(reason) => reason,
+                        // Every reader is gone and no new one will report, so
+                        // there is nothing left to supervise.
+                        None => return,
+                    },
                 };
 
-                match received {
-                    Ok(msg) => {
-                        debug!("Received message: {}", msg);
+                notify(
+                    &states,
+                    ConnectionState::Lost {
+                        reason: reason.clone(),
+                    },
+                );
 
-                        // Procesar el mensaje
-                        if let Ok(value) = serde_json::from_str::<serde_json::Value>(&msg) {
-                            // Identificar el tipo de mensaje
-                            let msg_type = value.get("type").and_then(|v| v.as_str()).unwrap_or("");
-                            let channel = value
-                                .get("channel")
-                                .and_then(|v| v.as_u64())
-                                .map(|c| c as u32);
+                // Waiters registered against the dead session would otherwise
+                // sit until their own timeouts. Dropping the senders wakes them
+                // now, with an error rather than a stall.
+                recover(&ctx.response_requests).clear();
 
-                            // Route to a waiter first. A channel-scoped ERROR
-                            // answers whatever operation is pending on that
-                            // channel, whichever success message it asked for:
-                            // otherwise the caller sat until its timeout while
-                            // the reason was only logged.
-                            {
-                                let mut delivered = false;
-                                {
-                                    let mut requests = recover(&response_requests);
-                                    let is_error = msg_type == "ERROR";
+                let mut attempt: u32 = 0;
+                loop {
+                    attempt += 1;
+                    if let Some(limit) = policy.max_attempts
+                        && attempt > limit
+                    {
+                        let reason =
+                            format!("gave up reconnecting after {limit} attempt(s): {reason}");
+                        error!("{reason}");
+                        notify(&states, ConnectionState::GaveUp { reason });
+                        return;
+                    }
 
-                                    while let Some(idx) = requests.iter().position(|req| {
-                                        let channel_matches =
-                                            req.channel_id.is_none() || req.channel_id == channel;
-                                        channel_matches
-                                            && (req.expected_type == msg_type
-                                                || (is_error && channel.is_some()))
-                                    }) {
-                                        let request = requests.remove(idx);
+                    let delay = policy.delay_for(attempt, &mut seed);
+                    notify(&states, ConnectionState::Reconnecting { attempt, delay });
 
-                                        let response = match msg_type {
-                                            "CHANNEL_OPENED" => {
-                                                ResponseType::ChannelOpened(channel.unwrap_or(0))
-                                            }
-                                            "FEED_CONFIG" => {
-                                                match serde_json::from_str::<FeedConfigMessage>(
-                                                    &msg,
-                                                ) {
-                                                    Ok(config) => {
-                                                        ResponseType::FeedConfig(Box::new(config))
-                                                    }
-                                                    Err(e) => ResponseType::Error(
-                                                        "MALFORMED_FEED_CONFIG".to_string(),
-                                                        e.to_string(),
-                                                    ),
-                                                }
-                                            }
-                                            "CHANNEL_CLOSED" => {
-                                                ResponseType::ChannelClosed(channel.unwrap_or(0))
-                                            }
-                                            "ERROR" => {
-                                                let error = value
-                                                    .get("error")
-                                                    .and_then(|v| v.as_str())
-                                                    .unwrap_or("unknown");
-                                                let message = value
-                                                    .get("message")
-                                                    .and_then(|v| v.as_str())
-                                                    .unwrap_or("");
-                                                ResponseType::Error(
-                                                    sanitize_server_text(error),
-                                                    sanitize_server_text(message),
-                                                )
-                                            }
-                                            _ => ResponseType::Other(msg.clone()),
-                                        };
-
-                                        // A gone receiver means that caller
-                                        // already walked away. Keep looking
-                                        // rather than swallowing a response a
-                                        // live waiter is still owed.
-                                        if request.response_sender.send(response).is_ok() {
-                                            delivered = true;
-                                            break;
-                                        }
-                                        debug!("Dropping a stale response registration");
-                                    }
-                                }
-
-                                if delivered {
-                                    continue;
-                                }
-                            }
-
-                            // Si nadie esperaba este mensaje específicamente, procesarlo normalmente
-                            match msg_type {
-                                "FEED_CONFIG" => {
-                                    // Nobody was waiting: this is the server
-                                    // changing the layout mid-session, which the
-                                    // spec allows. The decoder cannot follow it,
-                                    // so the channel stops being decodable
-                                    // rather than producing shifted values.
-                                    if let Some(ch) = channel {
-                                        // Only a real disagreement invalidates.
-                                        // A server may resend an identical
-                                        // FEED_CONFIG, and treating that as a
-                                        // change would stop decoding a channel
-                                        // nothing had happened to.
-                                        let disagrees =
-                                            match serde_json::from_str::<FeedConfigMessage>(&msg) {
-                                                Ok(config) => {
-                                                    let schemas = recover(&channel_schemas);
-                                                    schemas.get(&ch).is_some_and(|stored| {
-                                                        config_disagrees(&config, stored)
-                                                    })
-                                                }
-                                                // Unreadable is not agreement.
-                                                Err(_) => true,
-                                            };
-
-                                        if disagrees
-                                            && recover(&channel_schemas).remove(&ch).is_some()
-                                        {
-                                            error!(
-                                                "Channel {} was reconfigured by the server; \
-                                                 its data will be dropped rather than decoded \
-                                                 against the old layout",
-                                                ch
-                                            );
-                                        }
-                                    }
-                                }
-                                "FEED_DATA" => {
-                                    // Only decode against a layout the server
-                                    // agreed to.
-                                    let decodable = channel
-                                        .map(|ch| recover(&channel_schemas).contains_key(&ch))
-                                        .unwrap_or(false);
-
-                                    if !decodable {
-                                        debug!(
-                                            "Dropping FEED_DATA for channel {:?}: no validated layout",
-                                            channel
-                                        );
-                                    } else if let Ok(data_msg) =
-                                        serde_json::from_str::<FeedDataMessage<Vec<CompactData>>>(
-                                            &msg,
-                                        )
-                                    {
-                                        // Hand off and keep reading. Delivery is
-                                        // somebody else's job: doing it here let
-                                        // one slow callback or a full consumer
-                                        // stream stop the socket reads that every
-                                        // channel operation depends on.
-                                        let decoded = match try_parse_compact_data(&data_msg.data) {
-                                            Ok(events) => events,
-                                            Err(e) => {
-                                                // Report it rather than
-                                                // delivering a partial batch
-                                                // that looks complete.
-                                                error!(
-                                                    "Malformed COMPACT data on channel {:?}: {e}",
-                                                    channel
-                                                );
-                                                continue;
-                                            }
-                                        };
-
-                                        for event in decoded {
-                                            match delivery_tx.try_send(event) {
-                                                Ok(()) => {}
-                                                Err(mpsc::error::TrySendError::Full(_)) => {
-                                                    dropped_events += 1;
-                                                    if dropped_events.is_power_of_two() {
-                                                        warn!(
-                                                            "Delivery queue full, {} event(s) dropped so far; \
-                                                             the consumer is slower than the feed",
-                                                            dropped_events
-                                                        );
-                                                    }
-                                                }
-                                                Err(mpsc::error::TrySendError::Closed(_)) => {
-                                                    // Delivery has stopped entirely, which is a
-                                                    // different thing from falling behind and
-                                                    // must not be reported as backpressure.
-                                                    error!(
-                                                        "Delivery worker is gone; no further events \
-                                                         will reach callbacks or the stream"
-                                                    );
-                                                    break;
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-                                "ERROR" => {
-                                    if let Ok(error_msg) =
-                                        serde_json::from_str::<ErrorMessage>(&msg)
-                                    {
-                                        error!(
-                                            "Received error from server: {} - {}",
-                                            error_msg.error, error_msg.message
-                                        );
-                                    }
-                                }
-                                "KEEPALIVE" => {
-                                    // Simplemente registrar keepalives
-                                    debug!("Received KEEPALIVE message");
-                                }
-                                _ => {
-                                    debug!("Received unhandled message type: {}", msg_type);
-                                }
-                            }
+                    // The sleep is part of what disconnect() has to be able to
+                    // cut short: waiting out a 30 second backoff before
+                    // noticing would make shutdown feel hung.
+                    tokio::select! {
+                        _ = shutdown_rx.recv() => {
+                            debug!("Reconnect supervisor stopped during backoff");
+                            return;
                         }
+                        _ = tokio::time::sleep(delay) => {}
                     }
-                    // The connection is gone: reading the same dead socket again
-                    // can only fail, so stop instead of spinning forever.
-                    Err(e) if e.is_terminal() => {
-                        error!("Connection lost, stopping message processing: {}", e);
-                        record_reason(&disconnect_reason, &e);
-                        break;
-                    }
-                    Err(e) => {
-                        error!("Error receiving message: {}", e);
-                        // A short pause so repeated errors do not flood the logs
-                        tokio::time::sleep(Duration::from_millis(100)).await;
+
+                    match reconnect_once(&ctx, session_lost.clone()).await {
+                        Ok(_) => {
+                            info!("Reconnected after {attempt} attempt(s)");
+                            // The new session is live, so the recorded reason
+                            // describes a connection that no longer applies.
+                            *recover(&ctx.disconnect_reason) = None;
+                            notify(&states, ConnectionState::Reconnected);
+                            break;
+                        }
+                        Err(e)
+                            if !e.is_terminal() || matches!(e, DXLinkError::Authentication(_)) =>
+                        {
+                            // Documented classification: a rejected token or a
+                            // local protocol error will fail identically next
+                            // time, so retrying is just noise.
+                            let reason = format!("not retrying: {e}");
+                            error!("{reason}");
+                            notify(&states, ConnectionState::GaveUp { reason });
+                            return;
+                        }
+                        Err(e) => {
+                            warn!("Reconnect attempt {attempt} failed: {e}");
+                        }
                     }
                 }
             }
-
-            // This task only ever exits because the session is dead, so the
-            // socket is gone: stop writing to it as well.
-            if let Some(stop) = shutdown_keepalive {
-                let _ = stop.send(()).await;
-                debug!("Asked the keepalive task to stop, the session is dead");
-            }
         });
 
-        self.message_handle = Some(message_handle);
-        Ok(())
+        self.supervisor_handle = Some(handle);
     }
 
     /// Close the connection and clean up resources
@@ -1350,6 +2027,25 @@ impl DXLinkClient {
         // could deliver: five seconds per open channel, and the channel state
         // left behind anyway.
         //
+        // 0. Stop the supervisor before anything else. It exists to rebuild a
+        //    session that dies, and every step below looks exactly like a
+        //    session dying: stopping it later would race a reconnect against
+        //    the teardown.
+        if let Some(stop) = self.supervisor_shutdown.take() {
+            let _ = stop.send(()).await;
+        }
+        if let Some(mut handle) = self.supervisor_handle.take()
+            && tokio::time::timeout(SHUTDOWN_GRACE, &mut handle)
+                .await
+                .is_err()
+        {
+            warn!("Reconnect supervisor did not stop within {SHUTDOWN_GRACE:?}; aborting it");
+            handle.abort();
+        }
+        // Dropping the sender means a reader that dies during the teardown
+        // below has nobody to report to, which is what we want by then.
+        self.session_lost_sender = None;
+
         // 1. Stop writing maintenance, so nothing races the shutdown.
         if let Some(sender) = self.keepalive_sender.take() {
             let _ = sender.send(()).await;
@@ -1380,7 +2076,7 @@ impl DXLinkClient {
             channels.keys().copied().collect::<Vec<_>>()
         };
 
-        if !channels_to_close.is_empty() && self.connection.is_some() {
+        if !channels_to_close.is_empty() && self.get_connection().is_ok() {
             let closing = async {
                 for channel_id in channels_to_close {
                     if let Err(e) = self.close_channel(channel_id).await {
@@ -1406,7 +2102,7 @@ impl DXLinkClient {
 
         // 4. Drop the connection and every scrap of session state, so a second
         //    disconnect is a no-op and a later reconnect starts clean.
-        self.connection = None;
+        *recover(&self.connection) = None;
         self.server_keepalive_timeout = None;
         self.clear_session_state();
 
@@ -1431,6 +2127,7 @@ impl DXLinkClient {
         // keep it.
         recover(&self.channels).clear();
         recover(&self.channel_schemas).clear();
+        recover(&self.channel_contracts).clear();
         self.event_stream_taken = false;
         recover(&self.subscriptions).clear();
         // Dropping the senders wakes every waiter instead of leaving it to time
@@ -1476,6 +2173,9 @@ impl DXLinkClient {
                     let mut channels = recover(&self.channels);
                     channels.insert(channel_id, "FEED".to_string());
                 }
+                // Kept so a reconnect reopens the channel with the contract it
+                // had, rather than guessing one.
+                recover(&self.channel_contracts).insert(channel_id, contract.to_string());
 
                 info!("Feed channel {} created successfully", channel_id);
                 Ok(channel_id)
@@ -1763,6 +2463,7 @@ impl DXLinkClient {
                 // existed.
                 recover(&self.subscriptions).forget_channel(channel_id);
                 recover(&self.channel_schemas).remove(&channel_id);
+                recover(&self.channel_contracts).remove(&channel_id);
 
                 info!("Channel {} closed successfully", channel_id);
                 Ok(())
@@ -1872,10 +2573,8 @@ impl DXLinkClient {
         Ok(channel_id)
     }
 
-    fn get_connection_mut(&mut self) -> DXLinkResult<&mut WebSocketConnection> {
-        self.connection
-            .as_mut()
-            .ok_or_else(|| DXLinkError::Connection("Not connected to DXLink server".to_string()))
+    fn get_connection_mut(&mut self) -> DXLinkResult<WebSocketConnection> {
+        live_connection(&self.connection)
     }
 
     fn validate_channel(&self, channel_id: u32, expected_service: &str) -> DXLinkResult<()> {
@@ -1920,7 +2619,7 @@ impl fmt::Debug for DXLinkClient {
 
         debug_struct.field("url", &self.url);
         debug_struct.field("has_token", &(!self.token.is_empty()));
-        debug_struct.field("connected", &self.connection.is_some());
+        debug_struct.field("connected", &self.get_connection().is_ok());
         debug_struct.field("keepalive_timeout", &self.keepalive_timeout);
         let channel_count = if let Ok(channels) = self.channels.lock() {
             channels.len()
@@ -1962,7 +2661,7 @@ impl fmt::Display for DXLinkClient {
         write!(
             f,
             "DXLink Client [{}]",
-            if self.connection.is_some() {
+            if self.get_connection().is_ok() {
                 "Connected"
             } else {
                 "Disconnected"
@@ -2011,7 +2710,7 @@ mod tests {
         assert_eq!(client.url, "wss://test.url");
         assert_eq!(client.token, "test_token");
         assert_eq!(client.keepalive_timeout, DEFAULT_KEEPALIVE_TIMEOUT);
-        assert!(client.connection.is_none());
+        assert!(client.get_connection().is_err());
         assert!(client.event_sender.is_none());
         assert!(client.keepalive_handle.is_none());
         assert!(client.message_handle.is_none());
@@ -2148,7 +2847,7 @@ mod tests {
         });
 
         let mut client = DXLinkClient::new(&format!("ws://{}", addr), "test_token");
-        client.connection = Some(
+        *recover(&client.connection) = Some(
             crate::connection::WebSocketConnection::connect(&format!("ws://{}", addr))
                 .await
                 .expect("failed to connect"),
@@ -2193,7 +2892,7 @@ mod tests {
         });
 
         let mut client = DXLinkClient::new(&format!("ws://{}", addr), "test_token");
-        client.connection = Some(
+        *recover(&client.connection) = Some(
             crate::connection::WebSocketConnection::connect(&format!("ws://{}", addr))
                 .await
                 .expect("failed to connect"),
@@ -2359,5 +3058,80 @@ mod keepalive_tests {
 
         let rejected = DXLinkClient::new("wss://example.com", "token").with_keepalive_timeout(0);
         assert!(matches!(rejected, Err(DXLinkError::Protocol(_))));
+    }
+}
+
+#[cfg(test)]
+mod reconnect_policy_tests {
+    use super::*;
+
+    fn policy() -> ReconnectPolicy {
+        ReconnectPolicy {
+            initial_delay: Duration::from_secs(1),
+            max_delay: Duration::from_secs(8),
+            max_attempts: None,
+            jitter: false,
+        }
+    }
+
+    #[test]
+    fn test_the_delay_doubles_and_then_stops_at_the_ceiling() {
+        let policy = policy();
+        let mut seed = 1;
+        let delays: Vec<u64> = (1..=6)
+            .map(|attempt| policy.delay_for(attempt, &mut seed).as_secs())
+            .collect();
+        assert_eq!(delays, [1, 2, 4, 8, 8, 8]);
+    }
+
+    /// A long outage must not fold the backoff back round to zero and start
+    /// hammering, which is what an overflowing shift would do.
+    #[test]
+    fn test_a_very_late_attempt_still_waits_the_maximum() {
+        let policy = policy();
+        let mut seed = 1;
+        for attempt in [40u32, 1_000, u32::MAX] {
+            assert_eq!(
+                policy.delay_for(attempt, &mut seed),
+                policy.max_delay,
+                "attempt {attempt} escaped the ceiling"
+            );
+        }
+    }
+
+    #[test]
+    fn test_jitter_stays_inside_the_backoff_and_moves() {
+        let policy = ReconnectPolicy {
+            jitter: true,
+            ..policy()
+        };
+        let mut seed = 0x2545_F491_4F6C_DD1D;
+        let mut seen = Vec::new();
+        for _ in 0..16 {
+            let delay = policy.delay_for(4, &mut seed);
+            assert!(
+                delay <= policy.max_delay,
+                "jitter must never exceed the delay it spreads: {delay:?}"
+            );
+            seen.push(delay);
+        }
+        // The point of jitter is that two clients do not come back together.
+        assert!(
+            seen.iter().any(|delay| *delay != seen[0]),
+            "jitter produced the same delay every time: {seen:?}"
+        );
+    }
+
+    #[test]
+    fn test_reconnection_is_off_until_it_is_asked_for() {
+        let mut client = DXLinkClient::new("wss://example.com", "token");
+        assert!(client.reconnect.is_none(), "no policy by default");
+        assert!(
+            client.connection_states().is_none(),
+            "no state stream without a policy"
+        );
+
+        client.with_reconnect(ReconnectPolicy::default());
+        assert!(client.reconnect.is_some());
     }
 }

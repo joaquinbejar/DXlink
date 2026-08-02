@@ -71,6 +71,12 @@ pub enum Behaviour {
     NonCompactFeedConfig,
     /// Honour the first FEED_SETUP and reorder the reply to every one after it.
     ReorderedFeedConfigOnSecondSetup,
+    /// Serve one full session, hang up once the feed is subscribed, then serve
+    /// every later connection normally. Drives a reconnect that succeeds.
+    DropFirstSession,
+    /// Like `DropFirstSession`, but reject `AUTH` on every connection after the
+    /// first, so a reconnect hits the one failure it must not retry.
+    RejectAuthOnReconnect,
     /// Negotiate a 3 second keepalive deadline, below the 15s the client used
     /// to assume. Lets a test prove the negotiated value is honoured without
     /// waiting a minute for it.
@@ -97,255 +103,281 @@ impl MockServer {
         let arrived_task = arrived.clone();
 
         tokio::spawn(async move {
-            let Ok((stream, _)) = listener.accept().await else {
-                return;
-            };
-            let Ok(mut ws) = tokio_tungstenite::accept_async(stream).await else {
-                return;
-            };
+            // Serving more than one connection is what lets a test drive a
+            // reconnect: the client comes back to the same address.
+            let mut sessions_served = 0u32;
 
-            // Field order per (channel, event type), learned from FEED_SETUP.
-            let mut event_fields: HashMap<(u64, String), Vec<String>> = HashMap::new();
-            let mut channel_requests_seen = 0u32;
-            let mut feed_setups_seen = 0u32;
-
-            while let Some(Ok(message)) = ws.next().await {
-                let Message::Text(text) = message else {
-                    continue;
+            'accept: loop {
+                let Ok((stream, _)) = listener.accept().await else {
+                    return;
                 };
-                let Ok(value) = serde_json::from_str::<Value>(&text) else {
-                    continue;
+                let Ok(mut ws) = tokio_tungstenite::accept_async(stream).await else {
+                    continue 'accept;
                 };
+                sessions_served += 1;
 
-                received_task
-                    .lock()
-                    .expect("received lock poisoned")
-                    .push(value.clone());
-                arrived_task.notify_waiters();
+                // Field order per (channel, event type), learned from FEED_SETUP.
+                // Per connection: a reconnect renegotiates its own layouts.
+                let mut event_fields: HashMap<(u64, String), Vec<String>> = HashMap::new();
+                let mut channel_requests_seen = 0u32;
+                let mut feed_setups_seen = 0u32;
 
-                let channel = value["channel"].as_u64().unwrap_or(0);
-                let mut responses: Vec<Value> = Vec::new();
-                let mut close_after = false;
+                while let Some(Ok(message)) = ws.next().await {
+                    let Message::Text(text) = message else {
+                        continue;
+                    };
+                    let Ok(value) = serde_json::from_str::<Value>(&text) else {
+                        continue;
+                    };
 
-                // Handshake fault injection, before the normal answers.
-                match (behaviour, value["type"].as_str().unwrap_or("")) {
-                    (Behaviour::Silent, _) => continue,
-                    (Behaviour::CloseAfterHandshake, "AUTH") => {
-                        let _ = ws
-                            .send(Message::Text(
-                                json!({"channel": 0, "type": "AUTH_STATE",
+                    received_task
+                        .lock()
+                        .expect("received lock poisoned")
+                        .push(value.clone());
+                    arrived_task.notify_waiters();
+
+                    let channel = value["channel"].as_u64().unwrap_or(0);
+                    let mut responses: Vec<Value> = Vec::new();
+                    let mut close_after = false;
+
+                    // Handshake fault injection, before the normal answers.
+                    match (behaviour, value["type"].as_str().unwrap_or("")) {
+                        (Behaviour::Silent, _) => continue,
+                        (Behaviour::CloseAfterHandshake, "AUTH") => {
+                            let _ = ws
+                                .send(Message::Text(
+                                    json!({"channel": 0, "type": "AUTH_STATE",
                                        "state": "AUTHORIZED"})
-                                .to_string()
-                                .into(),
-                            ))
-                            .await;
-                        let _ = ws.send(Message::Close(None)).await;
-                        return;
-                    }
-                    (Behaviour::WrongTypeOnSetup, "SETUP") => {
-                        let _ = ws
-                            .send(Message::Text(
-                                json!({"channel": 0, "type": "FEED_CONFIG"})
                                     .to_string()
                                     .into(),
-                            ))
-                            .await;
-                        continue;
-                    }
-                    (Behaviour::WrongChannelOnSetup, "SETUP") => {
-                        let _ = ws
-                            .send(Message::Text(
-                                json!({"channel": 7, "type": "SETUP", "version": "1.0"})
+                                ))
+                                .await;
+                            let _ = ws.send(Message::Close(None)).await;
+                            continue 'accept;
+                        }
+                        (Behaviour::RejectAuthOnReconnect, "AUTH") if sessions_served > 1 => {
+                            let _ = ws
+                                .send(Message::Text(
+                                    json!({"channel": 0, "type": "AUTH_STATE",
+                                       "state": "UNAUTHORIZED"})
                                     .to_string()
                                     .into(),
-                            ))
-                            .await;
-                        continue;
-                    }
-                    (Behaviour::MalformedSetup, "SETUP") => {
-                        let _ = ws.send(Message::Text("not json at all".into())).await;
-                        continue;
-                    }
-                    (Behaviour::ErrorEchoingToken, "SETUP") => {
-                        let echoed = value["token"].as_str().unwrap_or("");
-                        let _ = ws
-                            .send(Message::Text(
-                                json!({"channel": 0, "type": "ERROR", "error": "UNAUTHORIZED",
-                                       "message": format!("rejected token {echoed}")})
-                                .to_string()
-                                .into(),
-                            ))
-                            .await;
-                        continue;
-                    }
-                    (Behaviour::ErrorOnSetup, "SETUP") => {
-                        let _ = ws
-                            .send(Message::Text(
-                                json!({"channel": 0, "type": "ERROR", "error": "UNAUTHORIZED",
-                                       "message": "Authentication failed"})
-                                .to_string()
-                                .into(),
-                            ))
-                            .await;
-                        continue;
-                    }
-                    _ => {}
-                }
-
-                match value["type"].as_str().unwrap_or("") {
-                    "SETUP" => {
-                        let negotiated = if behaviour == Behaviour::ShortKeepalive {
-                            3
-                        } else {
-                            60
-                        };
-                        responses.push(json!({
-                            "channel": channel,
-                            "type": "SETUP",
-                            "version": "1.0.0",
-                            "keepaliveTimeout": negotiated,
-                            "acceptKeepaliveTimeout": negotiated
-                        }));
-                        responses.push(json!({
-                            "channel": 0, "type": "AUTH_STATE", "state": "UNAUTHORIZED"
-                        }));
-                    }
-                    "AUTH" => {
-                        let state = if behaviour == Behaviour::RejectAuth {
-                            "UNAUTHORIZED"
-                        } else {
-                            "AUTHORIZED"
-                        };
-                        responses.push(json!({
-                            "channel": 0, "type": "AUTH_STATE",
-                            "state": state, "userId": "test-user"
-                        }));
-                    }
-                    "CHANNEL_REQUEST" if behaviour == Behaviour::IgnoreChannelRequest => {}
-                    "CHANNEL_REQUEST" if behaviour == Behaviour::IgnoreFirstChannelRequest => {
-                        channel_requests_seen += 1;
-                        if channel_requests_seen == 1 {
+                                ))
+                                .await;
                             continue;
                         }
-                        responses.push(json!({
-                            "channel": channel, "type": "CHANNEL_OPENED",
-                            "service": "FEED", "parameters": {}
-                        }));
-                    }
-                    "CHANNEL_REQUEST" if behaviour == Behaviour::ErrorOnChannelRequest => {
-                        responses.push(json!({
-                            "channel": channel, "type": "ERROR",
-                            "error": "BAD_ACTION", "message": "contract not supported"
-                        }));
-                    }
-                    "CHANNEL_REQUEST" => responses.push(json!({
-                        "channel": channel,
-                        "type": "CHANNEL_OPENED",
-                        "service": value["service"].as_str().unwrap_or("FEED"),
-                        "parameters": {}
-                    })),
-                    "FEED_SETUP"
-                        if behaviour == Behaviour::ReorderedFeedConfig
-                            || (behaviour == Behaviour::ReorderedFeedConfigOnSecondSetup && {
-                                feed_setups_seen += 1;
-                                feed_setups_seen > 1
-                            }) =>
-                    {
-                        let mut reordered = value["acceptEventFields"]["Quote"]
-                            .as_array()
-                            .cloned()
-                            .unwrap_or_default();
-                        // Guard: a fixture panic would mask the behaviour under
-                        // test rather than reporting it.
-                        if reordered.len() >= 2 {
-                            reordered.swap(0, 1);
+                        (Behaviour::WrongTypeOnSetup, "SETUP") => {
+                            let _ = ws
+                                .send(Message::Text(
+                                    json!({"channel": 0, "type": "FEED_CONFIG"})
+                                        .to_string()
+                                        .into(),
+                                ))
+                                .await;
+                            continue;
                         }
-                        responses.push(json!({
-                            "channel": channel, "type": "FEED_CONFIG",
-                            "aggregationPeriod": 0.1, "dataFormat": "COMPACT",
-                            "eventFields": { "Quote": reordered }
-                        }));
+                        (Behaviour::WrongChannelOnSetup, "SETUP") => {
+                            let _ = ws
+                                .send(Message::Text(
+                                    json!({"channel": 7, "type": "SETUP", "version": "1.0"})
+                                        .to_string()
+                                        .into(),
+                                ))
+                                .await;
+                            continue;
+                        }
+                        (Behaviour::MalformedSetup, "SETUP") => {
+                            let _ = ws.send(Message::Text("not json at all".into())).await;
+                            continue;
+                        }
+                        (Behaviour::ErrorEchoingToken, "SETUP") => {
+                            let echoed = value["token"].as_str().unwrap_or("");
+                            let _ = ws
+                                .send(Message::Text(
+                                    json!({"channel": 0, "type": "ERROR", "error": "UNAUTHORIZED",
+                                       "message": format!("rejected token {echoed}")})
+                                    .to_string()
+                                    .into(),
+                                ))
+                                .await;
+                            continue;
+                        }
+                        (Behaviour::ErrorOnSetup, "SETUP") => {
+                            let _ = ws
+                                .send(Message::Text(
+                                    json!({"channel": 0, "type": "ERROR", "error": "UNAUTHORIZED",
+                                       "message": "Authentication failed"})
+                                    .to_string()
+                                    .into(),
+                                ))
+                                .await;
+                            continue;
+                        }
+                        _ => {}
                     }
-                    "FEED_SETUP" if behaviour == Behaviour::NonCompactFeedConfig => {
-                        responses.push(json!({
-                            "channel": channel, "type": "FEED_CONFIG",
-                            "aggregationPeriod": 0.1, "dataFormat": "FULL"
-                        }));
-                    }
-                    "FEED_SETUP" => {
-                        // Remember exactly which fields the client asked for, in
-                        // order: that is the wire layout it will decode against.
-                        if let Some(fields) = value["acceptEventFields"].as_object() {
-                            for (event_type, list) in fields {
-                                let order: Vec<String> = list
-                                    .as_array()
-                                    .map(|a| {
-                                        a.iter()
-                                            .filter_map(|f| f.as_str().map(String::from))
-                                            .collect()
-                                    })
-                                    .unwrap_or_default();
-                                event_fields.insert((channel, event_type.clone()), order);
+
+                    match value["type"].as_str().unwrap_or("") {
+                        "SETUP" => {
+                            let negotiated = if behaviour == Behaviour::ShortKeepalive {
+                                3
+                            } else {
+                                60
+                            };
+                            responses.push(json!({
+                                "channel": channel,
+                                "type": "SETUP",
+                                "version": "1.0.0",
+                                "keepaliveTimeout": negotiated,
+                                "acceptKeepaliveTimeout": negotiated
+                            }));
+                            responses.push(json!({
+                                "channel": 0, "type": "AUTH_STATE", "state": "UNAUTHORIZED"
+                            }));
+                        }
+                        "AUTH" => {
+                            let state = if behaviour == Behaviour::RejectAuth {
+                                "UNAUTHORIZED"
+                            } else {
+                                "AUTHORIZED"
+                            };
+                            responses.push(json!({
+                                "channel": 0, "type": "AUTH_STATE",
+                                "state": state, "userId": "test-user"
+                            }));
+                        }
+                        "CHANNEL_REQUEST" if behaviour == Behaviour::IgnoreChannelRequest => {}
+                        "CHANNEL_REQUEST" if behaviour == Behaviour::IgnoreFirstChannelRequest => {
+                            channel_requests_seen += 1;
+                            if channel_requests_seen == 1 {
+                                continue;
                             }
+                            responses.push(json!({
+                                "channel": channel, "type": "CHANNEL_OPENED",
+                                "service": "FEED", "parameters": {}
+                            }));
                         }
-                        responses.push(json!({
+                        "CHANNEL_REQUEST" if behaviour == Behaviour::ErrorOnChannelRequest => {
+                            responses.push(json!({
+                                "channel": channel, "type": "ERROR",
+                                "error": "BAD_ACTION", "message": "contract not supported"
+                            }));
+                        }
+                        "CHANNEL_REQUEST" => responses.push(json!({
                             "channel": channel,
-                            "type": "FEED_CONFIG",
-                            "aggregationPeriod": 0.1,
-                            "dataFormat": "COMPACT",
-                            "eventFields": value["acceptEventFields"].clone()
-                        }));
-                    }
-                    "FEED_SUBSCRIPTION" => {
-                        if let Some(add) = value.get("add").and_then(|a| a.as_array()) {
-                            for sub in add {
-                                let event_type = sub["type"].as_str().unwrap_or("");
-                                let symbol = sub["symbol"].as_str().unwrap_or("");
-                                let Some(order) =
-                                    event_fields.get(&(channel, event_type.to_string()))
-                                else {
-                                    continue;
-                                };
-                                let row: Vec<Value> = order
-                                    .iter()
-                                    .map(|field| field_value(field, event_type, symbol))
-                                    .collect();
-                                responses.push(json!({
-                                    "channel": channel,
-                                    "type": "FEED_DATA",
-                                    "data": [event_type, row]
-                                }));
+                            "type": "CHANNEL_OPENED",
+                            "service": value["service"].as_str().unwrap_or("FEED"),
+                            "parameters": {}
+                        })),
+                        "FEED_SETUP"
+                            if behaviour == Behaviour::ReorderedFeedConfig
+                                || (behaviour == Behaviour::ReorderedFeedConfigOnSecondSetup
+                                    && {
+                                        feed_setups_seen += 1;
+                                        feed_setups_seen > 1
+                                    }) =>
+                        {
+                            let mut reordered = value["acceptEventFields"]["Quote"]
+                                .as_array()
+                                .cloned()
+                                .unwrap_or_default();
+                            // Guard: a fixture panic would mask the behaviour under
+                            // test rather than reporting it.
+                            if reordered.len() >= 2 {
+                                reordered.swap(0, 1);
                             }
+                            responses.push(json!({
+                                "channel": channel, "type": "FEED_CONFIG",
+                                "aggregationPeriod": 0.1, "dataFormat": "COMPACT",
+                                "eventFields": { "Quote": reordered }
+                            }));
                         }
-                        close_after = behaviour == Behaviour::CloseAfterSubscribe;
+                        "FEED_SETUP" if behaviour == Behaviour::NonCompactFeedConfig => {
+                            responses.push(json!({
+                                "channel": channel, "type": "FEED_CONFIG",
+                                "aggregationPeriod": 0.1, "dataFormat": "FULL"
+                            }));
+                        }
+                        "FEED_SETUP" => {
+                            // Remember exactly which fields the client asked for, in
+                            // order: that is the wire layout it will decode against.
+                            if let Some(fields) = value["acceptEventFields"].as_object() {
+                                for (event_type, list) in fields {
+                                    let order: Vec<String> = list
+                                        .as_array()
+                                        .map(|a| {
+                                            a.iter()
+                                                .filter_map(|f| f.as_str().map(String::from))
+                                                .collect()
+                                        })
+                                        .unwrap_or_default();
+                                    event_fields.insert((channel, event_type.clone()), order);
+                                }
+                            }
+                            responses.push(json!({
+                                "channel": channel,
+                                "type": "FEED_CONFIG",
+                                "aggregationPeriod": 0.1,
+                                "dataFormat": "COMPACT",
+                                "eventFields": value["acceptEventFields"].clone()
+                            }));
+                        }
+                        "FEED_SUBSCRIPTION" => {
+                            if let Some(add) = value.get("add").and_then(|a| a.as_array()) {
+                                for sub in add {
+                                    let event_type = sub["type"].as_str().unwrap_or("");
+                                    let symbol = sub["symbol"].as_str().unwrap_or("");
+                                    let Some(order) =
+                                        event_fields.get(&(channel, event_type.to_string()))
+                                    else {
+                                        continue;
+                                    };
+                                    let row: Vec<Value> = order
+                                        .iter()
+                                        .map(|field| field_value(field, event_type, symbol))
+                                        .collect();
+                                    responses.push(json!({
+                                        "channel": channel,
+                                        "type": "FEED_DATA",
+                                        "data": [event_type, row]
+                                    }));
+                                }
+                            }
+                            close_after = behaviour == Behaviour::CloseAfterSubscribe
+                                || (matches!(
+                                    behaviour,
+                                    Behaviour::DropFirstSession | Behaviour::RejectAuthOnReconnect
+                                ) && sessions_served == 1);
+                        }
+                        "CHANNEL_CANCEL" => responses.push(json!({
+                            "channel": channel, "type": "CHANNEL_CLOSED"
+                        })),
+                        // KEEPALIVE and anything else needs no reply.
+                        _ => {}
                     }
-                    "CHANNEL_CANCEL" => responses.push(json!({
-                        "channel": channel, "type": "CHANNEL_CLOSED"
-                    })),
-                    // KEEPALIVE and anything else needs no reply.
-                    _ => {}
+
+                    for response in responses {
+                        if behaviour == Behaviour::ControlFrames {
+                            let _ = ws.send(Message::Ping(vec![7].into())).await;
+                        }
+                        if ws
+                            .send(Message::Text(response.to_string().into()))
+                            .await
+                            .is_err()
+                        {
+                            continue 'accept;
+                        }
+                        if behaviour == Behaviour::ControlFrames {
+                            let _ = ws.send(Message::Pong(Vec::new().into())).await;
+                        }
+                    }
+
+                    if close_after {
+                        let _ = ws.send(Message::Close(None)).await;
+                        continue 'accept;
+                    }
                 }
 
-                for response in responses {
-                    if behaviour == Behaviour::ControlFrames {
-                        let _ = ws.send(Message::Ping(vec![7].into())).await;
-                    }
-                    if ws
-                        .send(Message::Text(response.to_string().into()))
-                        .await
-                        .is_err()
-                    {
-                        return;
-                    }
-                    if behaviour == Behaviour::ControlFrames {
-                        let _ = ws.send(Message::Pong(Vec::new().into())).await;
-                    }
-                }
-
-                if close_after {
-                    let _ = ws.send(Message::Close(None)).await;
-                    return;
-                }
+                // The client hung up; wait for the next one.
             }
         });
 
