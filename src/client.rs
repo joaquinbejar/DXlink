@@ -203,6 +203,15 @@ fn recover<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
+/// The symbol an event refers to, borrowed rather than cloned.
+fn symbol_of(event: &MarketEvent) -> &str {
+    match event {
+        MarketEvent::Quote(e) => &e.event_symbol,
+        MarketEvent::Trade(e) => &e.event_symbol,
+        MarketEvent::Greeks(e) => &e.event_symbol,
+    }
+}
+
 /// Records why a session ended, keeping the first reason rather than the last.
 ///
 /// The first failure is the cause; anything after it is a consequence of a
@@ -482,19 +491,13 @@ impl DXLinkClient {
             let mut stream_closed_reported = false;
 
             while let Some(event) = delivery_rx.recv().await {
-                let symbol = match &event {
-                    MarketEvent::Quote(e) => e.event_symbol.clone(),
-                    MarketEvent::Trade(e) => e.event_symbol.clone(),
-                    MarketEvent::Greeks(e) => e.event_symbol.clone(),
-                };
+                // Borrowed, not cloned: this runs per event on a hot path.
+                let symbol = symbol_of(&event);
 
                 // Copy the handle out and release the lock before running user
                 // code: holding it across a callback serialises every other
                 // symbol behind whatever that callback is doing.
-                let callback = match callbacks.lock() {
-                    Ok(map) => map.get(&symbol).cloned(),
-                    Err(poisoned) => poisoned.into_inner().get(&symbol).cloned(),
-                };
+                let callback = recover(&callbacks).get(symbol).cloned();
 
                 if let Some(callback) = callback {
                     let delivered = event.clone();
@@ -515,8 +518,13 @@ impl DXLinkClient {
                 if let Some(tx) = &event_sender {
                     match tx.try_send(event) {
                         Ok(()) => {}
-                        Err(mpsc::error::TrySendError::Full(_)) => {
-                            debug!("Event stream full, dropping an event for {}", symbol);
+                        Err(mpsc::error::TrySendError::Full(returned)) => {
+                            // try_send hands the event back, so the symbol is
+                            // still available without having cloned it up front.
+                            debug!(
+                                "Event stream full, dropping an event for {}",
+                                symbol_of(&returned)
+                            );
                         }
                         Err(mpsc::error::TrySendError::Closed(_)) => {
                             // The consumer dropped its receiver. Callbacks still
@@ -618,6 +626,10 @@ impl DXLinkClient {
     /// # }
     /// ```
     pub async fn connect(&mut self) -> DXLinkResult<Receiver<MarketEvent>> {
+        // A new session starts clean: a reason from the previous one would make
+        // a healthy connection look dead.
+        *recover(&self.disconnect_reason) = None;
+
         // Connect to WebSocket
         let connection = WebSocketConnection::connect(&self.url).await?;
 
@@ -1087,6 +1099,7 @@ impl DXLinkClient {
         // dead connection has to go, and a prior panic elsewhere is no reason to
         // keep it.
         recover(&self.channels).clear();
+        self.event_stream_taken = false;
         recover(&self.subscriptions).clear();
         // Dropping the senders wakes every waiter instead of leaving it to time
         // out against a connection that is already gone.

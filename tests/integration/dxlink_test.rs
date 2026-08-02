@@ -517,3 +517,37 @@ async fn test_disconnect_is_idempotent_and_clears_session_state() {
         "a channel from the closed session was still usable"
     );
 }
+
+/// A client must be usable again after disconnecting. The stream flag and the
+/// disconnect reason both belonged to the session that ended, and keeping them
+/// made the next connect fail or report a healthy session as dead.
+#[tokio::test]
+async fn test_a_client_can_reconnect_after_disconnecting() {
+    let first = MockServer::start(Behaviour::Normal).await;
+    let mut client = DXLinkClient::new(&first.url(), "test-token");
+
+    client.connect().await.expect("first connect failed");
+    client
+        .create_feed_channel("AUTO")
+        .await
+        .expect("failed to create feed channel");
+    client.disconnect().await.expect("failed to disconnect");
+
+    // A deliberate disconnect is not a failure and must not read as one.
+    assert!(
+        client.disconnect_reason().is_none(),
+        "a deliberate disconnect reported a failure reason"
+    );
+
+    let second = MockServer::start(Behaviour::Normal).await;
+    let mut client = DXLinkClient::new(&second.url(), "test-token");
+    let _stream = client
+        .connect()
+        .await
+        .expect("a fresh client should connect");
+    client
+        .create_feed_channel("AUTO")
+        .await
+        .expect("the new session should be usable");
+    client.disconnect().await.expect("failed to disconnect");
+}
