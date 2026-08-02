@@ -466,3 +466,95 @@ async fn test_a_failed_send_does_not_move_the_tracked_state() {
         "a failed reset must not clear the tracked state"
     );
 }
+
+/// An indexed subscription is scoped to its source, so the same type and symbol
+/// from two sources are two subscriptions. Collapsing them made `unsubscribe`
+/// remove the wrong local entry and a replay silently omit one source.
+#[tokio::test]
+async fn test_two_sources_for_one_symbol_are_tracked_separately() {
+    let server = MockServer::start(Behaviour::Normal).await;
+    let (mut client, channel_id) = connected_feed(&server, &[EventType::Quote]).await;
+
+    let from = |source: &str| FeedSubscription {
+        event_type: "Quote".to_string(),
+        symbol: "AAPL".to_string(),
+        from_time: None,
+        source: Some(source.to_string()),
+    };
+
+    client
+        .subscribe(channel_id, vec![from("DEX"), from("NTV")])
+        .await
+        .expect("failed to subscribe");
+
+    let tracked = client.subscriptions(channel_id);
+    assert_eq!(tracked.len(), 2, "the two sources collapsed: {tracked:?}");
+
+    // Removing one leaves the other, which is the assertion a shared key fails.
+    client
+        .unsubscribe(channel_id, vec![from("DEX")])
+        .await
+        .expect("failed to unsubscribe");
+
+    let left = client.subscriptions(channel_id);
+    assert_eq!(left.len(), 1, "unsubscribe removed too much: {left:?}");
+    assert_eq!(left[0].source.as_deref(), Some("NTV"));
+}
+
+/// A subscription with no source is its own identity, not a wildcard that
+/// matches the sourced ones.
+#[tokio::test]
+async fn test_a_sourceless_subscription_is_its_own_entry() {
+    let server = MockServer::start(Behaviour::Normal).await;
+    let (mut client, channel_id) = connected_feed(&server, &[EventType::Quote]).await;
+
+    let sourced = FeedSubscription {
+        event_type: "Quote".to_string(),
+        symbol: "AAPL".to_string(),
+        from_time: None,
+        source: Some("DEX".to_string()),
+    };
+
+    client
+        .subscribe(channel_id, vec![quote_sub("AAPL"), sourced.clone()])
+        .await
+        .expect("failed to subscribe");
+    assert_eq!(client.subscriptions(channel_id).len(), 2);
+
+    client
+        .unsubscribe(channel_id, vec![sourced])
+        .await
+        .expect("failed to unsubscribe");
+
+    let left = client.subscriptions(channel_id);
+    assert_eq!(left.len(), 1);
+    assert_eq!(left[0].source, None, "the wrong entry went: {left:?}");
+}
+
+/// `fromTime` is a parameter of the series rather than part of its identity, so
+/// the same symbol from the same source still replaces rather than accumulates.
+#[tokio::test]
+async fn test_a_new_from_time_replaces_the_same_source() {
+    let server = MockServer::start(Behaviour::Normal).await;
+    let (mut client, channel_id) = connected_feed(&server, &[EventType::Candle]).await;
+
+    let candle = |from_time: i64| FeedSubscription {
+        event_type: "Candle".to_string(),
+        symbol: "AAPL{=5m}".to_string(),
+        from_time: Some(from_time),
+        source: Some("DEX".to_string()),
+    };
+
+    client
+        .subscribe(channel_id, vec![candle(1_700_000_000_000)])
+        .await
+        .expect("failed to subscribe");
+    client
+        .subscribe(channel_id, vec![candle(1_700_000_600_000)])
+        .await
+        .expect("failed to resubscribe");
+
+    let tracked = client.subscriptions(channel_id);
+    assert_eq!(tracked.len(), 1, "the entry should have been replaced");
+    assert_eq!(tracked[0].from_time, Some(1_700_000_600_000));
+}

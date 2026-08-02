@@ -226,32 +226,50 @@ struct TrackedSubscription {
     subscription: FeedSubscription,
 }
 
+/// What identifies a subscription inside one channel: event type, symbol and
+/// source.
+///
+/// `source` is part of the identity because an indexed subscription is scoped
+/// to it — the same type and symbol from two sources are two subscriptions, and
+/// removing one must not forget the other. `fromTime` is **not**: it is a
+/// parameter of the series, so resubscribing the same symbol from the same
+/// source with a new time replaces the entry rather than adding a second one.
+type SubscriptionKey = (EventType, String, Option<String>);
+
 /// Live subscriptions, per channel, keyed the way the server keys them.
 ///
-/// The server identifies a subscription within a channel by event type and
-/// symbol; `fromTime` and `source` are parameters of that subscription rather
-/// than part of its identity. So subscribing to the same type and symbol twice
-/// on one channel **replaces** the entry — the second call is what the server
-/// ends up honouring, and tracking both would make replay send a subscription
-/// the server had already superseded.
+/// Subscribing twice to the same [`SubscriptionKey`] on one channel
+/// **replaces** the entry: the second call is what the server ends up
+/// honouring, and tracking both would make a replay send a subscription the
+/// server had already superseded.
 ///
 /// Per channel, because two feed channels can legitimately hold the same event
 /// and symbol with different aggregation, and closing or resetting one must not
 /// forget the other's.
 #[derive(Debug, Default)]
 struct SubscriptionBook {
-    by_channel: HashMap<u32, HashMap<(EventType, String), TrackedSubscription>>,
+    by_channel: HashMap<u32, HashMap<SubscriptionKey, TrackedSubscription>>,
     next_order: u64,
 }
 
+/// The identity of a subscription, for tracking it.
+fn key_of(event_type: EventType, subscription: &FeedSubscription) -> SubscriptionKey {
+    (
+        event_type,
+        subscription.symbol.clone(),
+        subscription.source.clone(),
+    )
+}
+
 impl SubscriptionBook {
-    /// Records a subscription, replacing any earlier one for the same type and
-    /// symbol on that channel.
+    /// Records a subscription, replacing any earlier one with the same identity
+    /// on that channel.
     fn insert(&mut self, channel_id: u32, event_type: EventType, subscription: FeedSubscription) {
         let order = self.next_order;
         self.next_order += 1;
+        let key = key_of(event_type, &subscription);
         self.by_channel.entry(channel_id).or_default().insert(
-            (event_type, subscription.symbol.clone()),
+            key,
             TrackedSubscription {
                 order,
                 subscription,
@@ -261,9 +279,9 @@ impl SubscriptionBook {
 
     /// Forgets one subscription. Unknown entries are ignored: the server treats
     /// removing something that is not there as a no-op too.
-    fn remove(&mut self, channel_id: u32, event_type: EventType, symbol: &str) {
+    fn remove(&mut self, channel_id: u32, event_type: EventType, subscription: &FeedSubscription) {
         if let Some(channel) = self.by_channel.get_mut(&channel_id) {
-            channel.remove(&(event_type, symbol.to_string()));
+            channel.remove(&key_of(event_type, subscription));
             if channel.is_empty() {
                 self.by_channel.remove(&channel_id);
             }
@@ -1636,7 +1654,6 @@ impl DXLinkClient {
             ))
         })?;
         let parsed = parse_subscription_types(&subscriptions, channel_id, &configured)?;
-        let symbols: Vec<String> = subscriptions.iter().map(|s| s.symbol.clone()).collect();
 
         let subscription_msg = FeedSubscriptionMessage {
             channel: channel_id,
@@ -1650,11 +1667,13 @@ impl DXLinkClient {
         conn.send(&subscription_msg).await?;
 
         // After the send, for the same reason as subscribe: a failed send must
-        // not leave the client believing it unsubscribed.
-        {
+        // not leave the client believing it unsubscribed. Matched on the whole
+        // identity, source included, so removing one source's subscription does
+        // not forget another's for the same symbol.
+        if let Some(removed) = subscription_msg.remove.as_ref() {
             let mut subs = recover(&self.subscriptions);
-            for (event_type, symbol) in parsed.iter().zip(&symbols) {
-                subs.remove(channel_id, *event_type, symbol);
+            for (event_type, subscription) in parsed.iter().zip(removed) {
+                subs.remove(channel_id, *event_type, subscription);
             }
         }
 
