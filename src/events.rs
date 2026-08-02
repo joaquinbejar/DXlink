@@ -227,6 +227,56 @@ impl EventType {
     }
 }
 
+/// Serde for DXLink's JSONDouble encoding.
+///
+/// JSON has no literal for a non-finite number, so the protocol sends them as
+/// the strings `"NaN"`, `"Infinity"` and `"-Infinity"`. These are ordinary
+/// values in market data, not anomalies: an option with no bid has a `NaN`
+/// price. Deriving plain `f64` meant such a payload failed to deserialize, and
+/// serializing one produced JSON the protocol does not accept.
+pub mod json_double {
+    use serde::de::{Error, Unexpected};
+    use serde::{Deserialize, Deserializer, Serializer};
+    use serde_json::Value;
+
+    /// Emits the protocol's string form for non-finite values.
+    pub fn serialize<S: Serializer>(value: &f64, serializer: S) -> Result<S::Ok, S::Error> {
+        if value.is_nan() {
+            serializer.serialize_str("NaN")
+        } else if value.is_infinite() {
+            serializer.serialize_str(if value.is_sign_positive() {
+                "Infinity"
+            } else {
+                "-Infinity"
+            })
+        } else {
+            serializer.serialize_f64(*value)
+        }
+    }
+
+    /// Accepts a JSON number or one of the protocol's non-finite strings.
+    pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<f64, D::Error> {
+        let value = Value::deserialize(deserializer)?;
+
+        if let Some(number) = value.as_f64() {
+            return Ok(number);
+        }
+
+        match value.as_str() {
+            Some("NaN") => Ok(f64::NAN),
+            Some("Infinity") => Ok(f64::INFINITY),
+            Some("-Infinity") => Ok(f64::NEG_INFINITY),
+            Some(other) => Err(D::Error::invalid_value(
+                Unexpected::Str(other),
+                &"a number, or \"NaN\", \"Infinity\" or \"-Infinity\"",
+            )),
+            None => Err(D::Error::custom(format!(
+                "expected a JSONDouble, got {value}"
+            ))),
+        }
+    }
+}
+
 /// Represents a quote event for a financial instrument.
 ///
 /// This structure holds information about a specific quote event, including the type of event,
@@ -243,18 +293,22 @@ pub struct QuoteEvent {
 
     /// The bid price for the instrument.
     #[serde(rename = "bidPrice")]
+    #[serde(with = "json_double")]
     pub bid_price: f64,
 
     /// The ask price for the instrument.
     #[serde(rename = "askPrice")]
+    #[serde(with = "json_double")]
     pub ask_price: f64,
 
     /// The size of the bid.
     #[serde(rename = "bidSize")]
+    #[serde(with = "json_double")]
     pub bid_size: f64,
 
     /// The size of the ask.
     #[serde(rename = "askSize")]
+    #[serde(with = "json_double")]
     pub ask_size: f64,
 }
 
@@ -269,12 +323,15 @@ pub struct TradeEvent {
     pub event_symbol: String,
     /// The price of the trade.
     #[serde(rename = "price")]
+    #[serde(with = "json_double")]
     pub price: f64,
     /// The size or quantity of the trade.
     #[serde(rename = "size")]
+    #[serde(with = "json_double")]
     pub size: f64,
     /// The total trading volume for the day.
     #[serde(rename = "dayVolume")]
+    #[serde(with = "json_double")]
     pub day_volume: f64,
 }
 
@@ -313,26 +370,32 @@ pub struct GreeksEvent {
 
     /// The delta value. This field is serialized as `delta`.
     #[serde(rename = "delta")]
+    #[serde(with = "json_double")]
     pub delta: f64,
 
     /// The gamma value. This field is serialized as `gamma`.
     #[serde(rename = "gamma")]
+    #[serde(with = "json_double")]
     pub gamma: f64,
 
     /// The theta value. This field is serialized as `theta`.
     #[serde(rename = "theta")]
+    #[serde(with = "json_double")]
     pub theta: f64,
 
     /// The vega value. This field is serialized as `vega`.
     #[serde(rename = "vega")]
+    #[serde(with = "json_double")]
     pub vega: f64,
 
     /// The rho value. This field is serialized as `rho`.
     #[serde(rename = "rho")]
+    #[serde(with = "json_double")]
     pub rho: f64,
 
     /// The volatility value. This field is serialized as `volatility`.
     #[serde(rename = "volatility")]
+    #[serde(with = "json_double")]
     pub volatility: f64,
 }
 
@@ -864,5 +927,109 @@ mod wire_name_tests {
             ALL_EVENT_TYPES.len(),
             "ALL_EVENT_TYPES contains a duplicate"
         );
+    }
+}
+
+#[cfg(test)]
+mod json_double_tests {
+    use super::*;
+    use serde_json::json;
+
+    /// An option with no bid has a NaN price. The protocol sends it as a string
+    /// because JSON has no literal, and deriving plain f64 rejected it.
+    #[test]
+    fn test_a_full_payload_with_non_finite_values_deserializes() {
+        let quote: QuoteEvent = serde_json::from_value(json!({
+            "eventType": "Quote",
+            "eventSymbol": "AAPL240119C00500000",
+            "bidPrice": "NaN",
+            "askPrice": "Infinity",
+            "bidSize": "-Infinity",
+            "askSize": 150.0
+        }))
+        .expect("the protocol's non-finite strings are valid");
+
+        assert!(quote.bid_price.is_nan());
+        assert_eq!(quote.ask_price, f64::INFINITY);
+        assert_eq!(quote.bid_size, f64::NEG_INFINITY);
+        assert_eq!(quote.ask_size, 150.0);
+    }
+
+    /// Serializing must produce what the protocol accepts, not JSON `null` or a
+    /// serializer error.
+    #[test]
+    fn test_non_finite_values_serialize_to_the_protocol_strings() {
+        let json = serde_json::to_value(QuoteEvent {
+            event_type: "Quote".to_string(),
+            event_symbol: "AAPL".to_string(),
+            bid_price: f64::NAN,
+            ask_price: f64::INFINITY,
+            bid_size: f64::NEG_INFINITY,
+            ask_size: 150.0,
+        })
+        .expect("failed to serialize");
+
+        assert_eq!(json["bidPrice"], "NaN");
+        assert_eq!(json["askPrice"], "Infinity");
+        assert_eq!(json["bidSize"], "-Infinity");
+        // Finite values stay numbers; quoting them all would be a wire change.
+        assert_eq!(json["askSize"], 150.0);
+    }
+
+    #[test]
+    fn test_finite_values_round_trip_exactly() {
+        let original = TradeEvent {
+            event_type: "Trade".to_string(),
+            event_symbol: "MSFT".to_string(),
+            price: 280.75,
+            size: 50.0,
+            day_volume: 5_000_000.0,
+        };
+
+        let back: TradeEvent =
+            serde_json::from_str(&serde_json::to_string(&original).expect("serialize"))
+                .expect("deserialize");
+
+        assert_eq!(back.price, 280.75);
+        assert_eq!(back.size, 50.0);
+        assert_eq!(back.day_volume, 5_000_000.0);
+    }
+
+    #[test]
+    fn test_non_finite_values_round_trip_through_full_json() {
+        let original = GreeksEvent {
+            event_type: "Greeks".to_string(),
+            event_symbol: "AAPL240119C00500000".to_string(),
+            delta: f64::NAN,
+            gamma: 0.05,
+            theta: f64::NEG_INFINITY,
+            vega: 0.1,
+            rho: f64::INFINITY,
+            volatility: 0.25,
+        };
+
+        let back: GreeksEvent =
+            serde_json::from_str(&serde_json::to_string(&original).expect("serialize"))
+                .expect("deserialize");
+
+        assert!(back.delta.is_nan());
+        assert_eq!(back.theta, f64::NEG_INFINITY);
+        assert_eq!(back.rho, f64::INFINITY);
+        assert_eq!(back.gamma, 0.05);
+    }
+
+    #[test]
+    fn test_a_string_that_is_not_a_known_special_is_rejected() {
+        let result: Result<QuoteEvent, _> = serde_json::from_value(json!({
+            "eventType": "Quote",
+            "eventSymbol": "AAPL",
+            "bidPrice": "cheap",
+            "askPrice": 1.0,
+            "bidSize": 1.0,
+            "askSize": 1.0
+        }));
+
+        let error = result.expect_err("`cheap` is not a JSONDouble").to_string();
+        assert!(error.contains("cheap"), "the value is missing: {error}");
     }
 }
