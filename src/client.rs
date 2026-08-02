@@ -1663,8 +1663,8 @@ impl DXLinkClient {
         Ok(())
     }
 
-    /// Resets the subscriptions on one channel, leaving every other channel's
-    /// alone.
+    /// Resets the subscriptions on one channel, leaving the subscriptions on
+    /// every other channel untouched.
     ///
     /// The reset the server performs is scoped to the channel it arrives on, so
     /// the tracked state now matches: this used to clear every channel's
