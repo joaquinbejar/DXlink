@@ -383,3 +383,68 @@ async fn test_a_timed_out_request_cannot_steal_a_later_response() {
 
     client.disconnect().await.expect("failed to disconnect");
 }
+
+/// The helper's own timeout is a distinct cleanup path from a cancelled caller.
+/// This lets it fire, then proves the stale registration cannot answer for the
+/// request that follows: the second attempt must get its own channel back, not
+/// be starved by the first.
+#[tokio::test]
+async fn test_a_request_that_times_out_does_not_starve_the_next_one() {
+    let server = MockServer::start(Behaviour::IgnoreFirstChannelRequest).await;
+    let mut client = DXLinkClient::new(&server.url(), "test-token");
+    client.connect().await.expect("failed to connect");
+
+    // Let the helper's internal timeout elapse rather than cancelling it.
+    tokio::time::pause();
+    let first = client.create_feed_channel("AUTO").await;
+    tokio::time::resume();
+    assert!(
+        matches!(first, Err(DXLinkError::Timeout(_))),
+        "the first request should time out, got: {first:?}"
+    );
+    assert_eq!(
+        client.pending_response_count(),
+        0,
+        "the timed-out registration was left behind"
+    );
+
+    // The server answers from here on; the response must reach this caller.
+    let channel = client
+        .create_feed_channel("AUTO")
+        .await
+        .expect("the second request should be answered");
+    client
+        .setup_feed(channel, &[EventType::Quote])
+        .await
+        .expect("the channel the second request opened should be usable");
+
+    client.disconnect().await.expect("failed to disconnect");
+}
+
+/// A failed send is the third cleanup path: the registration goes in before the
+/// send, so a send that errors must not leave it behind.
+#[tokio::test]
+async fn test_a_failed_send_leaves_no_pending_request() {
+    let server = MockServer::start(Behaviour::CloseAfterHandshake).await;
+    let mut client = DXLinkClient::new(&server.url(), "test-token");
+    client.connect().await.expect("failed to connect");
+
+    // The server hung up right after AUTH, so this send cannot land.
+    let mut last = Ok(0);
+    for _ in 0..5 {
+        last = client.create_feed_channel("AUTO").await;
+        if last.is_err() {
+            break;
+        }
+    }
+    assert!(
+        last.is_err(),
+        "the send should fail against a closed socket"
+    );
+
+    assert_eq!(
+        client.pending_response_count(),
+        0,
+        "a failed send left a registration behind"
+    );
+}

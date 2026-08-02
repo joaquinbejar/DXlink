@@ -85,8 +85,10 @@ enum ResponseType {
     FeedConfig(u32),
     /// Indicates a channel has been closed. The `u32` value represents the channel identifier.
     ChannelClosed(u32),
-    /// Indicates an error has occurred. The `String` value contains the error message.
-    Error(String),
+    /// A server error. Kept as `(code, message)` rather than pre-formatted text
+    /// so the caller can pick the right `DXLinkError` from the code instead of
+    /// having to parse it back out of a sentence.
+    Error(String, String),
     /// A generic response type for other cases. The `String` value contains the response data.  This variant is currently unused (`#[allow(dead_code)]`).
     #[allow(dead_code)]
     Other(String),
@@ -364,9 +366,24 @@ impl DXLinkClient {
         self.get_connection()?.send(message).await?;
 
         match tokio::time::timeout(wait, rx).await {
-            Ok(Ok(ResponseType::Error(detail))) => Err(DXLinkError::Protocol(format!(
-                "during {operation} on channel {channel}, the server returned {detail}"
-            ))),
+            Ok(Ok(ResponseType::Error(code, message))) => {
+                let detail = format!(
+                    "during {operation} on channel {channel}, waiting for {expected_type}, \
+                     the server returned {code}: {message}"
+                );
+                // Pick the variant from the code: an UNAUTHORIZED here means the
+                // same thing it means during the handshake, and collapsing it to
+                // Protocol would lose the terminal classification a caller needs
+                // to know it must re-authenticate rather than retry.
+                Err(match code.to_ascii_uppercase().as_str() {
+                    "UNAUTHORIZED" => DXLinkError::Authentication(detail),
+                    // The channel itself is the problem, as opposed to the
+                    // action, which is a protocol violation and falls through.
+                    "INVALID_CHANNEL" | "UNKNOWN_CHANNEL" => DXLinkError::Channel(detail),
+                    "TIMEOUT" => DXLinkError::Timeout(detail),
+                    _ => DXLinkError::Protocol(detail),
+                })
+            }
             Ok(Ok(response)) => Ok(response),
             Ok(Err(_)) => Err(DXLinkError::Protocol(format!(
                 "during {operation} on channel {channel}, the response channel closed"
@@ -742,11 +759,10 @@ impl DXLinkClient {
                                                     .get("message")
                                                     .and_then(|v| v.as_str())
                                                     .unwrap_or("");
-                                                ResponseType::Error(format!(
-                                                    "{}: {}",
+                                                ResponseType::Error(
                                                     sanitize_server_text(error),
-                                                    sanitize_server_text(message)
-                                                ))
+                                                    sanitize_server_text(message),
+                                                )
                                             }
                                             _ => ResponseType::Other(msg.clone()),
                                         };
@@ -927,9 +943,8 @@ impl DXLinkClient {
                 info!("Feed channel {} created successfully", channel_id);
                 Ok(channel_id)
             }
-            ResponseType::Error(error) => Err(DXLinkError::Protocol(format!(
-                "Server returned error: {}",
-                error
+            ResponseType::Error(code, message) => Err(DXLinkError::Protocol(format!(
+                "server returned {code}: {message}"
             ))),
             _ => Err(DXLinkError::Protocol(
                 "Unexpected response type".to_string(),
@@ -1017,9 +1032,8 @@ impl DXLinkClient {
                 info!("Feed channel {} setup completed successfully", channel_id);
                 Ok(())
             }
-            ResponseType::Error(error) => Err(DXLinkError::Protocol(format!(
-                "Server returned error: {}",
-                error
+            ResponseType::Error(code, message) => Err(DXLinkError::Protocol(format!(
+                "server returned {code}: {message}"
             ))),
             _ => Err(DXLinkError::Protocol(
                 "Unexpected response type".to_string(),
@@ -1168,9 +1182,8 @@ impl DXLinkClient {
                 info!("Channel {} closed successfully", channel_id);
                 Ok(())
             }
-            ResponseType::Error(error) => Err(DXLinkError::Protocol(format!(
-                "Server returned error: {}",
-                error
+            ResponseType::Error(code, message) => Err(DXLinkError::Protocol(format!(
+                "server returned {code}: {message}"
             ))),
             _ => Err(DXLinkError::Protocol(
                 "Unexpected response type".to_string(),
