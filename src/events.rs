@@ -87,6 +87,56 @@ impl From<&str> for EventType {
     }
 }
 
+impl EventType {
+    /// The COMPACT field list this client requests for the event type, in the
+    /// exact order the decoder reads it.
+    ///
+    /// This is the single source of truth for the `setup_feed` ↔
+    /// `parse_compact_data` contract. The server echoes these fields back in
+    /// `FEED_CONFIG` and then sends rows in this order, so the list, the
+    /// validation of the reply, and the decoder stride all have to come from
+    /// one place. They used to be three separate literals.
+    ///
+    /// `None` means this client has no decoder for the type: it can be named,
+    /// but no row can be turned into a [`MarketEvent`](crate::MarketEvent).
+    pub fn compact_fields(&self) -> Option<&'static [&'static str]> {
+        match self {
+            EventType::Quote => Some(&[
+                "eventType",
+                "eventSymbol",
+                "bidPrice",
+                "askPrice",
+                "bidSize",
+                "askSize",
+            ]),
+            EventType::Trade => Some(&["eventType", "eventSymbol", "price", "size", "dayVolume"]),
+            EventType::Greeks => Some(&[
+                "eventType",
+                "eventSymbol",
+                "delta",
+                "gamma",
+                "theta",
+                "vega",
+                "rho",
+                "volatility",
+            ]),
+            // Declared by the protocol, not decoded here.
+            EventType::Summary
+            | EventType::Profile
+            | EventType::Order
+            | EventType::TimeAndSale
+            | EventType::Candle
+            | EventType::TradeETH
+            | EventType::SpreadOrder
+            | EventType::TheoPrice
+            | EventType::Underlying
+            | EventType::Series
+            | EventType::Configuration
+            | EventType::Message => None,
+        }
+    }
+}
+
 /// Represents a quote event for a financial instrument.
 ///
 /// This structure holds information about a specific quote event, including the type of event,

@@ -9,8 +9,8 @@ use crate::error::{DXLinkError, DXLinkResult};
 use crate::events::{CompactData, EventType, MarketEvent};
 use crate::messages::{
     AuthMessage, AuthStateMessage, BaseMessage, ChannelRequestMessage, ErrorMessage,
-    FeedDataMessage, FeedSetupMessage, FeedSubscription, FeedSubscriptionMessage, KeepaliveMessage,
-    ServerSetupMessage, SetupMessage,
+    FeedConfigMessage, FeedDataMessage, FeedSetupMessage, FeedSubscription,
+    FeedSubscriptionMessage, KeepaliveMessage, ServerSetupMessage, SetupMessage,
 };
 
 use crate::parse_compact_data;
@@ -92,8 +92,9 @@ pub type EventCallback = Box<dyn Fn(MarketEvent) + Send + Sync + 'static>;
 enum ResponseType {
     /// Indicates a channel has been opened. The `u32` value represents the channel identifier.
     ChannelOpened(u32),
-    /// Indicates a feed configuration has been received.  The `u32` value represents the channel identifier.
-    FeedConfig(u32),
+    /// A feed configuration. Carries the whole message, not just the
+    /// channel: the negotiated data format and field order are the point.
+    FeedConfig(Box<FeedConfigMessage>),
     /// Indicates a channel has been closed. The `u32` value represents the channel identifier.
     ChannelClosed(u32),
     /// A server error. Kept as `(code, message)` rather than pre-formatted text
@@ -206,6 +207,71 @@ fn recover<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     mutex
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// Field layouts, per event type, that a channel was configured with.
+type ChannelSchema = HashMap<String, Vec<String>>;
+
+/// Validated layouts per channel.
+type ChannelSchemas = Arc<Mutex<HashMap<u32, ChannelSchema>>>;
+
+/// The COMPACT field lists this client requests for a set of event types.
+fn requested_fields(event_types: &[EventType]) -> ChannelSchema {
+    event_types
+        .iter()
+        .map(|event_type| {
+            let fields = event_type
+                .compact_fields()
+                .unwrap_or(&["eventType", "eventSymbol"])
+                .iter()
+                .map(|f| (*f).to_string())
+                .collect();
+            (event_type.to_string(), fields)
+        })
+        .collect()
+}
+
+/// Checks that the server agreed to the contract this client asked for.
+///
+/// The specification says `FEED_CONFIG` reports the *actual* configuration, and
+/// that the server may send it again when it changes. Treating it as a bare
+/// acknowledgement meant a different data format, a reordered field list, or a
+/// dropped field all went unnoticed until the decoder produced numbers in the
+/// wrong fields.
+fn validate_feed_config(
+    config: &FeedConfigMessage,
+    channel_id: u32,
+    event_types: &[EventType],
+) -> DXLinkResult<()> {
+    if !config.data_format.eq_ignore_ascii_case("COMPACT") {
+        return Err(DXLinkError::Protocol(format!(
+            "channel {channel_id}: this client decodes COMPACT rows, but the server \
+             negotiated {}",
+            config.data_format
+        )));
+    }
+
+    // A server that echoes no field list has not disagreed with the request.
+    let Some(negotiated) = config.event_fields.as_ref() else {
+        return Ok(());
+    };
+
+    for (event_type, expected) in requested_fields(event_types) {
+        let Some(actual) = negotiated.get(&event_type) else {
+            // Not echoed back is not a disagreement either.
+            continue;
+        };
+
+        if *actual != expected {
+            return Err(DXLinkError::Protocol(format!(
+                "channel {channel_id}: the server changed the {event_type} field layout; \
+                 requested {expected:?} but it negotiated {actual:?}. Decoding against the \
+                 requested order would attach values to the wrong fields"
+            )));
+        }
+    }
+
+    Ok(())
 }
 
 /// The symbol an event refers to, borrowed rather than cloned.
@@ -328,6 +394,9 @@ pub struct DXLinkClient {
     response_requests: Arc<Mutex<Vec<ResponseRequest>>>,
     /// Hands out the identity each pending request is cleaned up by.
     next_request_id: Arc<Mutex<u64>>,
+    /// The field layout validated for each configured channel. A channel with
+    /// no entry has no agreed layout, so its rows must not be decoded.
+    channel_schemas: ChannelSchemas,
 }
 
 impl DXLinkClient {
@@ -371,6 +440,7 @@ impl DXLinkClient {
             keepalive_sender: None,
             response_requests: Arc::new(Mutex::new(Vec::new())),
             next_request_id: Arc::new(Mutex::new(0)),
+            channel_schemas: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -821,6 +891,7 @@ impl DXLinkClient {
         // The reader only routes protocol traffic now; callbacks and the
         // consumer stream belong to the delivery worker.
         let response_requests = self.response_requests.clone();
+        let channel_schemas = self.channel_schemas.clone();
 
         // Iniciar la tarea de procesamiento de mensajes
         // Inbound silence past our advertised deadline means the peer is gone,
@@ -890,7 +961,17 @@ impl DXLinkClient {
                                                 ResponseType::ChannelOpened(channel.unwrap_or(0))
                                             }
                                             "FEED_CONFIG" => {
-                                                ResponseType::FeedConfig(channel.unwrap_or(0))
+                                                match serde_json::from_str::<FeedConfigMessage>(
+                                                    &msg,
+                                                ) {
+                                                    Ok(config) => {
+                                                        ResponseType::FeedConfig(Box::new(config))
+                                                    }
+                                                    Err(e) => ResponseType::Error(
+                                                        "MALFORMED_FEED_CONFIG".to_string(),
+                                                        e.to_string(),
+                                                    ),
+                                                }
                                             }
                                             "CHANNEL_CLOSED" => {
                                                 ResponseType::ChannelClosed(channel.unwrap_or(0))
@@ -931,10 +1012,41 @@ impl DXLinkClient {
 
                             // Si nadie esperaba este mensaje específicamente, procesarlo normalmente
                             match msg_type {
+                                "FEED_CONFIG" => {
+                                    // Nobody was waiting: this is the server
+                                    // changing the layout mid-session, which the
+                                    // spec allows. The decoder cannot follow it,
+                                    // so the channel stops being decodable
+                                    // rather than producing shifted values.
+                                    if let Some(ch) = channel
+                                        && recover(&channel_schemas).remove(&ch).is_some()
+                                    {
+                                        {
+                                            error!(
+                                                "Channel {} was reconfigured by the server; \
+                                                 its data will be dropped rather than decoded \
+                                                 against the old layout",
+                                                ch
+                                            );
+                                        }
+                                    }
+                                }
                                 "FEED_DATA" => {
-                                    if let Ok(data_msg) = serde_json::from_str::<
-                                        FeedDataMessage<Vec<CompactData>>,
-                                    >(&msg)
+                                    // Only decode against a layout the server
+                                    // agreed to.
+                                    let decodable = channel
+                                        .map(|ch| recover(&channel_schemas).contains_key(&ch))
+                                        .unwrap_or(false);
+
+                                    if !decodable {
+                                        debug!(
+                                            "Dropping FEED_DATA for channel {:?}: no validated layout",
+                                            channel
+                                        );
+                                    } else if let Ok(data_msg) =
+                                        serde_json::from_str::<FeedDataMessage<Vec<CompactData>>>(
+                                            &msg,
+                                        )
                                     {
                                         // Hand off and keep reading. Delivery is
                                         // somebody else's job: doing it here let
@@ -1103,6 +1215,7 @@ impl DXLinkClient {
         // dead connection has to go, and a prior panic elsewhere is no reason to
         // keep it.
         recover(&self.channels).clear();
+        recover(&self.channel_schemas).clear();
         self.event_stream_taken = false;
         recover(&self.subscriptions).clear();
         // Dropping the senders wakes every waiter instead of leaving it to time
@@ -1174,35 +1287,14 @@ impl DXLinkClient {
         let mut accept_event_fields = HashMap::new();
 
         for event_type in event_types {
-            let fields = match event_type {
-                EventType::Quote => vec![
-                    "eventType".to_string(),
-                    "eventSymbol".to_string(),
-                    "bidPrice".to_string(),
-                    "askPrice".to_string(),
-                    "bidSize".to_string(),
-                    "askSize".to_string(),
-                ],
-                EventType::Trade => vec![
-                    "eventType".to_string(),
-                    "eventSymbol".to_string(),
-                    "price".to_string(),
-                    "size".to_string(),
-                    "dayVolume".to_string(),
-                ],
-                EventType::Greeks => vec![
-                    "eventType".to_string(),
-                    "eventSymbol".to_string(),
-                    "delta".to_string(),
-                    "gamma".to_string(),
-                    "theta".to_string(),
-                    "vega".to_string(),
-                    "rho".to_string(),
-                    "volatility".to_string(),
-                ],
-                // Add more event types as needed
-                _ => vec!["eventType".to_string(), "eventSymbol".to_string()],
-            };
+            // One source of truth: the same list validates the server's reply
+            // and drives the decoder stride.
+            let fields: Vec<String> = event_type
+                .compact_fields()
+                .unwrap_or(&["eventType", "eventSymbol"])
+                .iter()
+                .map(|f| (*f).to_string())
+                .collect();
 
             accept_event_fields.insert(event_type.to_string(), fields);
         }
@@ -1215,8 +1307,9 @@ impl DXLinkClient {
             accept_event_fields,
         };
 
-        let json = serde_json::to_string(&feed_setup)?;
-        debug!("Sending FEED_SETUP: {}", json);
+        // No direct payload log here: Connection::send already logs it through
+        // the redacting path, and a second hand-rolled log is exactly how a
+        // credential ends up in a file.
 
         let response = self
             .request_response(
@@ -1230,13 +1323,21 @@ impl DXLinkClient {
 
         // Procesar la respuesta
         match response {
-            ResponseType::FeedConfig(received_channel) => {
-                if received_channel != channel_id {
+            ResponseType::FeedConfig(config) => {
+                if config.channel != channel_id {
                     return Err(DXLinkError::Channel(format!(
                         "Expected config for channel {}, got {}",
-                        channel_id, received_channel
+                        channel_id, config.channel
                     )));
                 }
+
+                // The reply is the negotiated contract, not an acknowledgement.
+                // Accepting it unread meant a server that chose a different
+                // format or reordered a field list left the decoder attaching
+                // values to the wrong fields, silently.
+                validate_feed_config(&config, channel_id, event_types)?;
+
+                recover(&self.channel_schemas).insert(channel_id, requested_fields(event_types));
 
                 info!("Feed channel {} setup completed successfully", channel_id);
                 Ok(())

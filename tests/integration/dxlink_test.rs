@@ -551,3 +551,57 @@ async fn test_a_client_can_reconnect_after_disconnecting() {
         .expect("the new session should be usable");
     client.disconnect().await.expect("failed to disconnect");
 }
+
+// --- FEED_CONFIG validation (issue #12) ------------------------------------
+
+/// A server that reorders the field list must be rejected. Accepting it meant
+/// the decoder kept reading the requested order and attached every value to the
+/// wrong field, with no error anywhere.
+#[tokio::test]
+async fn test_setup_feed_rejects_a_reordered_field_layout() {
+    let server = MockServer::start(Behaviour::ReorderedFeedConfig).await;
+    let mut client = DXLinkClient::new(&server.url(), "test-token");
+    client.connect().await.expect("failed to connect");
+    let channel_id = client
+        .create_feed_channel("AUTO")
+        .await
+        .expect("failed to create feed channel");
+
+    match client.setup_feed(channel_id, &[EventType::Quote]).await {
+        Err(DXLinkError::Protocol(msg)) => {
+            assert!(msg.contains("Quote"), "which event type is unclear: {msg}");
+            assert!(
+                msg.contains("eventSymbol") && msg.contains("eventType"),
+                "the error should show both layouts: {msg}"
+            );
+        }
+        other => panic!("a reordered layout must be rejected, got: {other:?}"),
+    }
+
+    client.disconnect().await.expect("failed to disconnect");
+}
+
+/// This client decodes COMPACT rows and nothing else.
+#[tokio::test]
+async fn test_setup_feed_rejects_a_format_it_cannot_decode() {
+    let server = MockServer::start(Behaviour::NonCompactFeedConfig).await;
+    let mut client = DXLinkClient::new(&server.url(), "test-token");
+    client.connect().await.expect("failed to connect");
+    let channel_id = client
+        .create_feed_channel("AUTO")
+        .await
+        .expect("failed to create feed channel");
+
+    match client.setup_feed(channel_id, &[EventType::Quote]).await {
+        Err(DXLinkError::Protocol(msg)) => {
+            assert!(msg.contains("COMPACT"), "unclear error: {msg}");
+            assert!(
+                msg.contains("FULL"),
+                "the negotiated format is missing: {msg}"
+            );
+        }
+        other => panic!("a non-COMPACT format must be rejected, got: {other:?}"),
+    }
+
+    client.disconnect().await.expect("failed to disconnect");
+}
