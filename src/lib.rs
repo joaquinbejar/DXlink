@@ -16,6 +16,8 @@
 //!   can be requested — but the rows that come back are not decoded yet.
 //! - Typed errors ([`DXLinkError`]) with [`DXLinkError::is_terminal`] to tell a
 //!   lost connection from one bad message.
+//! - A lost connection is observable: the event stream closes, and
+//!   [`DXLinkClient::disconnect_reason`] says why.
 //!
 //! ## What is not supported yet
 //!
@@ -24,8 +26,6 @@
 //! - [`EventType`] declares more variants than the library can decode. Only
 //!   `Quote`, `Trade` and `Greeks` produce a [`MarketEvent`]; subscribing to any
 //!   other type is accepted by the server but never delivers events here.
-//! - The consumer is not notified when the event stream stops producing because
-//!   the connection was lost.
 //!
 //! ## Minimum supported Rust version
 //!
