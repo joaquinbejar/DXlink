@@ -15,180 +15,7 @@ use dxlink::{DXLinkClient, EventType, FeedSubscription, MarketEvent};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-/// A DXLink server that speaks enough of the protocol to run a full session,
-/// and can interleave WebSocket control frames with every response.
-mod flow_server {
-    use futures_util::{SinkExt, StreamExt};
-    use serde_json::{Value, json};
-    use std::net::SocketAddr;
-    use std::sync::{Arc, Mutex};
-    use tokio::net::TcpListener;
-    use tokio_tungstenite::tungstenite::Message;
-
-    pub struct FlowServer {
-        pub address: SocketAddr,
-        received: Arc<Mutex<Vec<Value>>>,
-    }
-
-    impl FlowServer {
-        /// Every message the client sent, in order.
-        pub fn received(&self) -> Vec<Value> {
-            self.received
-                .lock()
-                .expect("received lock poisoned")
-                .clone()
-        }
-
-        pub fn url(&self) -> String {
-            format!("ws://{}", self.address)
-        }
-    }
-
-    /// What the server does besides answering the protocol.
-    #[derive(Clone, Copy, PartialEq)]
-    pub enum Behaviour {
-        /// Plain text responses only.
-        Plain,
-        /// Send a Ping before, and a Pong after, every response. Control frames
-        /// are ordinary traffic and must never break a session.
-        ControlFrames,
-        /// Complete the handshake, then hang up once the feed is subscribed.
-        CloseAfterSubscribe,
-    }
-
-    /// Column order for COMPACT rows. This MUST match the field list that
-    /// `setup_feed` requests for each event type — the server echoes back the
-    /// fields in the order they were asked for.
-    fn quote_row(symbol: &str) -> Value {
-        // eventType, eventSymbol, bidPrice, askPrice, bidSize, askSize
-        json!(["Quote", symbol, 150.25, 150.5, 100.0, 150.0])
-    }
-
-    fn trade_row(symbol: &str) -> Value {
-        // eventType, eventSymbol, price, size, dayVolume
-        json!(["Trade", symbol, 151.25, 75.0, 10_000_000.0])
-    }
-
-    pub async fn start(behaviour: Behaviour) -> FlowServer {
-        let listener = TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("failed to bind flow server");
-        let address = listener.local_addr().expect("failed to read local addr");
-
-        let received = Arc::new(Mutex::new(Vec::new()));
-        let received_task = received.clone();
-
-        tokio::spawn(async move {
-            let (stream, _) = listener.accept().await.expect("failed to accept");
-            let mut ws = tokio_tungstenite::accept_async(stream)
-                .await
-                .expect("failed to handshake");
-
-            // One task owns the whole socket, so requests and responses stay
-            // ordered and there is no sink to share.
-            while let Some(Ok(message)) = ws.next().await {
-                let Message::Text(text) = message else {
-                    continue;
-                };
-                let Ok(value) = serde_json::from_str::<Value>(&text) else {
-                    continue;
-                };
-
-                received_task
-                    .lock()
-                    .expect("received lock poisoned")
-                    .push(value.clone());
-
-                let channel = value["channel"].as_u64().unwrap_or(0);
-                let mut responses: Vec<Value> = Vec::new();
-                let mut close_after = false;
-
-                match value["type"].as_str().unwrap_or("") {
-                    "SETUP" => {
-                        responses.push(json!({
-                            "channel": channel,
-                            "type": "SETUP",
-                            "version": "1.0.0",
-                            "keepaliveTimeout": 60,
-                            "acceptKeepaliveTimeout": 60
-                        }));
-                        responses.push(json!({
-                            "channel": 0,
-                            "type": "AUTH_STATE",
-                            "state": "UNAUTHORIZED"
-                        }));
-                    }
-                    "AUTH" => responses.push(json!({
-                        "channel": 0,
-                        "type": "AUTH_STATE",
-                        "state": "AUTHORIZED",
-                        "userId": "test-user"
-                    })),
-                    "CHANNEL_REQUEST" => responses.push(json!({
-                        "channel": channel,
-                        "type": "CHANNEL_OPENED",
-                        "service": "FEED",
-                        "parameters": {}
-                    })),
-                    "FEED_SETUP" => responses.push(json!({
-                        "channel": channel,
-                        "type": "FEED_CONFIG",
-                        "aggregationPeriod": 0.1,
-                        "dataFormat": "COMPACT"
-                    })),
-                    "FEED_SUBSCRIPTION" => {
-                        if let Some(add) = value.get("add").and_then(|a| a.as_array()) {
-                            for sub in add {
-                                let symbol = sub["symbol"].as_str().unwrap_or("");
-                                let row = match sub["type"].as_str().unwrap_or("") {
-                                    "Quote" => quote_row(symbol),
-                                    "Trade" => trade_row(symbol),
-                                    _ => continue,
-                                };
-                                let event_type = sub["type"].as_str().unwrap_or("");
-                                responses.push(json!({
-                                    "channel": channel,
-                                    "type": "FEED_DATA",
-                                    "data": [event_type, row]
-                                }));
-                            }
-                        }
-                        close_after = behaviour == Behaviour::CloseAfterSubscribe;
-                    }
-                    // KEEPALIVE and anything else needs no reply.
-                    _ => {}
-                }
-
-                for response in responses {
-                    if behaviour == Behaviour::ControlFrames {
-                        ws.send(Message::Ping(vec![7].into()))
-                            .await
-                            .expect("failed to send ping");
-                    }
-
-                    ws.send(Message::Text(response.to_string().into()))
-                        .await
-                        .expect("failed to send response");
-
-                    if behaviour == Behaviour::ControlFrames {
-                        ws.send(Message::Pong(Vec::new().into()))
-                            .await
-                            .expect("failed to send pong");
-                    }
-                }
-
-                if close_after {
-                    let _ = ws.send(Message::Close(None)).await;
-                    return;
-                }
-            }
-        });
-
-        FlowServer { address, received }
-    }
-}
-
-use flow_server::Behaviour;
+use crate::fixture::{Behaviour, MockServer, expected};
 
 /// Collects events off the stream until `wanted` have arrived or time runs out.
 async fn collect_events(
@@ -217,7 +44,7 @@ async fn collect_events(
 /// Runs the same sequence as the `basic` example and checks the market data that
 /// comes out the other end, field by field.
 async fn run_full_session(behaviour: Behaviour) {
-    let server = flow_server::start(behaviour).await;
+    let server = MockServer::start(behaviour).await;
 
     let mut client = DXLinkClient::new(&server.url(), "test-token");
     let mut event_stream = client.connect().await.expect("failed to connect");
@@ -282,10 +109,10 @@ async fn run_full_session(behaviour: Behaviour) {
     // eventType and eventSymbol swap, this reads "Quote" instead of "AAPL".
     assert_eq!(quote.event_symbol, "AAPL");
     assert_eq!(quote.event_type, "Quote");
-    assert_eq!(quote.bid_price, 150.25);
-    assert_eq!(quote.ask_price, 150.5);
-    assert_eq!(quote.bid_size, 100.0);
-    assert_eq!(quote.ask_size, 150.0);
+    assert_eq!(quote.bid_price, expected::BID_PRICE);
+    assert_eq!(quote.ask_price, expected::ASK_PRICE);
+    assert_eq!(quote.bid_size, expected::BID_SIZE);
+    assert_eq!(quote.ask_size, expected::ASK_SIZE);
 
     let trade = events
         .iter()
@@ -296,9 +123,9 @@ async fn run_full_session(behaviour: Behaviour) {
         .expect("no Trade event reached the consumer");
 
     assert_eq!(trade.event_symbol, "AAPL");
-    assert_eq!(trade.price, 151.25);
-    assert_eq!(trade.size, 75.0);
-    assert_eq!(trade.day_volume, 10_000_000.0);
+    assert_eq!(trade.price, expected::PRICE);
+    assert_eq!(trade.size, expected::SIZE);
+    assert_eq!(trade.day_volume, expected::DAY_VOLUME);
 
     // The callback path is separate from the stream path; both must fire.
     // Copy out of the lock in its own scope so no guard reaches the await below.
@@ -317,7 +144,7 @@ async fn run_full_session(behaviour: Behaviour) {
 
 #[tokio::test]
 async fn test_full_session_delivers_market_data() {
-    run_full_session(Behaviour::Plain).await;
+    run_full_session(Behaviour::Normal).await;
 }
 
 /// End-to-end regression for issue #4. Before the fix the first Ping aborted the
@@ -330,7 +157,7 @@ async fn test_full_session_survives_interleaved_control_frames() {
 /// A callback registered for one symbol must not see another symbol's events.
 #[tokio::test]
 async fn test_callback_is_scoped_to_its_symbol() {
-    let server = flow_server::start(Behaviour::Plain).await;
+    let server = MockServer::start(Behaviour::Normal).await;
 
     let mut client = DXLinkClient::new(&server.url(), "test-token");
     let mut event_stream = client.connect().await.expect("failed to connect");
@@ -402,7 +229,7 @@ async fn test_callback_is_scoped_to_its_symbol() {
 /// and `disconnect` still succeeds.
 #[tokio::test]
 async fn test_session_survives_server_close() {
-    let server = flow_server::start(Behaviour::CloseAfterSubscribe).await;
+    let server = MockServer::start(Behaviour::CloseAfterSubscribe).await;
 
     let mut client = DXLinkClient::new(&server.url(), "test-token");
     let mut event_stream = client.connect().await.expect("failed to connect");
@@ -448,7 +275,7 @@ async fn test_session_survives_server_close() {
 /// expects, in order, with the token it was given.
 #[tokio::test]
 async fn test_session_sends_the_expected_protocol_messages() {
-    let server = flow_server::start(Behaviour::Plain).await;
+    let server = MockServer::start(Behaviour::Normal).await;
 
     let mut client = DXLinkClient::new(&server.url(), "test-token");
     let mut event_stream = client.connect().await.expect("failed to connect");
