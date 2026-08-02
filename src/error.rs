@@ -34,11 +34,12 @@ pub enum DXLinkError {
 }
 
 impl DXLinkError {
-    /// Reports whether this error leaves the connection unusable.
+    /// Reports whether this error requires a connection to be (re)established
+    /// before anything can proceed.
     ///
-    /// A terminal error means the WebSocket cannot carry further traffic and the
-    /// caller must establish a new connection to continue; retrying the same
-    /// socket will never succeed. A non-terminal error describes a single bad
+    /// A terminal error means retrying as-is can never succeed: the transport
+    /// failed, the peer went away, the credentials were rejected, or there was no
+    /// live connection to begin with. A non-terminal error describes a single bad
     /// message — the frame was rejected, the connection was not.
     ///
     /// This is what tells a read loop whether to stop or to skip the offending

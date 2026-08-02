@@ -1240,21 +1240,17 @@ mod tests {
 
         let handle = client
             .message_handle
-            .as_ref()
+            .take()
             .expect("message task should have been spawned");
 
-        // Generous bound: the point is that it terminates at all, not how fast.
-        let stopped = tokio::time::timeout(Duration::from_secs(5), async {
-            while !handle.is_finished() {
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-        })
-        .await;
+        // Awaiting the handle rather than polling is_finished() also fails the
+        // test if the task panicked on its way out. Generous bound: the point is
+        // that it terminates at all, not how fast.
+        let joined = tokio::time::timeout(Duration::from_secs(5), handle)
+            .await
+            .expect("message task kept running after the server closed the connection");
 
-        assert!(
-            stopped.is_ok(),
-            "message task kept running after the server closed the connection"
-        );
+        joined.expect("message task panicked instead of stopping cleanly");
     }
 
     // Test error cases for connection
