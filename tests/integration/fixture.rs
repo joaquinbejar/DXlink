@@ -42,6 +42,16 @@ pub enum Behaviour {
     RejectAuth,
     /// Complete the session, then hang up once the feed is subscribed.
     CloseAfterSubscribe,
+    /// Accept the socket and never say anything.
+    Silent,
+    /// Answer SETUP with a message of the wrong type.
+    WrongTypeOnSetup,
+    /// Answer SETUP on a channel other than 0.
+    WrongChannelOnSetup,
+    /// Answer SETUP with text that is not JSON.
+    MalformedSetup,
+    /// Answer SETUP with a protocol ERROR frame.
+    ErrorOnSetup,
 }
 
 pub struct MockServer {
@@ -91,6 +101,47 @@ impl MockServer {
                 let channel = value["channel"].as_u64().unwrap_or(0);
                 let mut responses: Vec<Value> = Vec::new();
                 let mut close_after = false;
+
+                // Handshake fault injection, before the normal answers.
+                match (behaviour, value["type"].as_str().unwrap_or("")) {
+                    (Behaviour::Silent, _) => continue,
+                    (Behaviour::WrongTypeOnSetup, "SETUP") => {
+                        let _ = ws
+                            .send(Message::Text(
+                                json!({"channel": 0, "type": "FEED_CONFIG"})
+                                    .to_string()
+                                    .into(),
+                            ))
+                            .await;
+                        continue;
+                    }
+                    (Behaviour::WrongChannelOnSetup, "SETUP") => {
+                        let _ = ws
+                            .send(Message::Text(
+                                json!({"channel": 7, "type": "SETUP", "version": "1.0"})
+                                    .to_string()
+                                    .into(),
+                            ))
+                            .await;
+                        continue;
+                    }
+                    (Behaviour::MalformedSetup, "SETUP") => {
+                        let _ = ws.send(Message::Text("not json at all".into())).await;
+                        continue;
+                    }
+                    (Behaviour::ErrorOnSetup, "SETUP") => {
+                        let _ = ws
+                            .send(Message::Text(
+                                json!({"channel": 0, "type": "ERROR", "error": "UNAUTHORIZED",
+                                       "message": "Authentication failed"})
+                                .to_string()
+                                .into(),
+                            ))
+                            .await;
+                        continue;
+                    }
+                    _ => {}
+                }
 
                 match value["type"].as_str().unwrap_or("") {
                     "SETUP" => {

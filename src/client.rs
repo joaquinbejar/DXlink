@@ -10,7 +10,7 @@ use crate::events::{CompactData, EventType, MarketEvent};
 use crate::messages::{
     AuthMessage, AuthStateMessage, BaseMessage, ChannelRequestMessage, ErrorMessage,
     FeedDataMessage, FeedSetupMessage, FeedSubscription, FeedSubscriptionMessage, KeepaliveMessage,
-    SetupMessage,
+    ServerSetupMessage, SetupMessage,
 };
 
 use crate::parse_compact_data;
@@ -34,6 +34,12 @@ const DEFAULT_KEEPALIVE_INTERVAL: u32 = 15;
 /// Default client version string.  This is used to identify the client
 /// software version to the server.
 const DEFAULT_CLIENT_VERSION: &str = "1.0.2-dxlink-0.1.3";
+
+/// How long any single handshake response may take before `connect()` gives up.
+///
+/// Every SETUP/AUTH read is bounded by this: a server that accepts the socket
+/// and then says nothing must not hold a caller open forever.
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// The main communication channel identifier. This is likely used for
 /// primary message exchange between client and server.
@@ -80,6 +86,73 @@ struct ResponseRequest {
     channel_id: Option<u32>,
     /// A `oneshot::Sender` used to send the `ResponseType` back to the requester once the expected response is received.
     response_sender: oneshot::Sender<ResponseType>,
+}
+
+/// Reads one handshake response and checks it is the message the protocol calls
+/// for at this point.
+///
+/// The handshake used to deserialize whatever arrived straight into the type it
+/// hoped for, so a server `ERROR` surfaced as `missing field \`state\`` and a
+/// message on the wrong channel was accepted silently. Errors name the state,
+/// what was expected and what arrived; none of them can carry the token.
+async fn expect_handshake_message(
+    connection: &WebSocketConnection,
+    state: &str,
+    expected_type: &str,
+    expected_channel: u32,
+) -> DXLinkResult<String> {
+    let raw = match connection.receive_with_timeout(HANDSHAKE_TIMEOUT).await? {
+        Some(raw) => raw,
+        None => {
+            return Err(DXLinkError::Timeout(format!(
+                "timed out after {}s waiting for {} on channel {} during {}",
+                HANDSHAKE_TIMEOUT.as_secs(),
+                expected_type,
+                expected_channel,
+                state
+            )));
+        }
+    };
+
+    let value: serde_json::Value = serde_json::from_str(&raw).map_err(|e| {
+        DXLinkError::Protocol(format!(
+            "during {state}, expected {expected_type} on channel {expected_channel} \
+             but the server sent malformed JSON: {e}"
+        ))
+    })?;
+
+    let received_type = value["type"].as_str().unwrap_or("<missing type>");
+    let received_channel = value["channel"].as_u64();
+
+    // A server ERROR here is the server telling us why, not an unexpected frame.
+    if received_type == "ERROR" {
+        let code = value["error"].as_str().unwrap_or("unknown");
+        let message = value["message"].as_str().unwrap_or("");
+        let detail = format!("during {state}, the server returned {code}: {message}");
+        return Err(if code.eq_ignore_ascii_case("UNAUTHORIZED") {
+            DXLinkError::Authentication(detail)
+        } else {
+            DXLinkError::Protocol(detail)
+        });
+    }
+
+    if received_type != expected_type {
+        return Err(DXLinkError::Protocol(format!(
+            "during {state}, expected {expected_type} but received {received_type}"
+        )));
+    }
+
+    if received_channel != Some(u64::from(expected_channel)) {
+        return Err(DXLinkError::Protocol(format!(
+            "during {state}, expected {expected_type} on channel {expected_channel} \
+             but it arrived on channel {}",
+            received_channel
+                .map(|c| c.to_string())
+                .unwrap_or_else(|| "<missing>".to_string())
+        )));
+    }
+
+    Ok(raw)
 }
 
 /// Represents a client for interacting with the DXLink service.
@@ -244,19 +317,25 @@ impl DXLinkClient {
 
         connection.send(&setup_msg).await?;
 
-        // Receive SETUP response
-        let response = connection.receive().await?;
-        let _: SetupMessage = serde_json::from_str(&response)?;
+        // Every read below is bounded and validated. On any failure `connection`
+        // is dropped here, so a partial handshake never leaves the client
+        // holding a half-established socket.
+        let response =
+            expect_handshake_message(&connection, "SETUP", "SETUP", MAIN_CHANNEL).await?;
+        let server_setup: ServerSetupMessage = serde_json::from_str(&response)?;
+        debug!(
+            "Server SETUP: version={:?}, keepaliveTimeout={:?}",
+            server_setup.version, server_setup.keepalive_timeout
+        );
 
-        // Check for AUTH_STATE message
-        let response = connection.receive().await?;
+        let response =
+            expect_handshake_message(&connection, "SETUP", "AUTH_STATE", MAIN_CHANNEL).await?;
         let auth_state: AuthStateMessage = serde_json::from_str(&response)?;
 
-        // Si ya estamos autorizados, podemos omitir el proceso de autenticación
+        // Already authorized means the token was accepted on the connection.
         if auth_state.state == "AUTHORIZED" {
             info!("Already authorized to DXLink server");
         } else if auth_state.state == "UNAUTHORIZED" {
-            // Send AUTH message
             let auth_msg = AuthMessage {
                 channel: MAIN_CHANNEL,
                 message_type: "AUTH".to_string(),
@@ -265,13 +344,13 @@ impl DXLinkClient {
 
             connection.send(&auth_msg).await?;
 
-            // Receive AUTH_STATE response, should be AUTHORIZED
-            let response = connection.receive().await?;
+            let response =
+                expect_handshake_message(&connection, "AUTH", "AUTH_STATE", MAIN_CHANNEL).await?;
             let auth_state: AuthStateMessage = serde_json::from_str(&response)?;
 
             if auth_state.state != "AUTHORIZED" {
                 return Err(DXLinkError::Authentication(format!(
-                    "Authentication failed. State: {}",
+                    "during AUTH, the server reported state {} instead of AUTHORIZED",
                     auth_state.state
                 )));
             }
@@ -279,7 +358,7 @@ impl DXLinkClient {
             info!("Successfully authenticated to DXLink server");
         } else {
             return Err(DXLinkError::Protocol(format!(
-                "Unexpected authentication state: {}",
+                "during SETUP, the server reported an unknown authentication state: {}",
                 auth_state.state
             )));
         }
