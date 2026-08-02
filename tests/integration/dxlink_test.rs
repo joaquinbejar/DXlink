@@ -318,3 +318,68 @@ async fn test_handshake_error_cannot_leak_an_echoed_token() {
     // The actionable part survives.
     assert!(text.contains("UNAUTHORIZED"), "error code lost: {text}");
 }
+
+// --- Response routing (issue #9) -------------------------------------------
+
+/// A channel-scoped ERROR must answer whatever operation is pending on that
+/// channel. It used to be logged only, so the caller sat until its timeout and
+/// got a misleading Timeout instead of the reason the server gave.
+#[tokio::test]
+async fn test_channel_error_answers_the_pending_operation() {
+    let server = MockServer::start(Behaviour::ErrorOnChannelRequest).await;
+    let mut client = DXLinkClient::new(&server.url(), "test-token");
+    client.connect().await.expect("failed to connect");
+
+    let started = std::time::Instant::now();
+    let result = client.create_feed_channel("AUTO").await;
+
+    match result {
+        Err(DXLinkError::Protocol(msg)) => {
+            assert!(msg.contains("BAD_ACTION"), "server error code lost: {msg}");
+            assert!(
+                msg.contains("create_feed_channel"),
+                "operation context lost: {msg}"
+            );
+        }
+        other => panic!("expected the server error to be delivered, got: {other:?}"),
+    }
+
+    // The point is that it did not wait out the 10 second timeout.
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "the error was not delivered promptly: {:?}",
+        started.elapsed()
+    );
+
+    client.disconnect().await.expect("failed to disconnect");
+}
+
+/// A request that times out must leave nothing behind that could consume a
+/// later response. Two timed-out attempts followed by a working one is the
+/// shape that used to break: the stale entry stole the third response.
+#[tokio::test]
+async fn test_a_timed_out_request_cannot_steal_a_later_response() {
+    let server = MockServer::start(Behaviour::IgnoreChannelRequest).await;
+    let mut client = DXLinkClient::new(&server.url(), "test-token");
+    client.connect().await.expect("failed to connect");
+
+    // Cancel the wait rather than sitting through the full timeout; a dropped
+    // future is exactly the path that used to leak a registration.
+    for _ in 0..2 {
+        let cancelled = tokio::time::timeout(
+            Duration::from_millis(200),
+            client.create_feed_channel("AUTO"),
+        )
+        .await;
+        assert!(cancelled.is_err(), "the fixture should never answer");
+    }
+
+    // Nothing stale may remain to answer for a later request.
+    let pending = client.pending_response_count();
+    assert_eq!(
+        pending, 0,
+        "{pending} registrations survived a cancelled wait"
+    );
+
+    client.disconnect().await.expect("failed to disconnect");
+}

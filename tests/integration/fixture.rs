@@ -54,6 +54,11 @@ pub enum Behaviour {
     ErrorOnSetup,
     /// Answer SETUP with an ERROR whose message echoes a credential back.
     ErrorEchoingToken,
+    /// Answer a CHANNEL_REQUEST with a channel-scoped ERROR instead of
+    /// CHANNEL_OPENED.
+    ErrorOnChannelRequest,
+    /// Accept CHANNEL_REQUEST but never answer it.
+    IgnoreChannelRequest,
     /// Negotiate a 3 second keepalive deadline, below the 15s the client used
     /// to assume. Lets a test prove the negotiated value is honoured without
     /// waiting a minute for it.
@@ -188,6 +193,13 @@ impl MockServer {
                         responses.push(json!({
                             "channel": 0, "type": "AUTH_STATE",
                             "state": state, "userId": "test-user"
+                        }));
+                    }
+                    "CHANNEL_REQUEST" if behaviour == Behaviour::IgnoreChannelRequest => {}
+                    "CHANNEL_REQUEST" if behaviour == Behaviour::ErrorOnChannelRequest => {
+                        responses.push(json!({
+                            "channel": channel, "type": "ERROR",
+                            "error": "BAD_ACTION", "message": "contract not supported"
                         }));
                     }
                     "CHANNEL_REQUEST" => responses.push(json!({

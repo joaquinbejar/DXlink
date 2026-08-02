@@ -97,6 +97,9 @@ enum ResponseType {
 /// response back to the requester.
 #[derive(Debug)]
 struct ResponseRequest {
+    /// Identity, so cleanup removes this exact registration and never a later
+    /// one that happens to want the same message type on the same channel.
+    id: u64,
     /// The expected type of the response message (e.g., "CHANNEL_OPENED", "FEED_CONFIG", etc.).  This string should match the expected
     /// response message type.
     expected_type: String,
@@ -177,6 +180,25 @@ async fn expect_handshake_message(
     Ok(raw)
 }
 
+/// Removes a pending response registration when it goes out of scope.
+///
+/// Registrations used to survive timeouts, cancelled futures and failed sends.
+/// A stale entry then matched the next valid response and consumed it, so a
+/// live waiter timed out instead. Tying removal to `Drop` covers every exit
+/// path, including the caller's future simply being dropped.
+struct PendingGuard {
+    requests: Arc<Mutex<Vec<ResponseRequest>>>,
+    id: u64,
+}
+
+impl Drop for PendingGuard {
+    fn drop(&mut self) {
+        if let Ok(mut requests) = self.requests.lock() {
+            requests.retain(|request| request.id != self.id);
+        }
+    }
+}
+
 /// Represents a client for interacting with the DXLink service.
 ///
 /// The `DXLinkClient` provides methods for connecting to a DXLink WebSocket server,
@@ -250,6 +272,8 @@ pub struct DXLinkClient {
     keepalive_sender: Option<Sender<()>>,
     /// A thread-safe vector that holds pending response requests.
     response_requests: Arc<Mutex<Vec<ResponseRequest>>>,
+    /// Hands out the identity each pending request is cleaned up by.
+    next_request_id: Arc<Mutex<u64>>,
 }
 
 impl DXLinkClient {
@@ -289,7 +313,87 @@ impl DXLinkClient {
             message_handle: None,
             keepalive_sender: None,
             response_requests: Arc::new(Mutex::new(Vec::new())),
+            next_request_id: Arc::new(Mutex::new(0)),
         }
+    }
+
+    /// Sends `message` and waits for `expected_type` on `channel`, cleaning the
+    /// registration up on every exit path.
+    ///
+    /// The registration goes in *before* the send: the message task is already
+    /// running, so registering afterwards is a lost-wakeup race. A guard removes
+    /// it on timeout, on send failure, and if the caller's future is dropped
+    /// mid-wait, none of which used to clean up.
+    async fn request_response<T: serde::Serialize>(
+        &self,
+        message: &T,
+        operation: &str,
+        expected_type: &str,
+        channel: u32,
+        wait: Duration,
+    ) -> DXLinkResult<ResponseType> {
+        let (tx, rx) = oneshot::channel();
+
+        let id = {
+            let mut next = self
+                .next_request_id
+                .lock()
+                .map_err(|_| DXLinkError::Unknown("request id lock poisoned".to_string()))?;
+            *next += 1;
+            *next
+        };
+
+        {
+            let mut requests = self
+                .response_requests
+                .lock()
+                .map_err(|_| DXLinkError::Unknown("response request lock poisoned".to_string()))?;
+            requests.push(ResponseRequest {
+                id,
+                expected_type: expected_type.to_string(),
+                channel_id: Some(channel),
+                response_sender: tx,
+            });
+        }
+
+        let _guard = PendingGuard {
+            requests: Arc::clone(&self.response_requests),
+            id,
+        };
+
+        self.get_connection()?.send(message).await?;
+
+        match tokio::time::timeout(wait, rx).await {
+            Ok(Ok(ResponseType::Error(detail))) => Err(DXLinkError::Protocol(format!(
+                "during {operation} on channel {channel}, the server returned {detail}"
+            ))),
+            Ok(Ok(response)) => Ok(response),
+            Ok(Err(_)) => Err(DXLinkError::Protocol(format!(
+                "during {operation} on channel {channel}, the response channel closed"
+            ))),
+            Err(_) => Err(DXLinkError::Timeout(format!(
+                "timed out after {}s waiting for {expected_type} on channel {channel} during {operation}",
+                wait.as_secs()
+            ))),
+        }
+    }
+
+    /// Borrows the live connection.
+    fn get_connection(&self) -> DXLinkResult<&WebSocketConnection> {
+        self.connection
+            .as_ref()
+            .ok_or_else(|| DXLinkError::Connection("Not connected to DXLink server".to_string()))
+    }
+
+    /// How many response registrations are currently pending.
+    ///
+    /// Exposed so a test can assert that a timed-out or cancelled request left
+    /// nothing behind that could consume someone else's response.
+    pub fn pending_response_count(&self) -> usize {
+        self.response_requests
+            .lock()
+            .map(|requests| requests.len())
+            .unwrap_or(0)
     }
 
     /// Sets the keepalive timeout this client advertises, in seconds.
@@ -450,54 +554,6 @@ impl DXLinkClient {
         receiver
     }
 
-    /// Waits for a specific response type from the DXLink device, optionally filtered by channel ID.
-    ///
-    /// This function registers a request for a specific response type and then waits for the corresponding
-    /// response to be received from the DXLink device.  The wait is subject to a timeout.
-    ///
-    /// # Arguments
-    ///
-    /// * `expected_type` - The expected type of the response message (e.g., "CHANNEL_OPENED", "FEED_CONFIG", etc.).
-    /// * `channel_id` - The expected channel ID for the response.  If `None`, any channel ID is accepted.
-    /// * `timeout` - The maximum time to wait for the response.
-    ///
-    /// # Returns
-    ///
-    /// * `Ok(ResponseType)` - If the expected response is received within the timeout period.
-    /// * `Err(DXLinkError::Timeout)` - If the timeout period expires before the expected response is received.
-    /// * `Err(DXLinkError::Protocol)` - If the response channel is closed unexpectedly.
-    ///
-    #[allow(dead_code)]
-    async fn wait_for_response(
-        &self,
-        expected_type: &str,
-        channel_id: Option<u32>,
-        timeout: Duration,
-    ) -> DXLinkResult<ResponseType> {
-        let (tx, rx) = oneshot::channel();
-
-        // Registrar nuestra solicitud de respuesta
-        {
-            let mut requests = self.response_requests.lock().unwrap();
-            requests.push(ResponseRequest {
-                expected_type: expected_type.to_string(),
-                channel_id,
-                response_sender: tx,
-            });
-        }
-
-        // Esperar la respuesta con timeout
-        match tokio::time::timeout(timeout, rx).await {
-            Ok(Ok(response)) => Ok(response),
-            Ok(Err(_)) => Err(DXLinkError::Protocol("Response channel closed".to_string())),
-            Err(_) => Err(DXLinkError::Timeout(format!(
-                "Timed out waiting for {} message{}",
-                expected_type,
-                channel_id.map_or("".to_string(), |id| format!(" for channel {}", id))
-            ))),
-        }
-    }
-
     /// Starts the keepalive task.
     ///
     /// This function spawns a new tokio task that periodically sends keepalive
@@ -648,44 +704,67 @@ impl DXLinkClient {
                                 .and_then(|v| v.as_u64())
                                 .map(|c| c as u32);
 
-                            // Primero, comprobar si alguien está esperando este mensaje
+                            // Route to a waiter first. A channel-scoped ERROR
+                            // answers whatever operation is pending on that
+                            // channel, whichever success message it asked for:
+                            // otherwise the caller sat until its timeout while
+                            // the reason was only logged.
                             {
-                                let mut requests = response_requests.lock().unwrap();
-                                if let Some(idx) = requests.iter().position(|req| {
-                                    req.expected_type == msg_type
-                                        && (req.channel_id.is_none() || req.channel_id == channel)
-                                }) {
-                                    // Encontramos alguien esperando este mensaje
-                                    let request = requests.remove(idx);
+                                let mut delivered = false;
+                                if let Ok(mut requests) = response_requests.lock() {
+                                    let is_error = msg_type == "ERROR";
 
-                                    // Crear la respuesta apropiada
-                                    let response = match msg_type {
-                                        "CHANNEL_OPENED" => {
-                                            ResponseType::ChannelOpened(channel.unwrap_or(0))
-                                        }
-                                        "FEED_CONFIG" => {
-                                            ResponseType::FeedConfig(channel.unwrap_or(0))
-                                        }
-                                        "CHANNEL_CLOSED" => {
-                                            ResponseType::ChannelClosed(channel.unwrap_or(0))
-                                        }
-                                        "ERROR" => {
-                                            let error = value
-                                                .get("error")
-                                                .and_then(|v| v.as_str())
-                                                .unwrap_or("unknown");
-                                            let message = value
-                                                .get("message")
-                                                .and_then(|v| v.as_str())
-                                                .unwrap_or("");
-                                            ResponseType::Error(format!("{} - {}", error, message))
-                                        }
-                                        _ => ResponseType::Other(msg.clone()),
-                                    };
+                                    while let Some(idx) = requests.iter().position(|req| {
+                                        let channel_matches =
+                                            req.channel_id.is_none() || req.channel_id == channel;
+                                        channel_matches
+                                            && (req.expected_type == msg_type
+                                                || (is_error && channel.is_some()))
+                                    }) {
+                                        let request = requests.remove(idx);
 
-                                    // Enviar la respuesta (ignorando errores si el receptor ya no existe)
-                                    let _ = request.response_sender.send(response);
-                                    continue; // Pasar al siguiente mensaje
+                                        let response = match msg_type {
+                                            "CHANNEL_OPENED" => {
+                                                ResponseType::ChannelOpened(channel.unwrap_or(0))
+                                            }
+                                            "FEED_CONFIG" => {
+                                                ResponseType::FeedConfig(channel.unwrap_or(0))
+                                            }
+                                            "CHANNEL_CLOSED" => {
+                                                ResponseType::ChannelClosed(channel.unwrap_or(0))
+                                            }
+                                            "ERROR" => {
+                                                let error = value
+                                                    .get("error")
+                                                    .and_then(|v| v.as_str())
+                                                    .unwrap_or("unknown");
+                                                let message = value
+                                                    .get("message")
+                                                    .and_then(|v| v.as_str())
+                                                    .unwrap_or("");
+                                                ResponseType::Error(format!(
+                                                    "{}: {}",
+                                                    sanitize_server_text(error),
+                                                    sanitize_server_text(message)
+                                                ))
+                                            }
+                                            _ => ResponseType::Other(msg.clone()),
+                                        };
+
+                                        // A gone receiver means that caller
+                                        // already walked away. Keep looking
+                                        // rather than swallowing a response a
+                                        // live waiter is still owed.
+                                        if request.response_sender.send(response).is_ok() {
+                                            delivered = true;
+                                            break;
+                                        }
+                                        debug!("Dropping a stale response registration");
+                                    }
+                                }
+
+                                if delivered {
+                                    continue;
                                 }
                             }
 
@@ -820,34 +899,16 @@ impl DXLinkClient {
             parameters: params,
         };
 
-        // Registrar nuestra expectativa de respuesta
-        let (tx, rx) = oneshot::channel();
-        {
-            let mut requests = self.response_requests.lock().unwrap();
-            requests.push(ResponseRequest {
-                expected_type: "CHANNEL_OPENED".to_string(),
-                channel_id: Some(channel_id),
-                response_sender: tx,
-            });
-        }
+        let response = self
+            .request_response(
+                &channel_request,
+                "create_feed_channel",
+                "CHANNEL_OPENED",
+                channel_id,
+                Duration::from_secs(10),
+            )
+            .await?;
 
-        // Enviar la solicitud
-        let conn = self.get_connection_mut()?;
-        conn.send(&channel_request).await?;
-
-        // Esperar la respuesta
-        let response = match tokio::time::timeout(Duration::from_secs(10), rx).await {
-            Ok(Ok(response)) => response,
-            Ok(Err(_)) => return Err(DXLinkError::Protocol("Response channel closed".to_string())),
-            Err(_) => {
-                return Err(DXLinkError::Timeout(format!(
-                    "Timed out waiting for CHANNEL_OPENED message for channel {}",
-                    channel_id
-                )));
-            }
-        };
-
-        // Procesar la respuesta
         match response {
             ResponseType::ChannelOpened(received_channel) => {
                 if received_channel != channel_id {
@@ -933,32 +994,15 @@ impl DXLinkClient {
         let json = serde_json::to_string(&feed_setup)?;
         debug!("Sending FEED_SETUP: {}", json);
 
-        // Registrar nuestra expectativa de respuesta
-        let (tx, rx) = oneshot::channel();
-        {
-            let mut requests = self.response_requests.lock().unwrap();
-            requests.push(ResponseRequest {
-                expected_type: "FEED_CONFIG".to_string(),
-                channel_id: Some(channel_id),
-                response_sender: tx,
-            });
-        }
-
-        // Enviar la solicitud
-        let conn = self.get_connection_mut()?;
-        conn.send(&feed_setup).await?;
-
-        // Esperar la respuesta
-        let response = match tokio::time::timeout(Duration::from_secs(10), rx).await {
-            Ok(Ok(response)) => response,
-            Ok(Err(_)) => return Err(DXLinkError::Protocol("Response channel closed".to_string())),
-            Err(_) => {
-                return Err(DXLinkError::Timeout(format!(
-                    "Timed out waiting for FEED_CONFIG message for channel {}",
-                    channel_id
-                )));
-            }
-        };
+        let response = self
+            .request_response(
+                &feed_setup,
+                "setup_feed",
+                "FEED_CONFIG",
+                channel_id,
+                Duration::from_secs(10),
+            )
+            .await?;
 
         // Procesar la respuesta
         match response {
@@ -1095,32 +1139,15 @@ impl DXLinkClient {
             message_type: "CHANNEL_CANCEL".to_string(),
         };
 
-        // Registrar nuestra expectativa de respuesta (sin retener un futuro todavía)
-        let (tx, rx) = oneshot::channel();
-        {
-            let mut requests = self.response_requests.lock().unwrap();
-            requests.push(ResponseRequest {
-                expected_type: "CHANNEL_CLOSED".to_string(),
-                channel_id: Some(channel_id),
-                response_sender: tx,
-            });
-        }
-
-        // Ahora podemos obtener la conexión mutable y enviar
-        let conn = self.get_connection_mut()?;
-        conn.send(&cancel_msg).await?;
-
-        // Esperar la respuesta con timeout
-        let response = match tokio::time::timeout(Duration::from_secs(5), rx).await {
-            Ok(Ok(response)) => response,
-            Ok(Err(_)) => return Err(DXLinkError::Protocol("Response channel closed".to_string())),
-            Err(_) => {
-                return Err(DXLinkError::Timeout(format!(
-                    "Timed out waiting for CHANNEL_CLOSED message for channel {}",
-                    channel_id
-                )));
-            }
-        };
+        let response = self
+            .request_response(
+                &cancel_msg,
+                "close_channel",
+                "CHANNEL_CLOSED",
+                channel_id,
+                Duration::from_secs(5),
+            )
+            .await?;
 
         // Procesar la respuesta
         match response {
