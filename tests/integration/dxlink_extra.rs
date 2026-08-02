@@ -5,7 +5,9 @@
 //! warning log, which is why subscription bugs could not fail the suite.
 
 use crate::fixture::{Behaviour, MockServer, expected, is_type_on_channel};
+use dxlink::events::CandleEvent;
 use dxlink::{DXLinkClient, EventType, FeedSubscription, MarketEvent};
+use std::sync::{Arc, Mutex};
 
 /// Opens a connected client with a configured feed channel.
 async fn connected_feed(server: &MockServer, events: &[EventType]) -> (DXLinkClient, u32) {
@@ -102,6 +104,28 @@ async fn test_reset_subscriptions_sends_the_reset_flag() {
     client.disconnect().await.expect("failed to disconnect");
 }
 
+/// Checks every column of a decoded bar. Both delivery paths run it, so a
+/// stride drift cannot pass by only being asserted on one of them.
+fn assert_full_candle(candle: &CandleEvent, path: &str) {
+    assert_eq!(candle.event_symbol, "AAPL{=5m}", "wrong symbol on {path}");
+    assert_eq!(candle.event_time, expected::EVENT_TIME, "on {path}");
+    assert_eq!(candle.event_flags, expected::EVENT_FLAGS, "on {path}");
+    assert_eq!(candle.index, expected::INDEX, "on {path}");
+    assert_eq!(candle.time, expected::TIME, "on {path}");
+    assert_eq!(candle.sequence, expected::SEQUENCE, "on {path}");
+    assert_eq!(candle.count, expected::COUNT, "on {path}");
+    assert_eq!(candle.open, expected::OPEN, "on {path}");
+    assert_eq!(candle.high, expected::HIGH, "on {path}");
+    assert_eq!(candle.low, expected::LOW, "on {path}");
+    assert_eq!(candle.close, expected::CLOSE, "on {path}");
+    assert_eq!(candle.volume, expected::VOLUME, "on {path}");
+    assert_eq!(candle.vwap, expected::VWAP, "on {path}");
+    assert_eq!(candle.bid_volume, expected::BID_VOLUME, "on {path}");
+    assert_eq!(candle.ask_volume, expected::ASK_VOLUME, "on {path}");
+    assert_eq!(candle.imp_volatility, expected::IMP_VOLATILITY, "on {path}");
+    assert_eq!(candle.open_interest, expected::OPEN_INTEREST, "on {path}");
+}
+
 /// Historical data is requested by adding `fromTime`, and now that Candle rows
 /// decode, the bars must actually arrive. The refusal this replaces was the
 /// honest behaviour while there was no decoder.
@@ -121,6 +145,15 @@ async fn test_historical_candles_are_requested_and_delivered() {
 
     // Fixed value rather than "now": the assertion is about faithful transport.
     let from_time: i64 = 1_700_000_000_000;
+
+    // The callback path routes by symbol through `symbol_of`, which needed a new
+    // arm for this variant. Registering here covers that arm; without it a
+    // missing arm would only show up as callbacks silently never firing.
+    let delivered = Arc::new(Mutex::new(Vec::new()));
+    let sink = delivered.clone();
+    client.on_event("AAPL{=5m}", move |event| {
+        sink.lock().expect("callback lock poisoned").push(event);
+    });
 
     client
         .subscribe(
@@ -157,27 +190,23 @@ async fn test_historical_candles_are_requested_and_delivered() {
         .expect("no candle arrived")
         .expect("the stream closed");
 
-    match event {
-        MarketEvent::Candle(candle) => {
-            assert_eq!(candle.event_symbol, "AAPL{=5m}");
-            assert_eq!(candle.event_time, expected::EVENT_TIME);
-            assert_eq!(candle.event_flags, expected::EVENT_FLAGS);
-            assert_eq!(candle.index, expected::INDEX);
-            assert_eq!(candle.time, expected::TIME);
-            assert_eq!(candle.sequence, expected::SEQUENCE);
-            assert_eq!(candle.count, expected::COUNT);
-            assert_eq!(candle.open, expected::OPEN);
-            assert_eq!(candle.high, expected::HIGH);
-            assert_eq!(candle.low, expected::LOW);
-            assert_eq!(candle.close, expected::CLOSE);
-            assert_eq!(candle.volume, expected::VOLUME);
-            assert_eq!(candle.vwap, expected::VWAP);
-            assert_eq!(candle.bid_volume, expected::BID_VOLUME);
-            assert_eq!(candle.ask_volume, expected::ASK_VOLUME);
-            assert_eq!(candle.imp_volatility, expected::IMP_VOLATILITY);
-            assert_eq!(candle.open_interest, expected::OPEN_INTEREST);
-        }
+    match &event {
+        MarketEvent::Candle(candle) => assert_full_candle(candle, "the stream"),
         other => panic!("expected a candle, got {other:?}"),
+    }
+
+    // The worker awaits the callback before pushing to the stream, so by the
+    // time the bar above arrived the callback had already run. Copy out of the
+    // lock in its own scope so no guard reaches the await below.
+    let seen: Vec<MarketEvent> = {
+        let events = delivered.lock().expect("callback lock poisoned");
+        events.clone()
+    };
+    match seen.as_slice() {
+        [MarketEvent::Candle(candle)] => assert_full_candle(candle, "the callback"),
+        other => {
+            panic!("the callback for AAPL{{=5m}} should have received one candle, got {other:?}")
+        }
     }
 
     client.disconnect().await.expect("failed to disconnect");
