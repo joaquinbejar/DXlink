@@ -59,6 +59,14 @@ const DEFAULT_CLIENT_VERSION: &str = concat!("0.1-dxlink-rs/", env!("CARGO_PKG_V
 /// and then says nothing must not hold a caller open forever.
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// Capacity of the queue between the socket reader and the delivery worker.
+///
+/// Generous: it only has to absorb a burst while the worker is inside a user
+/// callback. When it does fill, events are dropped rather than blocking the
+/// reader, because a blocked reader stops answering protocol traffic and makes
+/// unrelated channel operations time out.
+const DELIVERY_QUEUE_CAPACITY: usize = 1024;
+
 /// The main communication channel identifier. This is likely used for
 /// primary message exchange between client and server.
 const MAIN_CHANNEL: u32 = 0;
@@ -261,7 +269,7 @@ pub struct DXLinkClient {
     /// A thread-safe map storing the association between channel IDs and the services they are subscribed to.
     channels: Arc<Mutex<HashMap<u32, String>>>, // channel_id -> service
     /// A thread-safe map storing callback functions associated with specific market data symbols.
-    callbacks: Arc<Mutex<HashMap<String, EventCallback>>>, // symbol -> callback
+    callbacks: Arc<Mutex<HashMap<String, Arc<EventCallback>>>>, // symbol -> callback
     /// A thread-safe set keeping track of active subscriptions, identified by `(EventType, String)`.
     subscriptions: Arc<Mutex<HashSet<(EventType, String)>>>, // (event_type, symbol)
     /// A sender for transmitting `MarketEvent` instances.
@@ -270,6 +278,8 @@ pub struct DXLinkClient {
     keepalive_handle: Option<JoinHandle<()>>,
     /// A handle to the message processing task.
     message_handle: Option<JoinHandle<()>>,
+    /// A handle to the task that runs callbacks and feeds the event stream.
+    delivery_handle: Option<JoinHandle<()>>,
     /// A channel sender used to signal the keepalive task.
     keepalive_sender: Option<Sender<()>>,
     /// A thread-safe vector that holds pending response requests.
@@ -313,6 +323,7 @@ impl DXLinkClient {
             event_sender: None,
             keepalive_handle: None,
             message_handle: None,
+            delivery_handle: None,
             keepalive_sender: None,
             response_requests: Arc::new(Mutex::new(Vec::new())),
             next_request_id: Arc::new(Mutex::new(0)),
@@ -411,6 +422,87 @@ impl DXLinkClient {
             .lock()
             .map(|requests| requests.len())
             .unwrap_or(0)
+    }
+
+    /// Spawns the worker that runs consumer callbacks and feeds the event
+    /// stream, and returns the queue the socket reader hands events to.
+    ///
+    /// Separate from the reader on purpose. Callbacks are user code: they can be
+    /// slow, they can panic, and the consumer's stream can fill up. Any of those
+    /// happening on the reader stopped it answering `FEED_CONFIG`,
+    /// `CHANNEL_CLOSED` and `ERROR`, so an unrelated channel operation timed out
+    /// because somebody's callback was busy.
+    ///
+    /// Backpressure policy: the queue is bounded and a full queue **drops the
+    /// event**, counting and logging the loss. Market data is only useful while
+    /// it is current, so blocking the reader to preserve a stale quote is the
+    /// wrong trade.
+    fn start_event_delivery(&mut self) -> Sender<MarketEvent> {
+        let (delivery_tx, mut delivery_rx) = mpsc::channel::<MarketEvent>(DELIVERY_QUEUE_CAPACITY);
+
+        let callbacks = self.callbacks.clone();
+        let event_sender = self.event_sender.clone();
+
+        let handle = tokio::spawn(async move {
+            let mut stream_closed_reported = false;
+
+            while let Some(event) = delivery_rx.recv().await {
+                let symbol = match &event {
+                    MarketEvent::Quote(e) => e.event_symbol.clone(),
+                    MarketEvent::Trade(e) => e.event_symbol.clone(),
+                    MarketEvent::Greeks(e) => e.event_symbol.clone(),
+                };
+
+                // Copy the handle out and release the lock before running user
+                // code: holding it across a callback serialises every other
+                // symbol behind whatever that callback is doing.
+                let callback = match callbacks.lock() {
+                    Ok(map) => map.get(&symbol).cloned(),
+                    Err(poisoned) => poisoned.into_inner().get(&symbol).cloned(),
+                };
+
+                if let Some(callback) = callback {
+                    let delivered = event.clone();
+                    // Run it on the blocking pool, not here. A callback that
+                    // blocks the thread would otherwise stall this task's
+                    // executor thread, and on a current-thread runtime that is
+                    // the same thread the protocol reader needs. spawn_blocking
+                    // also turns a panic into a JoinError instead of unwinding
+                    // through the task.
+                    if tokio::task::spawn_blocking(move || callback(delivered))
+                        .await
+                        .is_err()
+                    {
+                        error!("Callback for {} panicked; continuing delivery", symbol);
+                    }
+                }
+
+                if let Some(tx) = &event_sender {
+                    match tx.try_send(event) {
+                        Ok(()) => {}
+                        Err(mpsc::error::TrySendError::Full(_)) => {
+                            debug!("Event stream full, dropping an event for {}", symbol);
+                        }
+                        Err(mpsc::error::TrySendError::Closed(_)) => {
+                            // The consumer dropped its receiver. Callbacks still
+                            // fire; the stream cannot be re-taken, which is what
+                            // event_stream documents.
+                            if !stream_closed_reported {
+                                debug!(
+                                    "Event stream receiver dropped; delivering to callbacks only"
+                                );
+                                stream_closed_reported = true;
+                            }
+                        }
+                    }
+                }
+            }
+
+            debug!("Event delivery task terminated");
+        });
+
+        self.delivery_handle = Some(handle);
+        delivery_tx
     }
 
     /// Sets the keepalive timeout this client advertises, in seconds.
@@ -660,23 +752,23 @@ impl DXLinkClient {
     }
 
     fn start_message_processing(&mut self) -> DXLinkResult<()> {
-        // Cloned so the reader can tear the whole session down, not just itself:
-        // stopping only the reader left the keepalive writing to a socket
-        // nobody was listening to.
-        let shutdown_keepalive = self.keepalive_sender.clone();
-        // Asegurarnos de que tenemos una conexión
+        // Check first: nothing may be spawned on a client that is not connected.
         if self.connection.is_none() {
             return Err(DXLinkError::Connection(
                 "Cannot start message processing without a connection".to_string(),
             ));
         }
 
-        // Clonar la conexión para usar en la tarea
         let connection = self.connection.as_ref().unwrap().clone();
 
-        // Clonar referencias que necesitamos
-        let callbacks = self.callbacks.clone();
-        let event_sender = self.event_sender.clone();
+        // Cloned so the reader can tear the whole session down, not just itself:
+        // stopping only the reader left the keepalive writing to a socket
+        // nobody was listening to.
+        let shutdown_keepalive = self.keepalive_sender.clone();
+        let delivery_tx = self.start_event_delivery();
+
+        // The reader only routes protocol traffic now; callbacks and the
+        // consumer stream belong to the delivery worker.
         let response_requests = self.response_requests.clone();
 
         // Iniciar la tarea de procesamiento de mensajes
@@ -686,6 +778,8 @@ impl DXLinkClient {
         let receive_deadline = Duration::from_secs(u64::from(self.keepalive_timeout));
 
         let message_handle = tokio::spawn(async move {
+            let mut dropped_events: u64 = 0;
+
             loop {
                 let received = match connection.receive_with_timeout(receive_deadline).await {
                     Ok(Some(msg)) => Ok(msg),
@@ -791,26 +885,34 @@ impl DXLinkClient {
                                         FeedDataMessage<Vec<CompactData>>,
                                     >(&msg)
                                     {
-                                        let events = parse_compact_data(&data_msg.data);
-                                        for event in events {
-                                            let symbol = match &event {
-                                                MarketEvent::Quote(e) => &e.event_symbol,
-                                                MarketEvent::Trade(e) => &e.event_symbol,
-                                                MarketEvent::Greeks(e) => &e.event_symbol,
-                                            };
-
-                                            // Enviarlo a los callbacks
-                                            if let Ok(callbacks) = callbacks.lock()
-                                                && let Some(callback) = callbacks.get(symbol)
-                                            {
-                                                callback(event.clone());
-                                            }
-
-                                            // Enviarlo al canal de eventos
-                                            if let Some(tx) = &event_sender
-                                                && let Err(e) = tx.send(event.clone()).await
-                                            {
-                                                error!("Failed to send event to channel: {}", e);
+                                        // Hand off and keep reading. Delivery is
+                                        // somebody else's job: doing it here let
+                                        // one slow callback or a full consumer
+                                        // stream stop the socket reads that every
+                                        // channel operation depends on.
+                                        for event in parse_compact_data(&data_msg.data) {
+                                            match delivery_tx.try_send(event) {
+                                                Ok(()) => {}
+                                                Err(mpsc::error::TrySendError::Full(_)) => {
+                                                    dropped_events += 1;
+                                                    if dropped_events.is_power_of_two() {
+                                                        warn!(
+                                                            "Delivery queue full, {} event(s) dropped so far; \
+                                                             the consumer is slower than the feed",
+                                                            dropped_events
+                                                        );
+                                                    }
+                                                }
+                                                Err(mpsc::error::TrySendError::Closed(_)) => {
+                                                    // Delivery has stopped entirely, which is a
+                                                    // different thing from falling behind and
+                                                    // must not be reported as backpressure.
+                                                    error!(
+                                                        "Delivery worker is gone; no further events \
+                                                         will reach callbacks or the stream"
+                                                    );
+                                                    break;
+                                                }
                                             }
                                         }
                                     }
@@ -877,6 +979,13 @@ impl DXLinkClient {
 
         // Terminar la tarea de procesamiento de mensajes
         if let Some(handle) = self.message_handle.take() {
+            handle.abort();
+        }
+
+        // The delivery worker ends on its own once the reader drops the queue,
+        // but disconnect must not leave it running if the reader was aborted
+        // mid-flight.
+        if let Some(handle) = self.delivery_handle.take() {
             handle.abort();
         }
 
@@ -1194,10 +1303,28 @@ impl DXLinkClient {
     /// Register a callback function for a specific symbol
     pub fn on_event(&self, symbol: &str, callback: impl Fn(MarketEvent) + Send + Sync + 'static) {
         let mut callbacks = self.callbacks.lock().unwrap();
-        callbacks.insert(symbol.to_string(), Box::new(callback));
+        callbacks.insert(
+            symbol.to_string(),
+            Arc::new(Box::new(callback) as EventCallback),
+        );
     }
 
-    /// Get a stream of market events
+    /// Get a stream of market events.
+    ///
+    /// There is exactly one per client, and `connect` already returns it. If the
+    /// receiver is dropped the stream cannot be re-taken: delivery continues to
+    /// registered callbacks only, and the loss is logged once rather than per
+    /// event.
+    ///
+    /// # Backpressure
+    ///
+    /// The stream is bounded and **events are dropped when the consumer falls
+    /// behind**, rather than the library blocking to preserve them. A blocked
+    /// consumer would otherwise stall the socket reader and make unrelated
+    /// channel operations time out, and a quote that arrives late is worth less
+    /// than the connection staying responsive. Drops are logged. If you cannot
+    /// afford to miss events, drain this receiver into your own unbounded
+    /// buffer as soon as it yields.
     pub fn event_stream(&mut self) -> DXLinkResult<Receiver<MarketEvent>> {
         if self.event_sender.is_none() {
             let (tx, rx) = mpsc::channel(100); // Buffer of 100 events
