@@ -59,3 +59,19 @@ jobs:
       # Covers dev-dependencies too: a compromised test-only crate still runs
       # on CI machines with repository credentials in scope.
       - run: cargo audit --deny warnings
+
+  # The declared MSRV, proven rather than asserted. A dependency upgrade that
+  # needs a newer compiler fails here instead of surprising consumers after
+  # release. Raising `rust-version` is a compatibility break: say so in the
+  # release notes.
+  msrv:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.88.0
+      - uses: Swatinem/rust-cache@v2
+      # rust-toolchain.toml pins `stable` for contributors; override it so this
+      # job actually exercises the floor.
+      - run: rm -f rust-toolchain.toml
+      - run: cargo +1.88.0 build --workspace --all-features
+      - run: cargo +1.88.0 test --workspace --all-features

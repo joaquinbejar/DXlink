@@ -27,6 +27,13 @@
 //! - The consumer is not notified when the event stream stops producing because
 //!   the connection was lost.
 //!
+//! ## Minimum supported Rust version
+//!
+//! **Rust 1.88.** The crate is edition 2024 and uses let-chains, which 1.87
+//! rejects. Raising this floor is a compatibility break and is called out in
+//! the release notes; CI builds and tests the full workspace on it so a
+//! dependency upgrade cannot raise it silently.
+//!
 //! ref: <https://raw.githubusercontent.com/dxFeed/dxLink/refs/heads/main/dxlink-specification/asyncapi.yml>
 //!
 //! ## Example
