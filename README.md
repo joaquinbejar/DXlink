@@ -18,6 +18,9 @@ to DXLink servers, subscribing to market events, and processing real-time market
   can be requested — but the rows that come back are not decoded yet.
 - Typed errors ([`DXLinkError`]) with [`DXLinkError::is_terminal`] to tell a
   lost connection from one bad message.
+- Strict decoding: [`try_parse_compact_data`] reports a short row, a wrong
+  column type or an unknown event type instead of returning fewer events and
+  letting a consumer read that as a quiet market.
 - A lost connection is observable: the event stream closes, and
   [`DXLinkClient::disconnect_reason`] says why.
 
