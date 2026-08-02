@@ -20,6 +20,39 @@ use tracing::{debug, error};
 /// Placeholder written in place of credential values when logging outbound messages.
 const REDACTED_PLACEHOLDER: &str = "<redacted>";
 
+/// Maximum number of characters kept from a server-supplied close reason.
+const MAX_CLOSE_REASON_LEN: usize = 120;
+
+/// Longest unbroken run kept verbatim in a close reason. Real reasons are made
+/// of short words; anything longer has the shape of a credential.
+const MAX_CLOSE_REASON_WORD_LEN: usize = 32;
+
+/// Returns a close reason that is safe to log and to embed in an error.
+///
+/// The reason is free text chosen by the server, and it reaches both the logs
+/// and [`DXLinkError::Connection`]. The close path is also the authentication
+/// failure path, so a server that echoed the auth token back would turn our own
+/// error reporting into a credential leak. Control characters are dropped, runs
+/// too long to be a word are masked with [`REDACTED_PLACEHOLDER`], and the
+/// result is truncated. The close code is a protocol enum and is always kept.
+fn sanitize_close_reason(reason: &str) -> String {
+    let printable: String = reason.chars().filter(|c| !c.is_control()).collect();
+
+    let masked = printable
+        .split_whitespace()
+        .map(|word| {
+            if word.chars().count() > MAX_CLOSE_REASON_WORD_LEN {
+                REDACTED_PLACEHOLDER
+            } else {
+                word
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
+
+    masked.chars().take(MAX_CLOSE_REASON_LEN).collect()
+}
+
 /// Returns a copy of a serialized message that is safe to log.
 ///
 /// Credential-bearing fields (any field named `token`, at any nesting level)
@@ -184,11 +217,27 @@ impl WebSocketConnection {
                     debug!("Skipping WebSocket control frame: {:?}", message);
                 }
                 Some(Ok(Message::Close(frame))) => {
+                    // The code is a protocol enum and is trusted; the reason is
+                    // free text from the server and is not.
                     let detail = match frame {
-                        Some(frame) => format!("code {}, reason: {}", frame.code, frame.reason),
+                        Some(frame) => format!(
+                            "code {}, reason: {}",
+                            frame.code,
+                            sanitize_close_reason(&frame.reason)
+                        ),
                         None => "no close frame".to_string(),
                     };
                     error!("Server closed the connection: {}", detail);
+
+                    // Closing is a handshake. tungstenite queues the reply when
+                    // this frame is yielded, but on a split stream it only
+                    // reaches the peer once the write half is driven, so do that
+                    // before giving up on the socket. Failing here changes
+                    // nothing for the caller: the connection is gone either way.
+                    if let Err(e) = self.write.lock().await.close().await {
+                        debug!("Could not complete the close handshake: {}", e);
+                    }
+
                     return Err(DXLinkError::Connection(format!(
                         "server closed the connection ({})",
                         detail
@@ -409,6 +458,33 @@ mod frame_tests {
         }
     }
 
+    /// The close path is the authentication failure path, so a server that
+    /// echoes the token back must not get it into our error text or our logs.
+    #[tokio::test]
+    async fn test_close_reason_cannot_leak_a_credential() {
+        let token = "tastytrade-live-bearer-token-that-is-long-enough-to-be-a-secret";
+        let url = serve_frames(vec![Message::Close(Some(CloseFrame {
+            code: CloseCode::Policy,
+            reason: format!("rejected token {token}").into(),
+        }))])
+        .await;
+
+        let connection = WebSocketConnection::connect(&url)
+            .await
+            .expect("failed to connect");
+
+        let err = connection
+            .receive()
+            .await
+            .expect_err("a close frame must not be reported as success");
+
+        let text = err.to_string();
+        assert!(!text.contains(token), "token leaked into the error: {text}");
+        assert!(text.contains(REDACTED_PLACEHOLDER));
+        // The close code still has to survive, it is the actionable part.
+        assert!(text.contains("code"), "close code lost: {text}");
+    }
+
     #[tokio::test]
     async fn test_close_error_is_terminal() {
         let url = serve_frames(vec![Message::Close(None)]).await;
@@ -423,6 +499,49 @@ mod frame_tests {
             .expect_err("a close frame must not be reported as success");
         // This is what stops the message task instead of letting it spin.
         assert!(err.is_terminal(), "close should be terminal, got: {err:?}");
+    }
+
+    /// Closing is a handshake: when the peer sends Close we must send one back
+    /// before giving up on the socket, or the connection is left half closed.
+    #[tokio::test]
+    async fn test_receive_completes_the_close_handshake() {
+        let listener = TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("failed to bind test server");
+        let addr = listener.local_addr().expect("failed to read local addr");
+
+        let echoed = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("failed to accept");
+            let mut ws = accept_async(stream).await.expect("failed to handshake");
+
+            ws.send(Message::Close(Some(CloseFrame {
+                code: CloseCode::Normal,
+                reason: "bye".into(),
+            })))
+            .await
+            .expect("failed to send close");
+
+            // Wait for the client's half of the close handshake.
+            loop {
+                match ws.next().await {
+                    Some(Ok(Message::Close(_))) | None => return true,
+                    Some(Ok(_)) => continue,
+                    Some(Err(_)) => return false,
+                }
+            }
+        });
+
+        let connection = WebSocketConnection::connect(&format!("ws://{}", addr))
+            .await
+            .expect("failed to connect");
+
+        let _ = connection.receive().await;
+
+        let replied = tokio::time::timeout(Duration::from_secs(3), echoed)
+            .await
+            .expect("server never saw the client's close reply")
+            .expect("server task panicked");
+        assert!(replied, "client did not complete the close handshake");
     }
 
     #[tokio::test]
@@ -558,6 +677,52 @@ mod redaction_tests {
     #[test]
     fn test_redact_sensitive_withholds_unparseable_payloads() {
         assert_eq!(redact_sensitive("not json"), REDACTED_PLACEHOLDER);
+    }
+
+    #[test]
+    fn test_sanitize_close_reason_keeps_ordinary_text() {
+        // The diagnostic value of a close reason is the whole point of keeping
+        // it, so normal wording must survive untouched.
+        assert_eq!(
+            sanitize_close_reason("invalid token, please re-authenticate"),
+            "invalid token, please re-authenticate"
+        );
+    }
+
+    #[test]
+    fn test_sanitize_close_reason_masks_credential_shaped_runs() {
+        let token = "a".repeat(64);
+        let sanitized = sanitize_close_reason(&format!("rejected token {token} for user bob"));
+
+        assert!(!sanitized.contains(&token), "token survived: {sanitized}");
+        assert!(sanitized.contains(REDACTED_PLACEHOLDER));
+        // Everything that is not credential-shaped is still readable.
+        assert!(sanitized.contains("rejected token"));
+        assert!(sanitized.contains("for user bob"));
+    }
+
+    #[test]
+    fn test_sanitize_close_reason_drops_control_characters() {
+        let sanitized = sanitize_close_reason("bad\u{0}token\nsecond line\u{7}");
+
+        assert!(!sanitized.contains('\u{0}'));
+        assert!(!sanitized.contains('\u{7}'));
+        assert!(!sanitized.contains('\n'));
+    }
+
+    #[test]
+    fn test_sanitize_close_reason_is_bounded() {
+        // Many short words: nothing is credential-shaped, so only the overall
+        // length limit applies.
+        let long = "word ".repeat(200);
+        let sanitized = sanitize_close_reason(&long);
+
+        assert_eq!(sanitized.chars().count(), MAX_CLOSE_REASON_LEN);
+    }
+
+    #[test]
+    fn test_sanitize_close_reason_handles_empty_input() {
+        assert_eq!(sanitize_close_reason(""), "");
     }
 
     /// A `MakeWriter` that captures log output into a shared buffer so tests
