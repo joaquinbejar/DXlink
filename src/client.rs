@@ -1066,13 +1066,12 @@ fn keepalive_interval_for(advertised: u32, negotiated: Option<u32>) -> Duration 
 /// `GaveUp` that follows it, and the previous `mpsc` did the opposite because a
 /// sender cannot evict from the front of its own queue.
 ///
-/// A send with no subscribers is not a failure. It is the normal case for a
-/// consumer that never asked for the stream.
+/// A send with no subscribers is not a failure, it is the normal case for a
+/// consumer that never asked for the stream — and it is the case on **every**
+/// transition, so it is dropped silently rather than logged.
 fn notify(states: &Option<broadcast::Sender<ConnectionState>>, state: ConnectionState) {
-    if let Some(tx) = states
-        && tx.send(state).is_err()
-    {
-        debug!("No connection-state subscribers");
+    if let Some(tx) = states {
+        let _ = tx.send(state);
     }
 }
 
@@ -1789,15 +1788,30 @@ impl DXLinkClient {
     /// ```
     pub fn with_reconnect(&mut self, policy: ReconnectPolicy) {
         self.reconnect = Some(policy);
+        // Opened here rather than in `connect`, so `connection_states` works the
+        // moment a policy exists. A `&self` accessor that answered `None` until
+        // some other call had happened would be a trap.
+        if self.state_sender.is_none() {
+            // Normally already open, from `with_reconnect`. This covers a
+            // reconnect after a `disconnect`, which drops the old one.
+            if self.state_sender.is_none() {
+                let (state_tx, _) =
+                    broadcast::channel::<ConnectionState>(CONNECTION_STATE_CAPACITY);
+                self.state_sender = Some(state_tx);
+            }
+        }
     }
 
     /// Subscribes to connection-state changes.
     ///
     /// `None` without a reconnect policy: the session never comes back, and the
-    /// closing event stream already says so. Otherwise every call returns a new
-    /// receiver, and each one sees only what is sent **after** it subscribes —
-    /// so subscribe before the states you care about, which in practice means
-    /// right after [`connect`](Self::connect).
+    /// closing event stream already says so. With one, every call returns a new
+    /// receiver, from [`with_reconnect`](Self::with_reconnect) onwards — no need
+    /// to connect first.
+    ///
+    /// Each receiver sees only what is sent **after** it subscribes, so
+    /// subscribe before the states you care about. Subscribing right after
+    /// installing the policy is the way to be sure of catching all of them.
     ///
     /// The stream is bounded and never blocks the supervisor. A consumer that
     /// falls behind **loses the oldest states**, is told how many with
@@ -2161,9 +2175,10 @@ impl DXLinkClient {
         // Dropping the sender means a reader that dies during the teardown
         // below has nobody to report to, which is what we want by then.
         self.session_lost_sender = None;
-        // And the state stream ends with the session: the supervisor has
-        // returned, so this is the last sender and dropping it is what tells a
-        // consumer there will be no more states.
+        // And the state stream ends with the session. The supervisor is stopped
+        // by now, whether it returned or was aborted after the grace period, and
+        // either way it no longer holds a sender — so dropping this one is what
+        // tells a consumer there will be no more states.
         self.state_sender = None;
 
         // 1. Stop writing maintenance, so nothing races the shutdown.
@@ -3319,5 +3334,15 @@ mod reconnect_policy_tests {
 
         client.with_reconnect(ReconnectPolicy::default());
         assert!(client.reconnect.is_some());
+
+        // Available from here, without connecting first: a `&self` accessor
+        // that answered None until some other call had happened is a trap.
+        assert!(
+            client.connection_states().is_some(),
+            "the stream should exist as soon as the policy does"
+        );
+        // And it is a subscription, not a handout, so a second caller gets one
+        // of their own.
+        assert!(client.connection_states().is_some());
     }
 }

@@ -629,8 +629,21 @@ async fn test_a_slow_consumer_loses_the_middle_not_the_end() {
     )
     .await;
 
-    // Deliberately not reading while the attempts pile up.
-    tokio::time::sleep(Duration::from_secs(5)).await;
+    // Deliberately not reading while the attempts pile up. Waiting on the queue
+    // itself rather than on the clock: `len` saturates once the buffer is full,
+    // so two equal readings a beat apart mean states are already being evicted.
+    // The floor on the backoff puts a hard lower bound on how fast this can go,
+    // so a fixed sleep would either be slow or flaky on a loaded machine.
+    let mut previous = usize::MAX;
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    while states.len() != previous || previous == 0 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the queue never stopped growing, so it never overflowed"
+        );
+        previous = states.len();
+        tokio::time::sleep(Duration::from_millis(120)).await;
+    }
 
     let mut lagged = 0u64;
     let mut seen = Vec::new();
