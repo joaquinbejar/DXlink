@@ -88,6 +88,33 @@ impl From<&str> for EventType {
 }
 
 impl EventType {
+    /// Parses a wire name, answering `None` for anything unknown.
+    ///
+    /// Unlike the [`From<&str>`] impl, which answers `Quote` for any
+    /// unrecognised name, this reports that it does not know it. A decoder
+    /// cannot use the lenient conversion: silently treating an unknown type as
+    /// `Quote` means reading its row with the wrong layout.
+    pub fn from_wire_name(value: &str) -> Option<Self> {
+        match value {
+            "Quote" => Some(EventType::Quote),
+            "Trade" => Some(EventType::Trade),
+            "Summary" => Some(EventType::Summary),
+            "Profile" => Some(EventType::Profile),
+            "Order" => Some(EventType::Order),
+            "TimeAndSale" => Some(EventType::TimeAndSale),
+            "Candle" => Some(EventType::Candle),
+            "TradeETH" => Some(EventType::TradeETH),
+            "SpreadOrder" => Some(EventType::SpreadOrder),
+            "Greeks" => Some(EventType::Greeks),
+            "TheoPrice" => Some(EventType::TheoPrice),
+            "Underlying" => Some(EventType::Underlying),
+            "Series" => Some(EventType::Series),
+            "Configuration" => Some(EventType::Configuration),
+            "Message" => Some(EventType::Message),
+            _ => None,
+        }
+    }
+
     /// The COMPACT field list this client requests for the event type, in the
     /// exact order the decoder reads it.
     ///

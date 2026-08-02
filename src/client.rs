@@ -12,8 +12,8 @@ use crate::messages::{
     FeedConfigMessage, FeedDataMessage, FeedSetupMessage, FeedSubscription,
     FeedSubscriptionMessage, KeepaliveMessage, ServerSetupMessage, SetupMessage,
 };
+use crate::try_parse_compact_data;
 
-use crate::parse_compact_data;
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::sync::{Arc, Mutex};
@@ -1083,7 +1083,18 @@ impl DXLinkClient {
                                         // one slow callback or a full consumer
                                         // stream stop the socket reads that every
                                         // channel operation depends on.
-                                        for event in parse_compact_data(&data_msg.data) {
+                                        let decoded = match try_parse_compact_data(&data_msg.data) {
+                                            Ok(events) => events,
+                                            Err(e) => {
+                                                // Report it rather than
+                                                // delivering a partial batch
+                                                // that looks complete.
+                                                error!("Malformed COMPACT data: {e}");
+                                                continue;
+                                            }
+                                        };
+
+                                        for event in decoded {
                                             match delivery_tx.try_send(event) {
                                                 Ok(()) => {}
                                                 Err(mpsc::error::TrySendError::Full(_)) => {
