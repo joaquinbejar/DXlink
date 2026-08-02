@@ -458,3 +458,61 @@ async fn test_a_panicking_callback_does_not_kill_the_session() {
 
     client.disconnect().await.expect("failed to disconnect");
 }
+
+// --- Losing the connection is observable (issue #6) ------------------------
+
+/// The stream closing is the signal that the session is over, and
+/// disconnect_reason says why. Before this the consumer waited forever on a
+/// stream that would never produce again, with only a log line to go on.
+#[tokio::test]
+async fn test_a_lost_connection_closes_the_stream_and_reports_why() {
+    let server = MockServer::start(Behaviour::CloseAfterSubscribe).await;
+
+    let mut client = DXLinkClient::new(&server.url(), "test-token");
+    let mut event_stream = client.connect().await.expect("failed to connect");
+    let channel_id = client
+        .create_feed_channel("AUTO")
+        .await
+        .expect("failed to create feed channel");
+    client
+        .setup_feed(channel_id, &[EventType::Quote])
+        .await
+        .expect("failed to set up feed");
+
+    assert!(
+        client.disconnect_reason().is_none(),
+        "a healthy session should have no disconnect reason"
+    );
+
+    client
+        .subscribe(
+            channel_id,
+            vec![FeedSubscription {
+                event_type: "Quote".to_string(),
+                symbol: "AAPL".to_string(),
+                from_time: None,
+                source: None,
+            }],
+        )
+        .await
+        .expect("failed to subscribe");
+
+    // Drain until the channel closes. Reaching None at all is the point: it used
+    // to block forever because the client held a sender of its own.
+    let drained = tokio::time::timeout(Duration::from_secs(10), async {
+        while event_stream.recv().await.is_some() {}
+    })
+    .await;
+    assert!(
+        drained.is_ok(),
+        "the stream never closed after the server hung up"
+    );
+
+    let reason = client
+        .disconnect_reason()
+        .expect("the session ended without recording why");
+    assert!(
+        reason.contains("closed") || reason.contains("Connection"),
+        "unhelpful disconnect reason: {reason}"
+    );
+}

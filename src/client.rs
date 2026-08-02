@@ -203,6 +203,26 @@ fn recover<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
+/// The symbol an event refers to, borrowed rather than cloned.
+fn symbol_of(event: &MarketEvent) -> &str {
+    match event {
+        MarketEvent::Quote(e) => &e.event_symbol,
+        MarketEvent::Trade(e) => &e.event_symbol,
+        MarketEvent::Greeks(e) => &e.event_symbol,
+    }
+}
+
+/// Records why a session ended, keeping the first reason rather than the last.
+///
+/// The first failure is the cause; anything after it is a consequence of a
+/// connection that had already gone.
+fn record_reason(slot: &Arc<Mutex<Option<String>>>, error: &DXLinkError) {
+    let mut slot = recover(slot);
+    if slot.is_none() {
+        *slot = Some(error.to_string());
+    }
+}
+
 /// Removes a pending response registration when it goes out of scope.
 ///
 /// Registrations used to survive timeouts, cancelled futures and failed sends.
@@ -293,6 +313,12 @@ pub struct DXLinkClient {
     message_handle: Option<JoinHandle<()>>,
     /// A handle to the task that runs callbacks and feeds the event stream.
     delivery_handle: Option<JoinHandle<()>>,
+    /// Set once the event stream has been handed out, so it cannot be taken
+    /// twice even after the sender has moved into the delivery worker.
+    event_stream_taken: bool,
+    /// Why the session ended, once it has. Shared with the reader, which is
+    /// where the terminal error is observed.
+    disconnect_reason: Arc<Mutex<Option<String>>>,
     /// A channel sender used to signal the keepalive task.
     keepalive_sender: Option<Sender<()>>,
     /// A thread-safe vector that holds pending response requests.
@@ -337,6 +363,8 @@ impl DXLinkClient {
             keepalive_handle: None,
             message_handle: None,
             delivery_handle: None,
+            event_stream_taken: false,
+            disconnect_reason: Arc::new(Mutex::new(None)),
             keepalive_sender: None,
             response_requests: Arc::new(Mutex::new(Vec::new())),
             next_request_id: Arc::new(Mutex::new(0)),
@@ -454,25 +482,22 @@ impl DXLinkClient {
         let (delivery_tx, mut delivery_rx) = mpsc::channel::<MarketEvent>(DELIVERY_QUEUE_CAPACITY);
 
         let callbacks = self.callbacks.clone();
-        let event_sender = self.event_sender.clone();
+        // Taken, not cloned: the worker becomes the only owner, so when it ends
+        // the channel closes and the consumer's recv() returns None. That is the
+        // signal that the session is over.
+        let event_sender = self.event_sender.take();
 
         let handle = tokio::spawn(async move {
             let mut stream_closed_reported = false;
 
             while let Some(event) = delivery_rx.recv().await {
-                let symbol = match &event {
-                    MarketEvent::Quote(e) => e.event_symbol.clone(),
-                    MarketEvent::Trade(e) => e.event_symbol.clone(),
-                    MarketEvent::Greeks(e) => e.event_symbol.clone(),
-                };
+                // Borrowed, not cloned: this runs per event on a hot path.
+                let symbol = symbol_of(&event);
 
                 // Copy the handle out and release the lock before running user
                 // code: holding it across a callback serialises every other
                 // symbol behind whatever that callback is doing.
-                let callback = match callbacks.lock() {
-                    Ok(map) => map.get(&symbol).cloned(),
-                    Err(poisoned) => poisoned.into_inner().get(&symbol).cloned(),
-                };
+                let callback = recover(&callbacks).get(symbol).cloned();
 
                 if let Some(callback) = callback {
                     let delivered = event.clone();
@@ -493,8 +518,13 @@ impl DXLinkClient {
                 if let Some(tx) = &event_sender {
                     match tx.try_send(event) {
                         Ok(()) => {}
-                        Err(mpsc::error::TrySendError::Full(_)) => {
-                            debug!("Event stream full, dropping an event for {}", symbol);
+                        Err(mpsc::error::TrySendError::Full(returned)) => {
+                            // try_send hands the event back, so the symbol is
+                            // still available without having cloned it up front.
+                            debug!(
+                                "Event stream full, dropping an event for {}",
+                                symbol_of(&returned)
+                            );
                         }
                         Err(mpsc::error::TrySendError::Closed(_)) => {
                             // The consumer dropped its receiver. Callbacks still
@@ -596,6 +626,10 @@ impl DXLinkClient {
     /// # }
     /// ```
     pub async fn connect(&mut self) -> DXLinkResult<Receiver<MarketEvent>> {
+        // A new session starts clean: a reason from the previous one would make
+        // a healthy connection look dead.
+        *recover(&self.disconnect_reason) = None;
+
         // Connect to WebSocket
         let connection = WebSocketConnection::connect(&self.url).await?;
 
@@ -779,6 +813,7 @@ impl DXLinkClient {
         // nobody was listening to.
         let shutdown_keepalive = self.keepalive_sender.clone();
         let delivery_tx = self.start_event_delivery();
+        let disconnect_reason = self.disconnect_reason.clone();
 
         // The reader only routes protocol traffic now; callbacks and the
         // consumer stream belong to the delivery worker.
@@ -802,14 +837,13 @@ impl DXLinkClient {
                         // here specifically: a bare read timeout is not terminal
                         // in general, which is why this does not go through
                         // is_terminal().
-                        error!(
-                            "{}",
-                            DXLinkError::Timeout(format!(
-                                "no message received on channel {} for {}s, the connection is assumed dead",
-                                MAIN_CHANNEL,
-                                receive_deadline.as_secs()
-                            ))
-                        );
+                        let reason = DXLinkError::Timeout(format!(
+                            "no message received on channel {} for {}s, the connection is assumed dead",
+                            MAIN_CHANNEL,
+                            receive_deadline.as_secs()
+                        ));
+                        error!("{}", reason);
+                        record_reason(&disconnect_reason, &reason);
                         break;
                     }
                     Err(e) => Err(e),
@@ -954,6 +988,7 @@ impl DXLinkClient {
                     // can only fail, so stop instead of spinning forever.
                     Err(e) if e.is_terminal() => {
                         error!("Connection lost, stopping message processing: {}", e);
+                        record_reason(&disconnect_reason, &e);
                         break;
                     }
                     Err(e) => {
@@ -1064,6 +1099,7 @@ impl DXLinkClient {
         // dead connection has to go, and a prior panic elsewhere is no reason to
         // keep it.
         recover(&self.channels).clear();
+        self.event_stream_taken = false;
         recover(&self.subscriptions).clear();
         // Dropping the senders wakes every waiter instead of leaving it to time
         // out against a connection that is already gone.
@@ -1386,15 +1422,48 @@ impl DXLinkClient {
     /// afford to miss events, drain this receiver into your own unbounded
     /// buffer as soon as it yields.
     pub fn event_stream(&mut self) -> DXLinkResult<Receiver<MarketEvent>> {
-        if self.event_sender.is_none() {
-            let (tx, rx) = mpsc::channel(100); // Buffer of 100 events
-            self.event_sender = Some(tx);
-            Ok(rx)
-        } else {
-            Err(DXLinkError::Protocol(
+        if self.event_stream_taken {
+            return Err(DXLinkError::Protocol(
                 "Event stream already created".to_string(),
-            ))
+            ));
         }
+        let (tx, rx) = mpsc::channel(100); // Buffer of 100 events
+        self.event_sender = Some(tx);
+        self.event_stream_taken = true;
+        Ok(rx)
+    }
+
+    /// Why the session ended, if it has ended.
+    ///
+    /// The event stream closing tells a consumer *that* the session is over;
+    /// this tells it *why*. `None` while the session is healthy, and after a
+    /// deliberate [`disconnect`](Self::disconnect).
+    ///
+    /// Returned as text rather than a [`DXLinkError`] because the error is
+    /// observed once inside the reader and may be reported to any number of
+    /// callers, and `DXLinkError` is not `Clone`.
+    ///
+    /// # Example
+    ///
+    /// ```rust,no_run
+    /// # use dxlink::DXLinkClient;
+    /// # async fn example(mut client: DXLinkClient) -> Result<(), Box<dyn std::error::Error>> {
+    /// let mut events = client.connect().await?;
+    /// while let Some(event) = events.recv().await {
+    ///     let _ = event;
+    /// }
+    /// // The stream closed: the session is over.
+    /// if let Some(reason) = client.disconnect_reason() {
+    ///     eprintln!("connection lost: {reason}");
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn disconnect_reason(&self) -> Option<String> {
+        self.disconnect_reason
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
     }
 
     // Helper methods
