@@ -59,6 +59,9 @@ const DEFAULT_CLIENT_VERSION: &str = concat!("0.1-dxlink-rs/", env!("CARGO_PKG_V
 /// and then says nothing must not hold a caller open forever.
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// How long shutdown waits for a cooperative step before forcing it.
+const SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
+
 /// Capacity of the queue between the socket reader and the delivery worker.
 ///
 /// Generous: it only has to absorb a burst while the worker is inside a user
@@ -188,6 +191,16 @@ async fn expect_handshake_message(
     }
 
     Ok(raw)
+}
+
+/// Locks client state, recovering instead of panicking if it is poisoned.
+///
+/// State that describes a dead connection has to be cleared on disconnect, and a
+/// prior panic elsewhere is no reason to keep it around.
+fn recover<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mutex
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 /// Removes a pending response registration when it goes out of scope.
@@ -965,49 +978,96 @@ impl DXLinkClient {
 
     /// Close the connection and clean up resources
     pub async fn disconnect(&mut self) -> DXLinkResult<()> {
-        // Señalizar a la tarea de keepalive que termine
-        if let Some(sender) = &self.keepalive_sender {
-            // Intentar enviar la señal, pero no bloquear si el receptor ya no existe
+        // Order matters and it used to be backwards. The reader is the only
+        // response router, so aborting it first meant every close_channel below
+        // waited out its full five second timeout for a CHANNEL_CLOSED nobody
+        // could deliver: five seconds per open channel, and the channel state
+        // left behind anyway.
+        //
+        // 1. Stop writing maintenance, so nothing races the shutdown.
+        if let Some(sender) = self.keepalive_sender.take() {
             let _ = sender.send(()).await;
-            self.keepalive_sender = None;
+        }
+        if let Some(mut handle) = self.keepalive_handle.take() {
+            // Borrow the handle rather than moving it into the timeout: a moved
+            // handle is dropped when the timeout elapses, which detaches the
+            // task instead of stopping it. Connection::send has no deadline, so
+            // that task could sit in an await and keep using the socket after
+            // disconnect returned, with nothing left to stop it.
+            if tokio::time::timeout(SHUTDOWN_GRACE, &mut handle)
+                .await
+                .is_err()
+            {
+                warn!("Keepalive task did not stop within {SHUTDOWN_GRACE:?}; aborting it");
+                handle.abort();
+            }
         }
 
-        // Esperar a que la tarea de keepalive termine
-        if let Some(handle) = self.keepalive_handle.take() {
-            handle.abort();
+        // 2. Close the channels while the reader is still alive to route the
+        //    replies, under one deadline for the whole set rather than per
+        //    channel.
+        let channels_to_close = {
+            let channels = self
+                .channels
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            channels.keys().copied().collect::<Vec<_>>()
+        };
+
+        if !channels_to_close.is_empty() && self.connection.is_some() {
+            let closing = async {
+                for channel_id in channels_to_close {
+                    if let Err(e) = self.close_channel(channel_id).await {
+                        warn!("Error closing channel {}: {}", channel_id, e);
+                    }
+                }
+            };
+            if tokio::time::timeout(SHUTDOWN_GRACE, closing).await.is_err() {
+                warn!(
+                    "Gave up closing channels after {:?}; shutting down anyway",
+                    SHUTDOWN_GRACE
+                );
+            }
         }
 
-        // Terminar la tarea de procesamiento de mensajes
+        // 3. Now the reader has nothing left to route.
         if let Some(handle) = self.message_handle.take() {
             handle.abort();
         }
-
-        // The delivery worker ends on its own once the reader drops the queue,
-        // but disconnect must not leave it running if the reader was aborted
-        // mid-flight.
         if let Some(handle) = self.delivery_handle.take() {
             handle.abort();
         }
 
-        // Cerrar todos los canales
-        let channels_to_close = {
-            let channels = self.channels.lock().unwrap();
-            channels.keys().cloned().collect::<Vec<_>>()
-        };
-
-        for channel_id in channels_to_close {
-            if let Err(e) = self.close_channel(channel_id).await {
-                warn!("Error closing channel {}: {}", channel_id, e);
-                // Continue with other channels
-            }
-        }
-
-        // Cerrar la conexión
+        // 4. Drop the connection and every scrap of session state, so a second
+        //    disconnect is a no-op and a later reconnect starts clean.
         self.connection = None;
+        self.server_keepalive_timeout = None;
+        self.clear_session_state();
 
         info!("Disconnected from DXLink server");
 
         Ok(())
+    }
+
+    /// Drops everything tied to one session.
+    ///
+    /// Channels, subscriptions and pending responses all describe a connection
+    /// that no longer exists; carrying them across a disconnect made a later
+    /// reconnect look like it already had channels open.
+    ///
+    /// This clears the per-session bookkeeping, which is what a future
+    /// reconnect will need. It does not by itself make a
+    /// disconnect-then-connect cycle work: `connect` hands out the event
+    /// stream and that is still single-shot.
+    fn clear_session_state(&mut self) {
+        // Recovering from poisoning rather than skipping: state that describes a
+        // dead connection has to go, and a prior panic elsewhere is no reason to
+        // keep it.
+        recover(&self.channels).clear();
+        recover(&self.subscriptions).clear();
+        // Dropping the senders wakes every waiter instead of leaving it to time
+        // out against a connection that is already gone.
+        recover(&self.response_requests).clear();
     }
 
     /// Create a channel for receiving market data
@@ -1363,6 +1423,26 @@ impl DXLinkClient {
                 "Channel {} not found",
                 channel_id
             ))),
+        }
+    }
+}
+
+/// Aborts the tasks this client owns if it is dropped without `disconnect`.
+///
+/// Only abort: `Drop` is synchronous, so the protocol goodbye cannot be sent
+/// from here. Leaking two tasks per forgotten client is the failure this
+/// prevents, not an excuse to skip `disconnect`.
+impl Drop for DXLinkClient {
+    fn drop(&mut self) {
+        for handle in [
+            self.message_handle.take(),
+            self.keepalive_handle.take(),
+            self.delivery_handle.take(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            handle.abort();
         }
     }
 }
