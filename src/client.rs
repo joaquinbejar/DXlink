@@ -1538,6 +1538,7 @@ fn symbol_of(event: &MarketEvent) -> &str {
         MarketEvent::Profile(e) => &e.event_symbol,
         MarketEvent::Underlying(e) => &e.event_symbol,
         MarketEvent::TheoPrice(e) => &e.event_symbol,
+        MarketEvent::TradeETH(e) => &e.event_symbol,
     }
 }
 

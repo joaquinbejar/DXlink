@@ -77,6 +77,7 @@ const DECODED: &[EventType] = &[
     EventType::Profile,
     EventType::Underlying,
     EventType::TheoPrice,
+    EventType::TradeETH,
 ];
 
 /// Turns on tracing when `RUST_LOG` asks for it.
@@ -304,6 +305,29 @@ fn validate(event: &MarketEvent) -> &'static str {
             plausible_size(surface.put_volume, "putVolume", symbol);
             "Underlying"
         }
+        MarketEvent::TradeETH(print) => {
+            let symbol = &print.event_symbol;
+            plausible_time(print.time, "time", symbol);
+            plausible_price(print.price, "price", symbol);
+            plausible_size(print.size, "size", symbol);
+            plausible_size(print.day_volume, "dayVolume", symbol);
+            plausible_day_id(print.day_id, "dayId", symbol);
+            assert!(
+                print.exchange_code.len() <= 4,
+                "{symbol}: exchangeCode is {:?}, so the text columns may be shifted",
+                print.exchange_code
+            );
+            // Bounded set, so a shifted column lands outside it.
+            assert!(
+                matches!(
+                    print.tick_direction.as_str(),
+                    "UP" | "DOWN" | "ZERO" | "ZERO_UP" | "ZERO_DOWN" | "UNDEFINED"
+                ),
+                "{symbol}: tickDirection is {:?}, which is not one of the venue's values",
+                print.tick_direction
+            );
+            "TradeETH"
+        }
         MarketEvent::TheoPrice(theo) => {
             let symbol = &theo.event_symbol;
             plausible_time(theo.time, "time", symbol);
@@ -394,6 +418,7 @@ async fn test_real_server_delivers_well_formed_events() {
         "Profile",
         "TimeAndSale",
         "Underlying",
+        "TradeETH",
     ] {
         subscriptions.push(subscription(event_type, EQUITY));
     }

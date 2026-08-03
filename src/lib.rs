@@ -15,8 +15,9 @@
 //!   believes is live.
 //! - Automatic keepalives while the connection is open.
 //! - Market events decoded from the `COMPACT` wire format: **`Quote`, `Trade`,
-//!   `Greeks`, `Candle`, `Summary`, `TimeAndSale`, `Profile`, `Underlying` and
-//!   `TheoPrice`**, each with the full field set the dxFeed schema defines for it.
+//!   `Greeks`, `Candle`, `Summary`, `TimeAndSale`, `Profile`, `Underlying`,
+//!   `TheoPrice` and `TradeETH`**, each with the full field set the dxFeed
+//!   schema defines for it.
 //! - Both delivery styles: a per-symbol callback and a single event stream.
 //! - Historical data via `from_time` on a `Candle` subscription, decoded into
 //!   OHLC bars.
@@ -46,7 +47,7 @@
 //!
 //! - [`EventType`] declares more variants than the library can decode. Only
 //!   `Quote`, `Trade`, `Greeks`, `Candle`, `Summary`, `TimeAndSale`, `Profile`,
-//!   `Underlying` and `TheoPrice` produce a [`MarketEvent`], and
+//!   `Underlying`, `TheoPrice` and `TradeETH` produce a [`MarketEvent`], and
 //!   configuring or subscribing to any other type is **refused** rather than
 //!   accepted into a stream that can never produce.
 //!
@@ -217,6 +218,7 @@
 //! | `Profile` | the full 20-column layout: description, trading status and halt window, price limits, 52-week range and the fundamentals |
 //! | `Underlying` | the full 13-column layout: implied volatility with its term structure, call and put volume and their ratio |
 //! | `TheoPrice` | the full 13-column layout: the theoretical price with the underlying price, delta, gamma, dividend and interest it came from |
+//! | `TradeETH` | the full 15-column layout: the extended-hours print, its session volume and turnover, tick direction and the extended-hours flag |
 //!
 //! Configuring or subscribing to any other variant (`Order`, `Series`,
 //! …) is **refused**, rather than accepted into a stream that can

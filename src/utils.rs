@@ -7,7 +7,7 @@ use crate::MarketEvent;
 use crate::error::{DXLinkError, DXLinkResult};
 use crate::events::{
     CandleEvent, CompactData, EventType, GreeksEvent, ProfileEvent, QuoteEvent, SummaryEvent,
-    TheoPriceEvent, TimeAndSaleEvent, TradeEvent, UnderlyingEvent,
+    TheoPriceEvent, TimeAndSaleEvent, TradeETHEvent, TradeEvent, UnderlyingEvent,
 };
 use serde_json::Value;
 use std::collections::HashMap;
@@ -518,6 +518,23 @@ fn build_event(event_type: EventType, row: &Row<'_>) -> DXLinkResult<MarketEvent
             gamma: row.double("gamma")?,
             dividend: row.double("dividend")?,
             interest: row.double("interest")?,
+        }),
+        EventType::TradeETH => MarketEvent::TradeETH(TradeETHEvent {
+            event_type: event_type_name,
+            event_symbol: symbol,
+            event_time: row.int("eventTime")?,
+            time: row.int("time")?,
+            time_nano_part: row.int("timeNanoPart")?,
+            sequence: row.int("sequence")?,
+            exchange_code: row.text("exchangeCode")?,
+            price: row.double("price")?,
+            change: row.double("change")?,
+            size: row.double("size")?,
+            day_id: row.int("dayId")?,
+            day_volume: row.double("dayVolume")?,
+            day_turnover: row.double("dayTurnover")?,
+            tick_direction: row.text("tickDirection")?,
+            extended_trading_hours: row.flag("extendedTradingHours")?,
         }),
         // compact_fields returned Some for this type, so a missing arm here is a
         // bug in this match rather than a protocol problem.
@@ -1883,5 +1900,146 @@ mod theo_price_tests {
             matches!(back, MarketEvent::TheoPrice(_)),
             "an untagged round trip picked the wrong variant: {back:?}"
         );
+    }
+}
+
+#[cfg(test)]
+mod trade_eth_tests {
+    use super::*;
+    use serde_json::json;
+
+    /// A row exactly as the demo server sent it for AAPL, values included.
+    /// Copied from a capture rather than invented, because the point of this
+    /// type is that its layout was confirmed rather than inferred from `Trade`.
+    fn print_row(symbol: &str) -> Vec<Value> {
+        vec![
+            json!("TradeETH"),           // 0 eventType
+            json!(symbol),               // 1 eventSymbol
+            json!(0i64),                 // 2 eventTime, sent as 0 by a live feed
+            json!(1_785_542_396_498i64), // 3 time
+            json!(0i64),                 // 4 timeNanoPart
+            json!(3_009_441i64),         // 5 sequence
+            json!("D"),                  // 6 exchangeCode
+            json!(307.3554),             // 7 price
+            json!("NaN"),                // 8 change
+            json!(600.0),                // 9 size
+            json!(20665i64),             // 10 dayId
+            json!(11_085_372.061_196),   // 11 dayVolume
+            json!(3_417_052_245.055_67), // 12 dayTurnover
+            json!("UNDEFINED"),          // 13 tickDirection
+            json!(true),                 // 14 extendedTradingHours
+        ]
+    }
+
+    fn batch(values: Vec<Value>) -> Vec<CompactData> {
+        vec![
+            CompactData::EventType("TradeETH".to_string()),
+            CompactData::Values(values),
+        ]
+    }
+
+    #[test]
+    fn test_the_field_list_matches_the_decoder_stride() {
+        let fields = EventType::TradeETH
+            .compact_fields()
+            .expect("TradeETH has a decoder");
+        assert_eq!(fields.len(), 15, "the layout the server confirmed is 15");
+        assert_eq!(fields.len(), print_row("AAPL").len());
+    }
+
+    #[test]
+    fn test_a_real_row_decodes_field_for_field() {
+        let events = try_parse_compact_data(&batch(print_row("AAPL"))).expect("well formed");
+        match &events[0] {
+            MarketEvent::TradeETH(print) => {
+                assert_eq!(print.event_symbol, "AAPL");
+                assert_eq!(print.event_time, 0);
+                assert_eq!(print.time, 1_785_542_396_498);
+                assert_eq!(print.time_nano_part, 0);
+                assert_eq!(print.sequence, 3_009_441);
+                assert_eq!(print.exchange_code, "D");
+                assert_eq!(print.price, 307.3554);
+                assert!(print.change.is_nan(), "the venue sends NaN here");
+                assert_eq!(print.size, 600.0);
+                assert_eq!(print.day_id, 20665);
+                assert_eq!(print.day_volume, 11_085_372.061_196);
+                assert_eq!(print.day_turnover, 3_417_052_245.055_67);
+                assert_eq!(print.tick_direction, "UNDEFINED");
+                // The whole reason the type exists.
+                assert!(print.extended_trading_hours);
+            }
+            other => panic!("expected an extended-hours print, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_two_prints_decode_with_the_right_stride() {
+        let mut values = print_row("AAPL");
+        values.extend(print_row("MSFT"));
+
+        let events = try_parse_compact_data(&batch(values)).expect("well formed");
+        assert_eq!(events.len(), 2);
+        match (&events[0], &events[1]) {
+            (MarketEvent::TradeETH(first), MarketEvent::TradeETH(second)) => {
+                assert_eq!(first.event_symbol, "AAPL");
+                assert_eq!(second.event_symbol, "MSFT");
+            }
+            other => panic!("expected two prints, got {other:?}"),
+        }
+    }
+
+    /// The point of issue #66: an undecodable type does not merely go missing,
+    /// it abandons the rest of the batch it appears in.
+    #[test]
+    fn test_a_batch_mixing_trade_and_trade_eth_decodes_whole() {
+        let mut data = batch(print_row("AAPL"));
+        data.push(CompactData::EventType("Trade".to_string()));
+        data.push(CompactData::Values(vec![
+            json!("Trade"),
+            json!("MSFT"),
+            json!(464.72),
+            json!(100.0),
+            json!(60_845_971.0),
+        ]));
+
+        let events = try_parse_compact_data(&data).expect("both types decode now");
+        assert_eq!(
+            events.len(),
+            2,
+            "a TradeETH row used to abort the batch and take the Trade with it"
+        );
+        assert!(matches!(events[0], MarketEvent::TradeETH(_)));
+        assert!(matches!(events[1], MarketEvent::Trade(_)));
+    }
+
+    #[test]
+    fn test_a_numeric_tick_direction_is_rejected() {
+        let mut values = print_row("AAPL");
+        values[13] = json!(1.0);
+
+        let error = try_parse_compact_data(&batch(values)).expect_err("the column is text");
+        assert!(
+            error.to_string().contains("tickDirection"),
+            "the field is missing: {error}"
+        );
+    }
+
+    #[test]
+    fn test_a_regular_hours_print_is_distinguishable() {
+        let mut values = print_row("AAPL");
+        values[14] = json!(false);
+
+        let events = try_parse_compact_data(&batch(values)).expect("well formed");
+        match &events[0] {
+            MarketEvent::TradeETH(print) => assert!(!print.extended_trading_hours),
+            other => panic!("expected a print, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_a_truncated_print_row_is_rejected() {
+        let mut values = print_row("AAPL");
+        values.pop();
+        assert!(try_parse_compact_data(&batch(values)).is_err());
     }
 }
