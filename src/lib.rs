@@ -32,7 +32,9 @@
 //!   connecting and a terminal socket failure is followed by exponential
 //!   backoff, a fresh handshake, and a replay of every channel, feed
 //!   configuration and subscription. A rejected token is not retried.
-//!   [`DXLinkClient::connection_states`] reports what is happening.
+//!   [`DXLinkClient::connection_states`] reports what is happening, dropping the
+//!   oldest states rather than the newest if a consumer falls behind, so a slow
+//!   reader can miss the middle of a reconnect but not its outcome.
 //!
 //! ## What is not supported yet
 //!

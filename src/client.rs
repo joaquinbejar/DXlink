@@ -18,6 +18,7 @@ use std::collections::HashMap;
 use std::fmt;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
+use tokio::sync::broadcast;
 use tokio::sync::mpsc::{self, Receiver, Sender};
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
@@ -1057,21 +1058,20 @@ fn keepalive_interval_for(advertised: u32, negotiated: Option<u32>) -> Duration 
     Duration::from_secs(u64::from(deadline.div_ceil(KEEPALIVE_DIVISOR))).max(MIN_KEEPALIVE_INTERVAL)
 }
 
-/// Reports a connection-state change, dropping it if the consumer is behind.
+/// Reports a connection-state change, never blocking the supervisor.
 ///
-/// States are advisory and the supervisor's job is to reconnect, not to block
-/// on a consumer that stopped reading.
+/// A full queue **evicts the oldest state**, so a consumer that falls behind
+/// loses the middle of a reconnect rather than its end. That is the right way
+/// round: `Reconnecting { attempt: 3 }` is worth less than the `Reconnected` or
+/// `GaveUp` that follows it, and the previous `mpsc` did the opposite because a
+/// sender cannot evict from the front of its own queue.
 ///
-/// **Drops the state being reported, not the oldest queued one.** An `mpsc`
-/// sender cannot evict from the front of its own queue, so a consumer that
-/// ignores the stream long enough to fill it stops seeing new states rather
-/// than losing old ones. See issue #60: the terminal states are the ones worth
-/// keeping, so the eviction should go the other way.
-fn notify(states: &Option<Sender<ConnectionState>>, state: ConnectionState) {
-    if let Some(tx) = states
-        && tx.try_send(state.clone()).is_err()
-    {
-        debug!("Dropping connection state {state:?}: nobody is reading them");
+/// A send with no subscribers is not a failure, it is the normal case for a
+/// consumer that never asked for the stream — and it is the case on **every**
+/// transition, so it is dropped silently rather than logged.
+fn notify(states: &Option<broadcast::Sender<ConnectionState>>, state: ConnectionState) {
+    if let Some(tx) = states {
+        let _ = tx.send(state);
     }
 }
 
@@ -1552,10 +1552,10 @@ pub struct DXLinkClient {
     /// The reconnection policy, if the consumer installed one. `None` is the
     /// default and means the client never retries.
     reconnect: Option<ReconnectPolicy>,
-    /// The connection-state stream, until the consumer takes it.
-    state_receiver: Option<Receiver<ConnectionState>>,
-    /// The sending half, kept so the supervisor can be handed a clone.
-    state_sender: Option<Sender<ConnectionState>>,
+    /// Broadcasts connection-state changes. `None` until a session with a
+    /// reconnect policy is established, and dropped again on `disconnect`, which
+    /// is what closes a consumer's stream.
+    state_sender: Option<broadcast::Sender<ConnectionState>>,
     /// A handle to the reconnect supervisor, when one is running.
     supervisor_handle: Option<JoinHandle<()>>,
     /// Stops the supervisor, including a backoff it is in the middle of.
@@ -1615,7 +1615,6 @@ impl DXLinkClient {
             channel_schemas: Arc::new(Mutex::new(HashMap::new())),
             channel_contracts: Arc::new(Mutex::new(HashMap::new())),
             reconnect: None,
-            state_receiver: None,
             state_sender: None,
             supervisor_handle: None,
             supervisor_shutdown: None,
@@ -1789,24 +1788,42 @@ impl DXLinkClient {
     /// ```
     pub fn with_reconnect(&mut self, policy: ReconnectPolicy) {
         self.reconnect = Some(policy);
+        // Opened here rather than in `connect`, so `connection_states` works the
+        // moment a policy exists. A `&self` accessor that answered `None` until
+        // some other call had happened would be a trap.
+        if self.state_sender.is_none() {
+            // Normally already open, from `with_reconnect`. This covers a
+            // reconnect after a `disconnect`, which drops the old one.
+            if self.state_sender.is_none() {
+                let (state_tx, _) =
+                    broadcast::channel::<ConnectionState>(CONNECTION_STATE_CAPACITY);
+                self.state_sender = Some(state_tx);
+            }
+        }
     }
 
-    /// Takes the stream of connection-state changes.
+    /// Subscribes to connection-state changes.
     ///
-    /// There is one per client and it is handed out once; a second call
-    /// returns `None`. Only useful with a reconnect policy installed, since
-    /// without one the session never comes back and the closing event stream
-    /// already says so.
+    /// `None` without a reconnect policy: the session never comes back, and the
+    /// closing event stream already says so. With one, every call returns a new
+    /// receiver, from [`with_reconnect`](Self::with_reconnect) onwards — no need
+    /// to connect first.
     ///
-    /// The stream is bounded and **never blocks the supervisor**: when the
-    /// queue is full the new state is dropped, so a consumer that stops reading
-    /// long enough to fill it stops seeing changes until it drains. States are
-    /// advisory; the authority on whether the client is live is whether events
-    /// are still arriving.
+    /// Each receiver sees only what is sent **after** it subscribes, so
+    /// subscribe before the states you care about. Subscribing right after
+    /// installing the policy is the way to be sure of catching all of them.
     ///
-    /// Additive: a new method, no existing signature changes.
-    pub fn connection_states(&mut self) -> Option<Receiver<ConnectionState>> {
-        self.state_receiver.take()
+    /// The stream is bounded and never blocks the supervisor. A consumer that
+    /// falls behind **loses the oldest states**, is told how many with
+    /// [`RecvError::Lagged`](tokio::sync::broadcast::error::RecvError::Lagged),
+    /// and carries on — so it can miss the middle of a long reconnect but not
+    /// the `Reconnected` or `GaveUp` that ends it.
+    ///
+    /// The stream closes when the session does: after
+    /// [`disconnect`](Self::disconnect), or when the client is dropped.
+    /// Subscribing again after a later `connect` gives a live stream.
+    pub fn connection_states(&self) -> Option<broadcast::Receiver<ConnectionState>> {
+        self.state_sender.as_ref().map(broadcast::Sender::subscribe)
     }
 
     /// Sets the keepalive timeout this client advertises, in seconds.
@@ -1901,9 +1918,8 @@ impl DXLinkClient {
             let (lost_tx, lost_rx) = mpsc::channel::<String>(1);
             self.session_lost_sender = Some(lost_tx);
             self.session_lost_receiver = Some(lost_rx);
-            let (state_tx, state_rx) = mpsc::channel::<ConnectionState>(CONNECTION_STATE_CAPACITY);
+            let (state_tx, _) = broadcast::channel::<ConnectionState>(CONNECTION_STATE_CAPACITY);
             self.state_sender = Some(state_tx);
-            self.state_receiver = Some(state_rx);
         }
 
         // Keepalive first: it owns the shutdown channel the reader needs in
@@ -2034,10 +2050,10 @@ impl DXLinkClient {
             session_tasks: self.session_tasks.clone(),
         };
 
-        // Taken, not cloned: the supervisor becomes the only sender, so when it
-        // returns the state stream closes. A client holding a clone would leave
-        // a consumer waiting on states that can never come.
-        let states = self.state_sender.take();
+        // Cloned, not taken: a consumer can subscribe at any time, so the client
+        // keeps its own sender. `disconnect` drops that one, and the supervisor
+        // returning drops this one, which together close the stream.
+        let states = self.state_sender.clone();
         let (shutdown_tx, mut shutdown_rx) = mpsc::channel::<()>(1);
         self.supervisor_shutdown = Some(shutdown_tx);
 
@@ -2159,6 +2175,11 @@ impl DXLinkClient {
         // Dropping the sender means a reader that dies during the teardown
         // below has nobody to report to, which is what we want by then.
         self.session_lost_sender = None;
+        // And the state stream ends with the session. The supervisor is stopped
+        // by now, whether it returned or was aborted after the grace period, and
+        // either way it no longer holds a sender — so dropping this one is what
+        // tells a consumer there will be no more states.
+        self.state_sender = None;
 
         // 1. Stop writing maintenance, so nothing races the shutdown.
         // Taken in its own block: the guard must not live into the await below,
@@ -3313,5 +3334,15 @@ mod reconnect_policy_tests {
 
         client.with_reconnect(ReconnectPolicy::default());
         assert!(client.reconnect.is_some());
+
+        // Available from here, without connecting first: a `&self` accessor
+        // that answered None until some other call had happened is a trap.
+        assert!(
+            client.connection_states().is_some(),
+            "the stream should exist as soon as the policy does"
+        );
+        // And it is a subscription, not a handout, so a second caller gets one
+        // of their own.
+        assert!(client.connection_states().is_some());
     }
 }
