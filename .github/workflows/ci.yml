@@ -28,6 +28,11 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo fmt --all --check
       - run: cargo clippy --all-targets --all-features -- -D warnings
+      # Nothing caught broken doc links before this: a dead [`Type::method`]
+      # renders as literal text on docs.rs, where the API is the product.
+      - run: cargo doc --no-deps --workspace --all-features
+        env:
+          RUSTDOCFLAGS: -D warnings
 
   run_tests:
     runs-on: ubuntu-latest
