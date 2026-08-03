@@ -12,7 +12,7 @@ use crate::messages::{
     FeedConfigMessage, FeedDataMessage, FeedSetupMessage, FeedSubscription,
     FeedSubscriptionMessage, KeepaliveMessage, ServerSetupMessage, SetupMessage,
 };
-use crate::try_parse_compact_data;
+use crate::utils::try_parse_negotiated;
 
 use std::collections::HashMap;
 use std::fmt;
@@ -430,53 +430,54 @@ fn spawn_reader(setup: ReaderSetup) -> JoinHandle<()> {
                         // Si nadie esperaba este mensaje específicamente, procesarlo normalmente
                         match msg_type {
                             "FEED_CONFIG" => {
-                                // Nobody was waiting: this is the server
-                                // changing the layout mid-session, which the
-                                // spec allows. The decoder cannot follow it,
-                                // so the channel stops being decodable
-                                // rather than producing shifted values.
+                                // Nobody was waiting, so this is the server
+                                // reporting the layout it settled on. The demo
+                                // feed does this routinely: it answers
+                                // FEED_SETUP with nothing, then sends the real
+                                // list once a subscription exists.
+                                //
+                                // Adopted, not refused. The decoder reads by
+                                // field name, so serving fewer fields than we
+                                // asked for is decodable — the missing ones
+                                // read as "not provided". Invalidating instead
+                                // meant the channel delivered nothing at all.
                                 if let Some(ch) = channel {
-                                    // Only a real disagreement invalidates.
-                                    // A server may resend an identical
-                                    // FEED_CONFIG, and treating that as a
-                                    // change would stop decoding a channel
-                                    // nothing had happened to.
-                                    let disagrees =
-                                        match serde_json::from_str::<FeedConfigMessage>(&msg) {
-                                            Ok(config) => {
-                                                let schemas = recover(&channel_schemas);
-                                                schemas.get(&ch).is_some_and(|stored| {
-                                                    config_disagrees(&config, stored)
-                                                })
+                                    match serde_json::from_str::<FeedConfigMessage>(&msg) {
+                                        Ok(config) => adopt_config(&channel_schemas, ch, &config),
+                                        Err(e) => {
+                                            // Unreadable is not agreement: stop
+                                            // decoding rather than keep using a
+                                            // layout the server may have moved
+                                            // away from.
+                                            if recover(&channel_schemas).remove(&ch).is_some() {
+                                                error!(
+                                                    "Channel {ch} sent an unreadable \
+                                                     FEED_CONFIG ({e}); its data will be \
+                                                     dropped rather than decoded against a \
+                                                     layout that may be stale"
+                                                );
                                             }
-                                            // Unreadable is not agreement.
-                                            Err(_) => true,
-                                        };
-
-                                    if disagrees && recover(&channel_schemas).remove(&ch).is_some()
-                                    {
-                                        error!(
-                                            "Channel {} was reconfigured by the server; \
-                                                 its data will be dropped rather than decoded \
-                                                 against the old layout",
-                                            ch
-                                        );
+                                        }
                                     }
                                 }
                             }
                             "FEED_DATA" => {
                                 // Only decode against a layout the server
-                                // agreed to.
-                                let decodable = channel
-                                    .map(|ch| recover(&channel_schemas).contains_key(&ch))
-                                    .unwrap_or(false);
+                                // agreed to, and against *that* layout rather
+                                // than the one this client asked for: the two
+                                // are not always the same.
+                                let layout = channel
+                                    .and_then(|ch| recover(&channel_schemas).get(&ch).cloned());
 
-                                if !decodable {
+                                let Some(layout) = layout else {
                                     debug!(
                                         "Dropping FEED_DATA for channel {:?}: no validated layout",
                                         channel
                                     );
-                                } else if let Ok(data_msg) =
+                                    continue;
+                                };
+
+                                if let Ok(data_msg) =
                                     serde_json::from_str::<FeedDataMessage<Vec<CompactData>>>(&msg)
                                 {
                                     // Hand off and keep reading. Delivery is
@@ -484,19 +485,20 @@ fn spawn_reader(setup: ReaderSetup) -> JoinHandle<()> {
                                     // one slow callback or a full consumer
                                     // stream stop the socket reads that every
                                     // channel operation depends on.
-                                    let decoded = match try_parse_compact_data(&data_msg.data) {
-                                        Ok(events) => events,
-                                        Err(e) => {
-                                            // Report it rather than
-                                            // delivering a partial batch
-                                            // that looks complete.
-                                            error!(
-                                                "Malformed COMPACT data on channel {:?}: {e}",
-                                                channel
-                                            );
-                                            continue;
-                                        }
-                                    };
+                                    let decoded =
+                                        match try_parse_negotiated(&data_msg.data, &layout) {
+                                            Ok(events) => events,
+                                            Err(e) => {
+                                                // Report it rather than
+                                                // delivering a partial batch
+                                                // that looks complete.
+                                                error!(
+                                                    "Malformed COMPACT data on channel {:?}: {e}",
+                                                    channel
+                                                );
+                                                continue;
+                                            }
+                                        };
 
                                     for event in decoded {
                                         match delivery_tx.try_send(event) {
@@ -961,8 +963,8 @@ async fn replay_session(ctx: &ReconnectContext) -> DXLinkResult<()> {
         .await?
         {
             ResponseType::FeedConfig(config) => {
-                validate_feed_config(&config, channel_id, &event_types)?;
-                recover(&ctx.channel_schemas).insert(channel_id, requested_fields(&event_types));
+                let schema = negotiated_schema(&config, channel_id, &event_types)?;
+                recover(&ctx.channel_schemas).insert(channel_id, schema);
             }
             other => {
                 return Err(DXLinkError::Protocol(format!(
@@ -1308,31 +1310,21 @@ fn requested_fields(event_types: &[EventType]) -> ChannelSchema {
         .collect()
 }
 
-/// Whether a `FEED_CONFIG` contradicts a layout already validated for a channel.
-fn config_disagrees(config: &FeedConfigMessage, stored: &ChannelSchema) -> bool {
-    if !config.data_format.eq_ignore_ascii_case("COMPACT") {
-        return true;
-    }
-    let Some(negotiated) = config.event_fields.as_ref() else {
-        return false;
-    };
-    negotiated
-        .iter()
-        .any(|(event_type, fields)| stored.get(event_type).is_some_and(|known| known != fields))
-}
-
-/// Checks that the server agreed to the contract this client asked for.
+/// The layout a channel will actually be decoded against.
 ///
-/// The specification says `FEED_CONFIG` reports the *actual* configuration, and
-/// that the server may send it again when it changes. Treating it as a bare
-/// acknowledgement meant a different data format, a reordered field list, or a
-/// dropped field all went unnoticed until the decoder produced numbers in the
-/// wrong fields.
-fn validate_feed_config(
+/// `FEED_CONFIG` reports the **actual** configuration, which is not always the
+/// one requested: a server may serve a subset of the fields asked for, and the
+/// dxFeed demo does exactly that, dropping `VWAP` from `Candle`. So the reply is
+/// adopted rather than merely checked. What it cannot do is change the data
+/// format, or leave out the two columns that identify a row.
+///
+/// A type the server did not mention keeps the requested list, which is the
+/// spec's own reading: silence is agreement.
+fn negotiated_schema(
     config: &FeedConfigMessage,
     channel_id: u32,
     event_types: &[EventType],
-) -> DXLinkResult<()> {
+) -> DXLinkResult<ChannelSchema> {
     if !config.data_format.eq_ignore_ascii_case("COMPACT") {
         return Err(DXLinkError::Protocol(format!(
             "channel {channel_id}: this client decodes COMPACT rows, but the server \
@@ -1341,26 +1333,88 @@ fn validate_feed_config(
         )));
     }
 
-    // A server that echoes no field list has not disagreed with the request.
+    let mut schema = requested_fields(event_types);
     let Some(negotiated) = config.event_fields.as_ref() else {
-        return Ok(());
+        return Ok(schema);
     };
 
-    for (event_type, expected) in requested_fields(event_types) {
-        let Some(actual) = negotiated.get(&event_type) else {
-            // Not echoed back is not a disagreement either.
+    for (event_type, fields) in negotiated {
+        // Only what was asked for. A server volunteering a type we never
+        // requested has nothing to deliver on this channel anyway.
+        if !schema.contains_key(event_type) {
+            continue;
+        }
+        check_identifiable(event_type, channel_id, fields)?;
+        schema.insert(event_type.clone(), fields.clone());
+    }
+
+    Ok(schema)
+}
+
+/// Takes on the layout a `FEED_CONFIG` reports, for a channel already
+/// configured.
+///
+/// Only the types the channel knows about, and only layouts whose rows can
+/// still be identified. A channel with no stored schema is one that was never
+/// set up, so there is nothing to update.
+fn adopt_config(schemas: &ChannelSchemas, channel_id: u32, config: &FeedConfigMessage) {
+    if !config.data_format.eq_ignore_ascii_case("COMPACT") {
+        if recover(schemas).remove(&channel_id).is_some() {
+            error!(
+                "Channel {channel_id} was moved to {} data, which this client cannot \
+                 decode; its data will be dropped",
+                config.data_format
+            );
+        }
+        return;
+    }
+
+    let Some(negotiated) = config.event_fields.as_ref() else {
+        return;
+    };
+
+    let mut schemas = recover(schemas);
+    let Some(stored) = schemas.get_mut(&channel_id) else {
+        return;
+    };
+
+    for (event_type, fields) in negotiated {
+        let Some(known) = stored.get(event_type) else {
             continue;
         };
+        if known == fields {
+            continue;
+        }
+        if let Err(e) = check_identifiable(event_type, channel_id, fields) {
+            debug!("Ignoring an unusable {event_type} layout on channel {channel_id}: {e}");
+            continue;
+        }
+        info!(
+            "Channel {channel_id} negotiated a different {event_type} layout; decoding \
+             against it. Fields this client asked for and will not get: {:?}",
+            known
+                .iter()
+                .filter(|field| !fields.contains(field))
+                .collect::<Vec<_>>()
+        );
+        stored.insert(event_type.clone(), fields.clone());
+    }
+}
 
-        if *actual != expected {
+/// Rejects a layout that cannot identify its own rows.
+///
+/// Everything else may be missing and read as "not provided", but without these
+/// two there is no way to tell what a row is or what it is about, and decoding
+/// it would be guessing.
+fn check_identifiable(event_type: &str, channel_id: u32, fields: &[String]) -> DXLinkResult<()> {
+    for required in ["eventType", "eventSymbol"] {
+        if !fields.iter().any(|field| field == required) {
             return Err(DXLinkError::Protocol(format!(
-                "channel {channel_id}: the server changed the {event_type} field layout; \
-                 requested {expected:?} but it negotiated {actual:?}. Decoding against the \
-                 requested order would attach values to the wrong fields"
+                "channel {channel_id}: the server negotiated a {event_type} layout with no \
+                 `{required}` column ({fields:?}), so its rows cannot be identified"
             )));
         }
     }
-
     Ok(())
 }
 
@@ -2404,13 +2458,14 @@ impl DXLinkClient {
                     )));
                 }
 
-                // The reply is the negotiated contract, not an acknowledgement.
-                // Accepting it unread meant a server that chose a different
-                // format or reordered a field list left the decoder attaching
-                // values to the wrong fields, silently.
-                validate_feed_config(&config, channel_id, event_types)?;
+                // The reply is the negotiated contract, not an
+                // acknowledgement, and it is what the decoder will read against
+                // — the server may serve fewer fields than were asked for.
+                // Accepting it unread meant a different data format went
+                // unnoticed until values landed in the wrong fields.
+                let schema = negotiated_schema(&config, channel_id, event_types)?;
 
-                recover(&self.channel_schemas).insert(channel_id, requested_fields(event_types));
+                recover(&self.channel_schemas).insert(channel_id, schema);
 
                 info!("Feed channel {} setup completed successfully", channel_id);
                 Ok(())

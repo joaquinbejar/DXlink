@@ -25,6 +25,12 @@
 //! - Strict decoding: [`try_parse_compact_data`] reports a short row, a wrong
 //!   column type or an unknown event type instead of returning fewer events and
 //!   letting a consumer read that as a quiet market.
+//! - **The layout the server negotiates is the one that gets decoded.** A feed
+//!   may serve fewer fields than were asked for — the dxFeed demo drops `VWAP`
+//!   from `Candle` — so columns are read by name rather than by position. A
+//!   field the server does not send arrives as `NaN`, `0` or an empty string
+//!   rather than as its neighbour's value, and a reordered list is followed
+//!   rather than refused.
 //! - A lost connection is observable: the event stream closes, and
 //!   [`DXLinkClient::disconnect_reason`] says why.
 //! - **Opt-in reconnection.** Off by default. Install a

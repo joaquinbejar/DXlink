@@ -3,8 +3,8 @@
 //!
 //! Event delivery is covered in `dxlink_flow.rs`.
 
-use crate::fixture::{Behaviour, MockServer, is_type, is_type_on_channel};
-use dxlink::{DXLinkClient, DXLinkError, EventType, FeedSubscription};
+use crate::fixture::{Behaviour, MockServer, expected, is_type, is_type_on_channel};
+use dxlink::{DXLinkClient, DXLinkError, EventType, FeedSubscription, MarketEvent};
 use std::time::Duration;
 
 #[tokio::test]
@@ -552,30 +552,63 @@ async fn test_a_client_can_reconnect_after_disconnecting() {
     client.disconnect().await.expect("failed to disconnect");
 }
 
+/// A plain Quote subscription, for the layout tests below.
+fn quote_subscription(symbol: &str) -> FeedSubscription {
+    FeedSubscription {
+        event_type: "Quote".to_string(),
+        symbol: symbol.to_string(),
+        from_time: None,
+        source: None,
+    }
+}
+
 // --- FEED_CONFIG validation (issue #12) ------------------------------------
 
-/// A server that reorders the field list must be rejected. Accepting it meant
-/// the decoder kept reading the requested order and attached every value to the
-/// wrong field, with no error anywhere.
+/// A server that reorders the field list is **decoded against that order**,
+/// not refused.
+///
+/// This used to be a rejection, which was the right answer while the decoder
+/// read by position. It reads by name now, so the order the server picks is
+/// simply the order it is read in, and refusing would be turning a
+/// non-problem into a dead channel.
 #[tokio::test]
-async fn test_setup_feed_rejects_a_reordered_field_layout() {
+async fn test_setup_feed_adopts_a_reordered_field_layout() {
     let server = MockServer::start(Behaviour::ReorderedFeedConfig).await;
     let mut client = DXLinkClient::new(&server.url(), "test-token");
-    client.connect().await.expect("failed to connect");
+    let mut stream = client.connect().await.expect("failed to connect");
     let channel_id = client
         .create_feed_channel("AUTO")
         .await
         .expect("failed to create feed channel");
 
-    match client.setup_feed(channel_id, &[EventType::Quote]).await {
-        Err(DXLinkError::Protocol(msg)) => {
-            assert!(msg.contains("Quote"), "which event type is unclear: {msg}");
-            assert!(
-                msg.contains("eventSymbol") && msg.contains("eventType"),
-                "the error should show both layouts: {msg}"
-            );
+    client
+        .setup_feed(channel_id, &[EventType::Quote])
+        .await
+        .expect("a reordered layout is decodable, so it must be accepted");
+
+    client
+        .subscribe(channel_id, vec![quote_subscription("AAPL")])
+        .await
+        .expect("failed to subscribe");
+
+    let event = tokio::time::timeout(Duration::from_secs(5), stream.recv())
+        .await
+        .expect("no event arrived")
+        .expect("the stream closed");
+
+    // The whole point: the values land in the right fields even though the
+    // server put the columns somewhere else. Reading by position would have
+    // put the symbol in event_type here.
+    match event {
+        MarketEvent::Quote(quote) => {
+            assert_eq!(quote.event_type, "Quote");
+            assert_eq!(quote.event_symbol, "AAPL");
+            assert_eq!(quote.bid_price, expected::BID_PRICE);
+            assert_eq!(quote.ask_price, expected::ASK_PRICE);
+            assert_eq!(quote.bid_size, expected::BID_SIZE);
+            assert_eq!(quote.ask_size, expected::ASK_SIZE);
         }
-        other => panic!("a reordered layout must be rejected, got: {other:?}"),
+        other => panic!("expected a quote, got {other:?}"),
     }
 
     client.disconnect().await.expect("failed to disconnect");
@@ -606,12 +639,9 @@ async fn test_setup_feed_rejects_a_format_it_cannot_decode() {
     client.disconnect().await.expect("failed to disconnect");
 }
 
-/// A reconfiguration that fails validation must not leave the previous layout
-/// installed. It used to: the error returned before replacing the entry, and
-/// because the reply went to the waiter the unsolicited-config path never saw
-/// it, so the channel kept decoding against a contract the server had changed.
+/// A reconfiguration mid-session is adopted, and the channel keeps working.
 #[tokio::test]
-async fn test_a_rejected_reconfiguration_invalidates_the_channel() {
+async fn test_a_reconfiguration_is_adopted_and_the_channel_keeps_working() {
     let server = MockServer::start(Behaviour::ReorderedFeedConfigOnSecondSetup).await;
     let mut client = DXLinkClient::new(&server.url(), "test-token");
     let mut stream = client.connect().await.expect("failed to connect");
@@ -620,41 +650,38 @@ async fn test_a_rejected_reconfiguration_invalidates_the_channel() {
         .await
         .expect("failed to create feed channel");
 
-    // First setup is honoured.
     client
         .setup_feed(channel_id, &[EventType::Quote])
         .await
         .expect("the first setup should succeed");
 
-    // Second one comes back reordered and must be refused.
-    assert!(
-        client
-            .setup_feed(channel_id, &[EventType::Quote])
-            .await
-            .is_err(),
-        "a reordered reconfiguration must be refused"
-    );
+    // The second reply comes back with the columns in a different order, and
+    // that is now something to follow rather than refuse.
+    client
+        .setup_feed(channel_id, &[EventType::Quote])
+        .await
+        .expect("a reconfiguration this client can decode must be accepted");
 
-    // And the channel is no longer usable at all: with its layout gone there is
-    // nothing to decode against, so the refusal comes before anything is sent
-    // rather than after data arrives.
-    let result = client
-        .subscribe(
-            channel_id,
-            vec![FeedSubscription {
-                event_type: "Quote".to_string(),
-                symbol: "AAPL".to_string(),
-                from_time: None,
-                source: None,
-            }],
-        )
-        .await;
-    assert!(
-        result.is_err(),
-        "a channel whose reconfiguration was refused must not accept subscriptions"
-    );
+    client
+        .subscribe(channel_id, vec![quote_subscription("AAPL")])
+        .await
+        .expect("the channel should still be usable after a reconfiguration");
 
-    let _ = &mut stream;
+    let event = tokio::time::timeout(Duration::from_secs(5), stream.recv())
+        .await
+        .expect("no event arrived after the reconfiguration")
+        .expect("the stream closed");
+
+    match event {
+        MarketEvent::Quote(quote) => {
+            // Decoded against the *new* layout: the old one would have swapped
+            // these two.
+            assert_eq!(quote.event_type, "Quote");
+            assert_eq!(quote.event_symbol, "AAPL");
+            assert_eq!(quote.bid_price, expected::BID_PRICE);
+        }
+        other => panic!("expected a quote, got {other:?}"),
+    }
 
     client.disconnect().await.expect("failed to disconnect");
 }
@@ -917,6 +944,113 @@ async fn test_setup_feed_refuses_an_empty_event_type_list() {
         0,
         "a refused setup still went out"
     );
+
+    client.disconnect().await.expect("failed to disconnect");
+}
+
+/// Issue #63, reproduced offline: the server serves **fewer** fields than were
+/// asked for.
+///
+/// The dxFeed demo drops `VWAP` from `Candle`. Reading by position against the
+/// requested 18 columns meant the 17 that arrived were not a whole number of
+/// rows, so the whole batch was discarded and `Candle` delivered nothing at
+/// all. Reading by name, the bar decodes and the missing field reads as `NaN`.
+#[tokio::test]
+async fn test_a_trimmed_layout_still_decodes() {
+    let server = MockServer::start(Behaviour::TrimsCandleVwap).await;
+    let mut client = DXLinkClient::new(&server.url(), "test-token");
+    let mut stream = client.connect().await.expect("failed to connect");
+    let channel_id = client
+        .create_feed_channel("AUTO")
+        .await
+        .expect("failed to create feed channel");
+
+    client
+        .setup_feed(channel_id, &[EventType::Candle])
+        .await
+        .expect("a server serving a subset is still decodable");
+
+    client
+        .subscribe(
+            channel_id,
+            vec![FeedSubscription {
+                event_type: "Candle".to_string(),
+                symbol: "AAPL{=5m}".to_string(),
+                from_time: None,
+                source: None,
+            }],
+        )
+        .await
+        .expect("failed to subscribe");
+
+    let event = tokio::time::timeout(Duration::from_secs(5), stream.recv())
+        .await
+        .expect("no bar arrived, which is exactly the bug")
+        .expect("the stream closed");
+
+    match event {
+        MarketEvent::Candle(candle) => {
+            // Everything after the missing column still lands correctly, which
+            // is what a positional read could not do.
+            assert_eq!(candle.event_symbol, "AAPL{=5m}");
+            assert_eq!(candle.volume, expected::VOLUME);
+            assert_eq!(candle.bid_volume, expected::BID_VOLUME);
+            assert_eq!(candle.ask_volume, expected::ASK_VOLUME);
+            assert_eq!(candle.imp_volatility, expected::IMP_VOLATILITY);
+            assert_eq!(candle.open_interest, expected::OPEN_INTEREST);
+            // And the one the server does not serve is absent, not wrong.
+            assert!(
+                candle.vwap.is_nan(),
+                "a field the server did not send must not come back as a number: {}",
+                candle.vwap
+            );
+        }
+        other => panic!("expected a candle, got {other:?}"),
+    }
+
+    client.disconnect().await.expect("failed to disconnect");
+}
+
+/// The other half of issue #63: the real layout arrives **after** the
+/// subscription, not as the reply to `FEED_SETUP`.
+///
+/// The demo server acknowledges the setup with no field list at all, then
+/// reports what it will really serve once there is something to serve. That
+/// second config used to invalidate the channel, so every row that followed was
+/// dropped. It is adopted now.
+#[tokio::test]
+async fn test_a_late_config_is_adopted_rather_than_fatal() {
+    let server = MockServer::start(Behaviour::LateFeedConfig).await;
+    let mut client = DXLinkClient::new(&server.url(), "test-token");
+    let mut stream = client.connect().await.expect("failed to connect");
+    let channel_id = client
+        .create_feed_channel("AUTO")
+        .await
+        .expect("failed to create feed channel");
+
+    client
+        .setup_feed(channel_id, &[EventType::Quote])
+        .await
+        .expect("an acknowledgement with no field list is agreement, not a refusal");
+
+    client
+        .subscribe(channel_id, vec![quote_subscription("AAPL")])
+        .await
+        .expect("failed to subscribe");
+
+    let event = tokio::time::timeout(Duration::from_secs(5), stream.recv())
+        .await
+        .expect("no event arrived after the late config")
+        .expect("the stream closed");
+
+    match event {
+        MarketEvent::Quote(quote) => {
+            assert_eq!(quote.event_symbol, "AAPL");
+            assert_eq!(quote.bid_price, expected::BID_PRICE);
+            assert_eq!(quote.ask_price, expected::ASK_PRICE);
+        }
+        other => panic!("expected a quote, got {other:?}"),
+    }
 
     client.disconnect().await.expect("failed to disconnect");
 }

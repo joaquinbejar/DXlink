@@ -71,6 +71,12 @@ pub enum Behaviour {
     NonCompactFeedConfig,
     /// Honour the first FEED_SETUP and reorder the reply to every one after it.
     ReorderedFeedConfigOnSecondSetup,
+    /// Serve `Candle` without `VWAP`, reporting and sending the trimmed layout.
+    /// This is what the dxFeed demo does, and issue #63 is about it.
+    TrimsCandleVwap,
+    /// Acknowledge FEED_SETUP with no field list, then report the real layout
+    /// only once a subscription exists. Also what the dxFeed demo does.
+    LateFeedConfig,
     /// Serve one full session, hang up once the feed is subscribed, then serve
     /// every later connection normally. Drives a reconnect that succeeds.
     DropFirstSession,
@@ -286,29 +292,6 @@ impl MockServer {
                             "service": value["service"].as_str().unwrap_or("FEED"),
                             "parameters": {}
                         })),
-                        "FEED_SETUP"
-                            if behaviour == Behaviour::ReorderedFeedConfig
-                                || (behaviour == Behaviour::ReorderedFeedConfigOnSecondSetup
-                                    && {
-                                        feed_setups_seen += 1;
-                                        feed_setups_seen > 1
-                                    }) =>
-                        {
-                            let mut reordered = value["acceptEventFields"]["Quote"]
-                                .as_array()
-                                .cloned()
-                                .unwrap_or_default();
-                            // Guard: a fixture panic would mask the behaviour under
-                            // test rather than reporting it.
-                            if reordered.len() >= 2 {
-                                reordered.swap(0, 1);
-                            }
-                            responses.push(json!({
-                                "channel": channel, "type": "FEED_CONFIG",
-                                "aggregationPeriod": 0.1, "dataFormat": "COMPACT",
-                                "eventFields": { "Quote": reordered }
-                            }));
-                        }
                         "FEED_SETUP" if behaviour == Behaviour::NonCompactFeedConfig => {
                             responses.push(json!({
                                 "channel": channel, "type": "FEED_CONFIG",
@@ -316,11 +299,17 @@ impl MockServer {
                             }));
                         }
                         "FEED_SETUP" => {
-                            // Remember exactly which fields the client asked for, in
-                            // order: that is the wire layout it will decode against.
+                            feed_setups_seen += 1;
+
+                            // The layout this server will actually serve. A real
+                            // one does not always agree with the request, so the
+                            // fixture has to be able to disagree too — and it
+                            // reports and serves the *same* list, which is the
+                            // property that makes these tests mean anything.
+                            let mut effective: Vec<(String, Vec<String>)> = Vec::new();
                             if let Some(fields) = value["acceptEventFields"].as_object() {
                                 for (event_type, list) in fields {
-                                    let order: Vec<String> = list
+                                    let mut order: Vec<String> = list
                                         .as_array()
                                         .map(|a| {
                                             a.iter()
@@ -328,16 +317,50 @@ impl MockServer {
                                                 .collect()
                                         })
                                         .unwrap_or_default();
-                                    event_fields.insert((channel, event_type.clone()), order);
+
+                                    let reorders = behaviour == Behaviour::ReorderedFeedConfig
+                                        || (behaviour
+                                            == Behaviour::ReorderedFeedConfigOnSecondSetup
+                                            && feed_setups_seen > 1);
+                                    if reorders && event_type == "Quote" && order.len() >= 2 {
+                                        // Guard on the length: a fixture panic would
+                                        // mask the behaviour under test.
+                                        order.swap(0, 1);
+                                    }
+                                    if behaviour == Behaviour::TrimsCandleVwap {
+                                        order.retain(|field| field != "VWAP");
+                                    }
+
+                                    effective.push((event_type.clone(), order));
                                 }
                             }
-                            responses.push(json!({
-                                "channel": channel,
-                                "type": "FEED_CONFIG",
-                                "aggregationPeriod": 0.1,
-                                "dataFormat": "COMPACT",
-                                "eventFields": value["acceptEventFields"].clone()
-                            }));
+
+                            for (event_type, order) in &effective {
+                                event_fields.insert((channel, event_type.clone()), order.clone());
+                            }
+
+                            let reported: serde_json::Map<String, Value> = effective
+                                .iter()
+                                .map(|(event_type, order)| (event_type.clone(), json!(order)))
+                                .collect();
+
+                            if behaviour == Behaviour::LateFeedConfig {
+                                // What the dxFeed demo does: acknowledge with no
+                                // field list at all, and report the real one only
+                                // once there is a subscription.
+                                responses.push(json!({
+                                    "channel": channel, "type": "FEED_CONFIG",
+                                    "aggregationPeriod": 0.1, "dataFormat": "COMPACT"
+                                }));
+                            } else {
+                                responses.push(json!({
+                                    "channel": channel,
+                                    "type": "FEED_CONFIG",
+                                    "aggregationPeriod": 0.1,
+                                    "dataFormat": "COMPACT",
+                                    "eventFields": reported
+                                }));
+                            }
                         }
                         "FEED_SUBSCRIPTION" => {
                             if let Some(add) = value.get("add").and_then(|a| a.as_array()) {
@@ -349,6 +372,16 @@ impl MockServer {
                                     else {
                                         continue;
                                     };
+                                    if behaviour == Behaviour::LateFeedConfig {
+                                        // The real layout, announced now rather
+                                        // than at setup, and immediately before
+                                        // the data that uses it.
+                                        responses.push(json!({
+                                            "channel": channel, "type": "FEED_CONFIG",
+                                            "aggregationPeriod": 0.1, "dataFormat": "COMPACT",
+                                            "eventFields": { event_type: order.clone() }
+                                        }));
+                                    }
                                     let row: Vec<Value> = order
                                         .iter()
                                         .map(|field| field_value(field, event_type, symbol))
