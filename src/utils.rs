@@ -957,13 +957,13 @@ mod summary_tests {
             json!("Summary"),            // 0 eventType
             json!(symbol),               // 1 eventSymbol
             json!(1_700_000_000_500i64), // 2 eventTime
-            json!(20240119i64),          // 3 dayId
+            json!(20100i64),             // 3 dayId
             json!(149.5),                // 4 dayOpenPrice
             json!(152.0),                // 5 dayHighPrice
             json!(148.0),                // 6 dayLowPrice
             json!(150.75),               // 7 dayClosePrice
             json!("Final"),              // 8 dayClosePriceType
-            json!(20240118i64),          // 9 prevDayId
+            json!(20099i64),             // 9 prevDayId
             json!(147.75),               // 10 prevDayClosePrice
             json!("Final"),              // 11 prevDayClosePriceType
             json!(58_000_000.0),         // 12 prevDayVolume
@@ -1001,13 +1001,13 @@ mod summary_tests {
                 assert_eq!(first.event_symbol, "AAPL");
                 assert_eq!(second.event_symbol, "MSFT");
                 assert_eq!(first.event_time, 1_700_000_000_500);
-                assert_eq!(first.day_id, 20240119);
+                assert_eq!(first.day_id, 20100);
                 assert_eq!(first.day_open_price, 149.5);
                 assert_eq!(first.day_high_price, 152.0);
                 assert_eq!(first.day_low_price, 148.0);
                 assert_eq!(first.day_close_price, 150.75);
                 assert_eq!(first.day_close_price_type, "Final");
-                assert_eq!(first.prev_day_id, 20240118);
+                assert_eq!(first.prev_day_id, 20099);
                 assert_eq!(first.prev_day_close_price, 147.75);
                 assert_eq!(first.prev_day_close_price_type, "Final");
                 assert_eq!(first.prev_day_volume, 58_000_000.0);
@@ -1293,7 +1293,7 @@ mod profile_tests {
             json!(6.13),                        // 14 earningsPerShare
             json!(4.0),                         // 15 dividendFrequency
             json!(0.24),                        // 16 exDividendAmount
-            json!(20240209i64),                 // 17 exDividendDayId
+            json!(20050i64),                    // 17 exDividendDayId
             json!(15_552_800_000.0),            // 18 shares
             json!(15_461_900_000.0),            // 19 freeFloat
         ]
@@ -1343,7 +1343,7 @@ mod profile_tests {
                 assert_eq!(first.earnings_per_share, 6.13);
                 assert_eq!(first.dividend_frequency, 4.0);
                 assert_eq!(first.ex_dividend_amount, 0.24);
-                assert_eq!(first.ex_dividend_day_id, 20240209);
+                assert_eq!(first.ex_dividend_day_id, 20050);
                 assert_eq!(first.shares, 15_552_800_000.0);
                 assert_eq!(first.free_float, 15_461_900_000.0);
             }

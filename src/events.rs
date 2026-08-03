@@ -626,7 +626,10 @@ pub struct SummaryEvent {
     #[serde(rename = "eventTime")]
     pub event_time: i64,
 
-    /// Identifier of the current trading day.
+    /// The current trading day, as **days since the Unix epoch**.
+    ///
+    /// Not `yyyymmdd`, which is the natural guess and the wrong one: a real
+    /// feed sends 20665 for 2026-07-31.
     #[serde(rename = "dayId")]
     pub day_id: i64,
 
@@ -650,7 +653,8 @@ pub struct SummaryEvent {
     #[serde(rename = "dayClosePriceType")]
     pub day_close_price_type: String,
 
-    /// Identifier of the previous trading day.
+    /// The previous trading day, as days since the Unix epoch. See
+    /// [`day_id`](Self::day_id).
     #[serde(rename = "prevDayId")]
     pub prev_day_id: i64,
 
@@ -747,7 +751,8 @@ pub struct ProfileEvent {
     #[serde(rename = "exDividendAmount", with = "json_double")]
     pub ex_dividend_amount: f64,
 
-    /// Day the last dividend went ex, as a day identifier.
+    /// Day the last dividend went ex, as **days since the Unix epoch** rather
+    /// than `yyyymmdd`.
     #[serde(rename = "exDividendDayId")]
     pub ex_dividend_day_id: i64,
 
@@ -1695,13 +1700,13 @@ mod event_serde_tests {
             event_type: "Summary".to_string(),
             event_symbol: "AAPL".to_string(),
             event_time: 1_700_000_000_500,
-            day_id: 20240119,
+            day_id: 20100,
             day_open_price: 149.5,
             day_high_price: 152.0,
             day_low_price: 148.0,
             day_close_price: 150.75,
             day_close_price_type: "Final".to_string(),
-            prev_day_id: 20240118,
+            prev_day_id: 20099,
             prev_day_close_price: 147.75,
             prev_day_close_price_type: "Final".to_string(),
             prev_day_volume: 58_000_000.0,
@@ -1755,7 +1760,7 @@ mod event_serde_tests {
             earnings_per_share: 6.13,
             dividend_frequency: 4.0,
             ex_dividend_amount: 0.24,
-            ex_dividend_day_id: 20240209,
+            ex_dividend_day_id: 20050,
             shares: 15_552_800_000.0,
             free_float: 15_461_900_000.0,
         }

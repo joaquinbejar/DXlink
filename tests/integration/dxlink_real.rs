@@ -26,11 +26,35 @@ use std::env;
 use std::time::Duration;
 use tokio::time::timeout;
 
-/// The demo endpoint that actually works.
+/// dxFeed's own public demo, which serves delayed data and needs no token.
 ///
-/// The older `wss://demo.dxfeed.com/dxlink-ws` answers HTTP 400 on upgrade, and
-/// that once got reported as a client bug.
-const DEMO_URL: &str = "wss://tasty-demo-dxlink-md-ws.dxfeed.com/delayed";
+/// Note the `/market-data/` in the path. The shorter
+/// `wss://demo.dxfeed.com/dxlink-ws` answers HTTP 400 on upgrade, and that once
+/// got reported as a client bug.
+const PUBLIC_DEMO_URL: &str = "wss://demo.dxfeed.com/market-data/dxlink-ws";
+
+/// Where to point, and whether a token is needed.
+///
+/// Defaults to the public demo so these run with no credentials at all. Set
+/// `DXLINK_WS_URL` to aim them somewhere else — tastytrade's delayed endpoint is
+/// `wss://tasty-demo-dxlink-md-ws.dxfeed.com/delayed` and does require a token,
+/// which comes from tastytrade's `/api-quote-tokens`.
+fn endpoint() -> (String, String) {
+    let url = env::var("DXLINK_WS_URL").unwrap_or_else(|_| PUBLIC_DEMO_URL.to_string());
+    let token = env::var("DXLINK_API_TOKEN").unwrap_or_default();
+
+    // Only the public demo is anonymous. Anywhere else, a missing token shows up
+    // as UNAUTHORIZED from the server, which reads like a client bug rather than
+    // a missing credential.
+    assert!(
+        url == PUBLIC_DEMO_URL || !token.trim().is_empty(),
+        "DXLINK_WS_URL is set to {url} but DXLINK_API_TOKEN is empty. Only \
+         {PUBLIC_DEMO_URL} accepts an anonymous session; anything else rejects \
+         it at AUTH."
+    );
+
+    (url, token)
+}
 
 /// Liquid enough that something is usually moving.
 const EQUITY: &str = "AAPL";
@@ -54,6 +78,24 @@ const DECODED: &[EventType] = &[
     EventType::Underlying,
     EventType::TheoPrice,
 ];
+
+/// Turns on tracing when `RUST_LOG` asks for it.
+///
+/// Worth having on a network smoke specifically: when one of these fails the
+/// first question is always whether the client sent the wrong thing or the
+/// server answered oddly, and only the protocol log settles it.
+fn trace_the_wire() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        if env::var("RUST_LOG").is_ok() {
+            // The outbound log redacts credentials before it prints, so this is
+            // safe to enable with a real token in the environment.
+            let _ = tracing_subscriber::fmt()
+                .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+                .try_init();
+        }
+    });
+}
 
 fn subscription(event_type: &str, symbol: &str) -> FeedSubscription {
     FeedSubscription {
@@ -96,14 +138,34 @@ fn plausible_size(value: f64, field: &str, symbol: &str) {
     assert!(value >= 0.0, "{symbol}: {field} is negative ({value})");
 }
 
-/// An epoch millisecond in the range a live feed can produce. Catches a price
-/// that drifted into a time column, which is the same bug from the other side.
+/// An epoch millisecond in the range a live feed can produce, or zero.
+///
+/// Catches a price that drifted into a time column, which is the same bug as
+/// the other way round. Zero is allowed because the server genuinely sends it
+/// for a timestamp it did not populate — a real `Summary` from the demo feed
+/// arrives with `eventTime: 0`.
 fn plausible_time(value: i64, field: &str, symbol: &str) {
+    if value == 0 {
+        return;
+    }
     // 2001-09-09 to 2100-01-01. Wide on purpose: this is a shape check, not a
     // clock check, and a delayed feed replays older stamps.
     assert!(
         (1_000_000_000_000..4_102_444_800_000).contains(&value),
         "{symbol}: {field} is {value}, which is not an epoch millisecond"
+    );
+}
+
+/// A day identifier: **days since the Unix epoch**, not `yyyymmdd`.
+///
+/// This assertion started life as a `yyyymmdd` range, which is the natural
+/// guess and wrong. The real feed says 20665 for 2026-07-31, and that is
+/// exactly the kind of thing only a real server tells you.
+fn plausible_day_id(value: i64, field: &str, symbol: &str) {
+    // 1997-05-19 to 2079-09-28. A yyyymmdd would be far outside this.
+    assert!(
+        (10_000..40_000).contains(&value),
+        "{symbol}: {field} is {value}, which is not a day count since the epoch"
     );
 }
 
@@ -194,12 +256,8 @@ fn validate(event: &MarketEvent) -> &'static str {
                 "{symbol}: dayClosePriceType is {:?}, which is not a price type",
                 summary.day_close_price_type
             );
-            // Day identifiers are yyyymmdd, not epochs.
-            assert!(
-                (19000101..=21001231).contains(&summary.day_id),
-                "{symbol}: dayId is {}, which is not a day identifier",
-                summary.day_id
-            );
+            plausible_day_id(summary.day_id, "dayId", symbol);
+            plausible_day_id(summary.prev_day_id, "prevDayId", symbol);
             "Summary"
         }
         MarketEvent::TimeAndSale(print) => {
@@ -261,19 +319,13 @@ fn validate(event: &MarketEvent) -> &'static str {
 
 /// Connects and configures the channel for every decodable type.
 async fn open_session() -> (DXLinkClient, tokio::sync::mpsc::Receiver<MarketEvent>, u32) {
-    // Checked rather than defaulted. The demo feed answers an empty token with
-    // UNAUTHORIZED, and letting that surface as a bare connect failure reads
-    // like a client bug instead of a missing credential. Never printed: it goes
-    // straight into the client.
-    let token = env::var("DXLINK_API_TOKEN").unwrap_or_default();
-    assert!(
-        !token.trim().is_empty(),
-        "DXLINK_API_TOKEN is not set. These tests talk to the real dxFeed demo \
-         server, which rejects an empty token, so there is nothing to smoke \
-         without one. Set it in the environment and run again."
-    );
+    trace_the_wire();
 
-    let mut client = DXLinkClient::new(DEMO_URL, &token);
+    // The token is never printed: it goes straight into the client.
+    let (url, token) = endpoint();
+    println!("--- connecting to {url}");
+
+    let mut client = DXLinkClient::new(&url, &token);
     let stream = client
         .connect()
         .await
@@ -447,8 +499,10 @@ async fn test_real_server_replays_historical_candles() {
 
     assert!(
         !bars.is_empty(),
-        "no historical bars arrived for {CANDLE}; either fromTime was not \
-         honoured or the symbol has no history on this feed"
+        "no historical bars arrived for {CANDLE}. Known cause, issue #63: this \
+         server negotiates a Candle layout without VWAP, the decoder is \
+         compiled against one with it, so the channel is invalidated and every \
+         bar is dropped. Run with RUST_LOG=dxlink=debug to see them arriving."
     );
     for bar in &bars {
         assert_eq!(
