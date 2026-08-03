@@ -1,6 +1,6 @@
 [package]
 name = "dxlink"
-version = "0.3.0"
+version = "0.3.1"
 edition = "2024"
 # Measured, not guessed: 1.87 rejects the let-chains this crate uses.
 # Raising this is a compatibility break for consumers and belongs in release notes.
