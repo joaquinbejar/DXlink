@@ -10,6 +10,7 @@ use crate::events::{
     TheoPriceEvent, TimeAndSaleEvent, TradeEvent, UnderlyingEvent,
 };
 use serde_json::Value;
+use std::collections::HashMap;
 use tracing::warn;
 
 /// Decodes COMPACT rows, dropping the whole batch if any of it is malformed.
@@ -47,7 +48,7 @@ use tracing::warn;
 /// }
 /// ```
 pub fn parse_compact_data(data: &[CompactData]) -> Vec<MarketEvent> {
-    let (events, error) = decode(data);
+    let (events, error) = decode(data, None);
     if let Some(error) = error {
         warn!("Dropping malformed COMPACT data: {error}");
     }
@@ -90,7 +91,7 @@ pub fn parse_compact_data(data: &[CompactData]) -> Vec<MarketEvent> {
 /// assert_eq!(events.len(), 1);
 /// ```
 pub fn try_parse_compact_data(data: &[CompactData]) -> DXLinkResult<Vec<MarketEvent>> {
-    match decode(data) {
+    match decode(data, None) {
         (events, None) => Ok(events),
         (_, Some(error)) => Err(error),
     }
@@ -104,81 +105,139 @@ fn as_json_double(value: &Value) -> Option<f64> {
     crate::events::json_double::from_value(value)
 }
 
-/// A column that must be text.
-fn as_text<'a>(
-    values: &'a [Value],
-    index: usize,
-    event_type: &str,
-    row: usize,
-    field: &str,
-) -> DXLinkResult<&'a str> {
-    values[index].as_str().ok_or_else(|| {
-        DXLinkError::Protocol(format!(
-            "{event_type} row {row}: field `{field}` should be a string, got {}",
-            values[index]
-        ))
-    })
-}
-
-/// A column that must be a whole number, such as an epoch millisecond time.
-fn as_int(
-    values: &[Value],
-    index: usize,
-    event_type: &str,
-    row: usize,
-    field: &str,
-) -> DXLinkResult<i64> {
-    values[index].as_i64().ok_or_else(|| {
-        DXLinkError::Protocol(format!(
-            "{event_type} row {row}: field `{field}` should be a whole number, got {}",
-            values[index]
-        ))
-    })
-}
-
-/// A column that must be a double.
-fn as_double(
-    values: &[Value],
-    index: usize,
-    event_type: &str,
-    row: usize,
-    field: &str,
-) -> DXLinkResult<f64> {
-    as_json_double(&values[index]).ok_or_else(|| {
-        DXLinkError::Protocol(format!(
-            "{event_type} row {row}: field `{field}` should be a number, got {}",
-            values[index]
-        ))
-    })
-}
-
-/// A column that must be a boolean.
+/// Decodes against the layout a channel actually negotiated.
 ///
-/// Strict on purpose: the protocol sends JSON `true`/`false` here, and treating
-/// `0`, `"false"` or `null` as false would turn a layout error into a plausible
-/// flag. A print wrongly marked `validTick` moves a last price that should not
-/// have moved.
-fn as_bool(
-    values: &[Value],
-    index: usize,
-    event_type: &str,
+/// The client uses this rather than [`try_parse_compact_data`], because the
+/// list the server agreed to is not always the list that was requested.
+pub(crate) fn try_parse_negotiated(
+    data: &[CompactData],
+    layout: &HashMap<String, Vec<String>>,
+) -> DXLinkResult<Vec<MarketEvent>> {
+    match decode(data, Some(layout)) {
+        (events, None) => Ok(events),
+        (_, Some(error)) => Err(error),
+    }
+}
+
+/// One COMPACT row, addressed by field name rather than by position.
+///
+/// **This is the fix for the layout the server actually negotiates.** The
+/// client asks for a field list, but a server may serve a *subset* of it: the
+/// dxFeed demo drops `VWAP` from `Candle`, for instance. Reading by position
+/// against the requested list then either shifts every value after the gap or,
+/// if the arithmetic happens not to divide, drops the batch entirely.
+///
+/// Reading by name makes both harmless. A field the server left out reads as
+/// "not provided" instead of as its neighbour, and a field it added or moved is
+/// simply looked up where it really is.
+struct Row<'a> {
+    values: &'a [Value],
+    /// Field name to column, built once per batch from the negotiated layout.
+    columns: &'a HashMap<&'a str, usize>,
+    event_type: &'a str,
     row: usize,
-    field: &str,
-) -> DXLinkResult<bool> {
-    values[index].as_bool().ok_or_else(|| {
-        DXLinkError::Protocol(format!(
-            "{event_type} row {row}: field `{field}` should be a boolean, got {}",
-            values[index]
-        ))
-    })
+}
+
+impl<'a> Row<'a> {
+    fn value(&self, field: &str) -> Option<&'a Value> {
+        self.columns.get(field).map(|index| &self.values[*index])
+    }
+
+    /// A column that must be text when present.
+    ///
+    /// Absent means the server does not serve it, which is an empty string
+    /// rather than an error: the alternative is refusing an event over a field
+    /// the consumer may not even read.
+    fn text(&self, field: &str) -> DXLinkResult<String> {
+        let Some(value) = self.value(field) else {
+            return Ok(String::new());
+        };
+        value.as_str().map(str::to_string).ok_or_else(|| {
+            DXLinkError::Protocol(format!(
+                "{} row {}: field `{field}` should be a string, got {value}",
+                self.event_type, self.row
+            ))
+        })
+    }
+
+    /// A column that has to be there for the event to mean anything.
+    fn required_text(&self, field: &str) -> DXLinkResult<String> {
+        let Some(value) = self.value(field) else {
+            return Err(DXLinkError::Protocol(format!(
+                "{} row {}: the negotiated layout has no `{field}` column, so the \
+                 row cannot be identified",
+                self.event_type, self.row
+            )));
+        };
+        value.as_str().map(str::to_string).ok_or_else(|| {
+            DXLinkError::Protocol(format!(
+                "{} row {}: field `{field}` should be a string, got {value}",
+                self.event_type, self.row
+            ))
+        })
+    }
+
+    /// A column that must be a whole number, such as an epoch millisecond.
+    ///
+    /// Absent reads as zero, which is what the server itself sends for a
+    /// timestamp it did not populate.
+    fn int(&self, field: &str) -> DXLinkResult<i64> {
+        let Some(value) = self.value(field) else {
+            return Ok(0);
+        };
+        value.as_i64().ok_or_else(|| {
+            DXLinkError::Protocol(format!(
+                "{} row {}: field `{field}` should be a whole number, got {value}",
+                self.event_type, self.row
+            ))
+        })
+    }
+
+    /// A column that must be a double.
+    ///
+    /// Absent reads as `NaN`, the same value the protocol uses for a number
+    /// that does not apply, so a consumer already has to handle it.
+    fn double(&self, field: &str) -> DXLinkResult<f64> {
+        let Some(value) = self.value(field) else {
+            return Ok(f64::NAN);
+        };
+        as_json_double(value).ok_or_else(|| {
+            DXLinkError::Protocol(format!(
+                "{} row {}: field `{field}` should be a number, got {value}",
+                self.event_type, self.row
+            ))
+        })
+    }
+
+    /// A column that must be a boolean.
+    ///
+    /// Strict when present: the protocol sends JSON `true`/`false` here, and
+    /// treating `0` or `"false"` as false would turn a layout error into a
+    /// plausible flag. Absent reads as `false`, which for `validTick` and the
+    /// rest is the conservative answer.
+    fn flag(&self, field: &str) -> DXLinkResult<bool> {
+        let Some(value) = self.value(field) else {
+            return Ok(false);
+        };
+        value.as_bool().ok_or_else(|| {
+            DXLinkError::Protocol(format!(
+                "{} row {}: field `{field}` should be a boolean, got {value}",
+                self.event_type, self.row
+            ))
+        })
+    }
 }
 
 /// Decodes what it can and reports the first problem it hit.
 ///
-/// The layout comes from [`EventType::compact_fields`], the same list
-/// `setup_feed` asked the server for, so the stride cannot drift away from the
-/// request the way three separate literals could.
-fn decode(data: &[CompactData]) -> (Vec<MarketEvent>, Option<DXLinkError>) {
+/// `layout` is the field list per event type that the channel **negotiated**,
+/// which is not always the one it requested. `None` falls back to
+/// [`EventType::compact_fields`], which is what the standalone
+/// [`parse_compact_data`] entry points use when no channel is in play.
+fn decode(
+    data: &[CompactData],
+    layout: Option<&HashMap<String, Vec<String>>>,
+) -> (Vec<MarketEvent>, Option<DXLinkError>) {
     let mut events = Vec::new();
     let mut index = 0;
 
@@ -213,7 +272,38 @@ fn decode(data: &[CompactData]) -> (Vec<MarketEvent>, Option<DXLinkError>) {
             );
         };
 
-        let Some(fields) = event_type.compact_fields() else {
+        // The negotiated list wins. When a channel supplied one, a type missing
+        // from it is refused rather than falling back to what this client
+        // asked for: the fallback is the positional read that caused #63, and
+        // guessing here would decode against a layout nobody agreed to.
+        let fields: Vec<&str> = match layout {
+            Some(layout) => match layout.get(header.as_str()) {
+                Some(fields) => fields.iter().map(String::as_str).collect(),
+                None => {
+                    return (
+                        events,
+                        Some(DXLinkError::Protocol(format!(
+                            "event type `{header}` is not in the layout this channel \
+                             negotiated, so there is nothing to read its rows against"
+                        ))),
+                    );
+                }
+            },
+            None => match event_type.compact_fields() {
+                Some(fields) => fields.to_vec(),
+                None => {
+                    return (
+                        events,
+                        Some(DXLinkError::Protocol(format!(
+                            "event type `{header}` has no decoder in this client, so its \
+                             rows cannot be read"
+                        ))),
+                    );
+                }
+            },
+        };
+
+        if event_type.compact_fields().is_none() {
             return (
                 events,
                 Some(DXLinkError::Protocol(format!(
@@ -221,9 +311,17 @@ fn decode(data: &[CompactData]) -> (Vec<MarketEvent>, Option<DXLinkError>) {
                      cannot be read"
                 ))),
             );
-        };
+        }
 
         let stride = fields.len();
+        if stride == 0 {
+            return (
+                events,
+                Some(DXLinkError::Protocol(format!(
+                    "{header}: the negotiated layout has no columns at all"
+                ))),
+            );
+        }
         if values.len() % stride != 0 {
             return (
                 events,
@@ -235,24 +333,40 @@ fn decode(data: &[CompactData]) -> (Vec<MarketEvent>, Option<DXLinkError>) {
             );
         }
 
+        // Built once per batch, not per row.
+        let mut columns: HashMap<&str, usize> = HashMap::with_capacity(stride);
+        for (column, field) in fields.iter().enumerate() {
+            // First wins. A duplicated name is the server's problem, and
+            // picking one deterministically beats failing the batch.
+            columns.entry(field).or_insert(column);
+        }
+
         for (row, chunk) in values.chunks_exact(stride).enumerate() {
+            let row = Row {
+                values: chunk,
+                columns: &columns,
+                event_type: header,
+                row,
+            };
+
             // The batch header and the row's own eventType must agree, or the
             // row belongs to a layout other than the one being applied.
-            let inner = match as_text(chunk, 0, header, row, fields[0]) {
+            let inner = match row.required_text("eventType") {
                 Ok(inner) => inner,
                 Err(e) => return (events, Some(e)),
             };
-            if inner != header {
+            if inner != *header {
                 return (
                     events,
                     Some(DXLinkError::Protocol(format!(
-                        "{header} row {row}: the row says it is a `{inner}`, so it is not \
-                         laid out the way this batch claims"
+                        "{header} row {}: the row says it is a `{inner}`, so it is not \
+                         laid out the way this batch claims",
+                        row.row
                     ))),
                 );
             }
 
-            match build_event(event_type, chunk, header, row, fields) {
+            match build_event(event_type, &row) {
                 Ok(event) => events.push(event),
                 Err(e) => return (events, Some(e)),
             }
@@ -262,183 +376,149 @@ fn decode(data: &[CompactData]) -> (Vec<MarketEvent>, Option<DXLinkError>) {
     (events, None)
 }
 
-/// Builds one event from a row whose length already matches the layout.
-fn build_event(
-    event_type: EventType,
-    row_values: &[Value],
-    header: &str,
-    row: usize,
-    fields: &[&str],
-) -> DXLinkResult<MarketEvent> {
-    let symbol = as_text(row_values, 1, header, row, fields[1])?.to_string();
-    let number = |index: usize| as_double(row_values, index, header, row, fields[index]);
+/// Builds one event from a row, reading every column by name.
+fn build_event(event_type: EventType, row: &Row<'_>) -> DXLinkResult<MarketEvent> {
+    let event_type_name = row.required_text("eventType")?;
+    let symbol = row.required_text("eventSymbol")?;
 
     Ok(match event_type {
         EventType::Quote => MarketEvent::Quote(QuoteEvent {
-            event_type: header.to_string(),
+            event_type: event_type_name,
             event_symbol: symbol,
-            bid_price: number(2)?,
-            ask_price: number(3)?,
-            bid_size: number(4)?,
-            ask_size: number(5)?,
+            bid_price: row.double("bidPrice")?,
+            ask_price: row.double("askPrice")?,
+            bid_size: row.double("bidSize")?,
+            ask_size: row.double("askSize")?,
         }),
         EventType::Trade => MarketEvent::Trade(TradeEvent {
-            event_type: header.to_string(),
+            event_type: event_type_name,
             event_symbol: symbol,
-            price: number(2)?,
-            size: number(3)?,
-            day_volume: number(4)?,
+            price: row.double("price")?,
+            size: row.double("size")?,
+            day_volume: row.double("dayVolume")?,
         }),
         EventType::Greeks => MarketEvent::Greeks(GreeksEvent {
-            event_type: header.to_string(),
+            event_type: event_type_name,
             event_symbol: symbol,
-            delta: number(2)?,
-            gamma: number(3)?,
-            theta: number(4)?,
-            vega: number(5)?,
-            rho: number(6)?,
-            volatility: number(7)?,
+            delta: row.double("delta")?,
+            gamma: row.double("gamma")?,
+            theta: row.double("theta")?,
+            vega: row.double("vega")?,
+            rho: row.double("rho")?,
+            volatility: row.double("volatility")?,
         }),
-        EventType::Candle => {
-            let int = |index: usize| as_int(row_values, index, header, row, fields[index]);
-            MarketEvent::Candle(CandleEvent {
-                event_type: header.to_string(),
-                event_symbol: symbol,
-                event_time: int(2)?,
-                event_flags: int(3)?,
-                index: int(4)?,
-                time: int(5)?,
-                sequence: int(6)?,
-                count: int(7)?,
-                open: number(8)?,
-                high: number(9)?,
-                low: number(10)?,
-                close: number(11)?,
-                volume: number(12)?,
-                vwap: number(13)?,
-                bid_volume: number(14)?,
-                ask_volume: number(15)?,
-                imp_volatility: number(16)?,
-                open_interest: number(17)?,
-            })
-        }
-        EventType::Summary => {
-            let int = |index: usize| as_int(row_values, index, header, row, fields[index]);
-            let text = |index: usize| {
-                as_text(row_values, index, header, row, fields[index]).map(str::to_string)
-            };
-            MarketEvent::Summary(SummaryEvent {
-                event_type: header.to_string(),
-                event_symbol: symbol,
-                event_time: int(2)?,
-                day_id: int(3)?,
-                day_open_price: number(4)?,
-                day_high_price: number(5)?,
-                day_low_price: number(6)?,
-                day_close_price: number(7)?,
-                day_close_price_type: text(8)?,
-                prev_day_id: int(9)?,
-                prev_day_close_price: number(10)?,
-                prev_day_close_price_type: text(11)?,
-                prev_day_volume: number(12)?,
-                open_interest: number(13)?,
-            })
-        }
-        EventType::TimeAndSale => {
-            let int = |index: usize| as_int(row_values, index, header, row, fields[index]);
-            let text = |index: usize| {
-                as_text(row_values, index, header, row, fields[index]).map(str::to_string)
-            };
-            let flag = |index: usize| as_bool(row_values, index, header, row, fields[index]);
-            MarketEvent::TimeAndSale(TimeAndSaleEvent {
-                event_type: header.to_string(),
-                event_symbol: symbol,
-                event_time: int(2)?,
-                event_flags: int(3)?,
-                index: int(4)?,
-                time: int(5)?,
-                time_nano_part: int(6)?,
-                sequence: int(7)?,
-                exchange_code: text(8)?,
-                price: number(9)?,
-                size: number(10)?,
-                bid_price: number(11)?,
-                ask_price: number(12)?,
-                exchange_sale_conditions: text(13)?,
-                trade_through_exempt: text(14)?,
-                aggressor_side: text(15)?,
-                spread_leg: flag(16)?,
-                extended_trading_hours: flag(17)?,
-                valid_tick: flag(18)?,
-                sale_type: text(19)?,
-                buyer: text(20)?,
-                seller: text(21)?,
-            })
-        }
-        EventType::Profile => {
-            let int = |index: usize| as_int(row_values, index, header, row, fields[index]);
-            let text = |index: usize| {
-                as_text(row_values, index, header, row, fields[index]).map(str::to_string)
-            };
-            MarketEvent::Profile(ProfileEvent {
-                event_type: header.to_string(),
-                event_symbol: symbol,
-                event_time: int(2)?,
-                description: text(3)?,
-                short_sale_restriction: text(4)?,
-                trading_status: text(5)?,
-                status_reason: text(6)?,
-                halt_start_time: int(7)?,
-                halt_end_time: int(8)?,
-                high_limit_price: number(9)?,
-                low_limit_price: number(10)?,
-                high_52_week_price: number(11)?,
-                low_52_week_price: number(12)?,
-                beta: number(13)?,
-                earnings_per_share: number(14)?,
-                dividend_frequency: number(15)?,
-                ex_dividend_amount: number(16)?,
-                ex_dividend_day_id: int(17)?,
-                shares: number(18)?,
-                free_float: number(19)?,
-            })
-        }
-        EventType::Underlying => {
-            let int = |index: usize| as_int(row_values, index, header, row, fields[index]);
-            MarketEvent::Underlying(UnderlyingEvent {
-                event_type: header.to_string(),
-                event_symbol: symbol,
-                event_time: int(2)?,
-                event_flags: int(3)?,
-                index: int(4)?,
-                time: int(5)?,
-                sequence: int(6)?,
-                volatility: number(7)?,
-                front_volatility: number(8)?,
-                back_volatility: number(9)?,
-                call_volume: number(10)?,
-                put_volume: number(11)?,
-                put_call_ratio: number(12)?,
-            })
-        }
-        EventType::TheoPrice => {
-            let int = |index: usize| as_int(row_values, index, header, row, fields[index]);
-            MarketEvent::TheoPrice(TheoPriceEvent {
-                event_type: header.to_string(),
-                event_symbol: symbol,
-                event_time: int(2)?,
-                event_flags: int(3)?,
-                index: int(4)?,
-                time: int(5)?,
-                sequence: int(6)?,
-                price: number(7)?,
-                underlying_price: number(8)?,
-                delta: number(9)?,
-                gamma: number(10)?,
-                dividend: number(11)?,
-                interest: number(12)?,
-            })
-        }
+        EventType::Candle => MarketEvent::Candle(CandleEvent {
+            event_type: event_type_name,
+            event_symbol: symbol,
+            event_time: row.int("eventTime")?,
+            event_flags: row.int("eventFlags")?,
+            index: row.int("index")?,
+            time: row.int("time")?,
+            sequence: row.int("sequence")?,
+            count: row.int("count")?,
+            open: row.double("open")?,
+            high: row.double("high")?,
+            low: row.double("low")?,
+            close: row.double("close")?,
+            volume: row.double("volume")?,
+            vwap: row.double("VWAP")?,
+            bid_volume: row.double("bidVolume")?,
+            ask_volume: row.double("askVolume")?,
+            imp_volatility: row.double("impVolatility")?,
+            open_interest: row.double("openInterest")?,
+        }),
+        EventType::Summary => MarketEvent::Summary(SummaryEvent {
+            event_type: event_type_name,
+            event_symbol: symbol,
+            event_time: row.int("eventTime")?,
+            day_id: row.int("dayId")?,
+            day_open_price: row.double("dayOpenPrice")?,
+            day_high_price: row.double("dayHighPrice")?,
+            day_low_price: row.double("dayLowPrice")?,
+            day_close_price: row.double("dayClosePrice")?,
+            day_close_price_type: row.text("dayClosePriceType")?,
+            prev_day_id: row.int("prevDayId")?,
+            prev_day_close_price: row.double("prevDayClosePrice")?,
+            prev_day_close_price_type: row.text("prevDayClosePriceType")?,
+            prev_day_volume: row.double("prevDayVolume")?,
+            open_interest: row.double("openInterest")?,
+        }),
+        EventType::TimeAndSale => MarketEvent::TimeAndSale(TimeAndSaleEvent {
+            event_type: event_type_name,
+            event_symbol: symbol,
+            event_time: row.int("eventTime")?,
+            event_flags: row.int("eventFlags")?,
+            index: row.int("index")?,
+            time: row.int("time")?,
+            time_nano_part: row.int("timeNanoPart")?,
+            sequence: row.int("sequence")?,
+            exchange_code: row.text("exchangeCode")?,
+            price: row.double("price")?,
+            size: row.double("size")?,
+            bid_price: row.double("bidPrice")?,
+            ask_price: row.double("askPrice")?,
+            exchange_sale_conditions: row.text("exchangeSaleConditions")?,
+            trade_through_exempt: row.text("tradeThroughExempt")?,
+            aggressor_side: row.text("aggressorSide")?,
+            spread_leg: row.flag("spreadLeg")?,
+            extended_trading_hours: row.flag("extendedTradingHours")?,
+            valid_tick: row.flag("validTick")?,
+            sale_type: row.text("type")?,
+            buyer: row.text("buyer")?,
+            seller: row.text("seller")?,
+        }),
+        EventType::Profile => MarketEvent::Profile(ProfileEvent {
+            event_type: event_type_name,
+            event_symbol: symbol,
+            event_time: row.int("eventTime")?,
+            description: row.text("description")?,
+            short_sale_restriction: row.text("shortSaleRestriction")?,
+            trading_status: row.text("tradingStatus")?,
+            status_reason: row.text("statusReason")?,
+            halt_start_time: row.int("haltStartTime")?,
+            halt_end_time: row.int("haltEndTime")?,
+            high_limit_price: row.double("highLimitPrice")?,
+            low_limit_price: row.double("lowLimitPrice")?,
+            high_52_week_price: row.double("high52WeekPrice")?,
+            low_52_week_price: row.double("low52WeekPrice")?,
+            beta: row.double("beta")?,
+            earnings_per_share: row.double("earningsPerShare")?,
+            dividend_frequency: row.double("dividendFrequency")?,
+            ex_dividend_amount: row.double("exDividendAmount")?,
+            ex_dividend_day_id: row.int("exDividendDayId")?,
+            shares: row.double("shares")?,
+            free_float: row.double("freeFloat")?,
+        }),
+        EventType::Underlying => MarketEvent::Underlying(UnderlyingEvent {
+            event_type: event_type_name,
+            event_symbol: symbol,
+            event_time: row.int("eventTime")?,
+            event_flags: row.int("eventFlags")?,
+            index: row.int("index")?,
+            time: row.int("time")?,
+            sequence: row.int("sequence")?,
+            volatility: row.double("volatility")?,
+            front_volatility: row.double("frontVolatility")?,
+            back_volatility: row.double("backVolatility")?,
+            call_volume: row.double("callVolume")?,
+            put_volume: row.double("putVolume")?,
+            put_call_ratio: row.double("putCallRatio")?,
+        }),
+        EventType::TheoPrice => MarketEvent::TheoPrice(TheoPriceEvent {
+            event_type: event_type_name,
+            event_symbol: symbol,
+            event_time: row.int("eventTime")?,
+            event_flags: row.int("eventFlags")?,
+            index: row.int("index")?,
+            time: row.int("time")?,
+            sequence: row.int("sequence")?,
+            price: row.double("price")?,
+            underlying_price: row.double("underlyingPrice")?,
+            delta: row.double("delta")?,
+            gamma: row.double("gamma")?,
+            dividend: row.double("dividend")?,
+            interest: row.double("interest")?,
+        }),
         // compact_fields returned Some for this type, so a missing arm here is a
         // bug in this match rather than a protocol problem.
         other => {
