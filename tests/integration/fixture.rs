@@ -77,6 +77,11 @@ pub enum Behaviour {
     /// Acknowledge FEED_SETUP with no field list, then report the real layout
     /// only once a subscription exists. Also what the dxFeed demo does.
     LateFeedConfig,
+    /// Honour FEED_SETUP, then announce a mid-session layout with no
+    /// `eventSymbol` — one this client cannot identify rows with — while
+    /// keeping the column count the same, so a client that ignored it would
+    /// decode the rows into the wrong fields instead of erroring.
+    UnusableConfigMidSession,
     /// Serve one full session, hang up once the feed is subscribed, then serve
     /// every later connection normally. Drives a reconnect that succeeds.
     DropFirstSession,
@@ -372,6 +377,26 @@ impl MockServer {
                                     else {
                                         continue;
                                     };
+                                    if behaviour == Behaviour::UnusableConfigMidSession {
+                                        // Same width, no eventSymbol: the shape
+                                        // that decodes silently if it is not
+                                        // refused.
+                                        let unusable: Vec<String> = order
+                                            .iter()
+                                            .map(|field| {
+                                                if field == "eventSymbol" {
+                                                    "someFieldWeDoNotKnow".to_string()
+                                                } else {
+                                                    field.clone()
+                                                }
+                                            })
+                                            .collect();
+                                        responses.push(json!({
+                                            "channel": channel, "type": "FEED_CONFIG",
+                                            "aggregationPeriod": 0.1, "dataFormat": "COMPACT",
+                                            "eventFields": { event_type: unusable }
+                                        }));
+                                    }
                                     if behaviour == Behaviour::LateFeedConfig {
                                         // The real layout, announced now rather
                                         // than at setup, and immediately before

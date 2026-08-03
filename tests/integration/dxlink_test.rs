@@ -1054,3 +1054,53 @@ async fn test_a_late_config_is_adopted_rather_than_fatal() {
 
     client.disconnect().await.expect("failed to disconnect");
 }
+
+/// A mid-session layout this client cannot read has to **stop** the channel,
+/// not be quietly ignored.
+///
+/// Ignoring it leaves the old layout installed while the server sends rows in
+/// the new one. When the two happen to have the same column count — which is
+/// exactly the case constructed here — that decodes into wrong values instead
+/// of into an error, which is the failure mode this whole area exists to
+/// prevent.
+#[tokio::test]
+async fn test_an_unreadable_reconfiguration_stops_the_channel() {
+    let server = MockServer::start(Behaviour::UnusableConfigMidSession).await;
+    let mut client = DXLinkClient::new(&server.url(), "test-token");
+    let mut stream = client.connect().await.expect("failed to connect");
+    let channel_id = client
+        .create_feed_channel("AUTO")
+        .await
+        .expect("failed to create feed channel");
+
+    client
+        .setup_feed(channel_id, &[EventType::Quote])
+        .await
+        .expect("the setup itself is fine");
+
+    client
+        .subscribe(channel_id, vec![quote_subscription("AAPL")])
+        .await
+        .expect("failed to subscribe");
+
+    // Nothing may be delivered.
+    let delivered = tokio::time::timeout(Duration::from_secs(2), stream.recv()).await;
+    assert!(
+        delivered.is_err(),
+        "a layout this client cannot read must stop delivery, got {delivered:?}"
+    );
+
+    // And the channel is stopped, not merely producing an error per batch. This
+    // is the part that distinguishes failing closed from ignoring the config:
+    // with the layout gone, the refusal comes before anything is sent rather
+    // than after every row that arrives.
+    assert!(
+        client
+            .subscribe(channel_id, vec![quote_subscription("MSFT")])
+            .await
+            .is_err(),
+        "a channel whose layout the server moved past must stop accepting work"
+    );
+
+    client.disconnect().await.expect("failed to disconnect");
+}

@@ -1373,6 +1373,29 @@ fn adopt_config(schemas: &ChannelSchemas, channel_id: u32, config: &FeedConfigMe
         return;
     };
 
+    // Checked before anything is written. An unusable layout has to fail
+    // closed: ignoring it would leave the old one installed while the server
+    // sends rows in the new one, and if the two happen to have the same column
+    // count that decodes into wrong values rather than into an error.
+    for (event_type, fields) in negotiated {
+        let is_known = recover(schemas)
+            .get(&channel_id)
+            .is_some_and(|stored| stored.contains_key(event_type));
+        if !is_known {
+            continue;
+        }
+        if let Err(e) = check_identifiable(event_type, channel_id, fields)
+            && recover(schemas).remove(&channel_id).is_some()
+        {
+            error!(
+                "Channel {channel_id} was moved to a {event_type} layout this client \
+                 cannot read ({e}); its data will be dropped rather than decoded against \
+                 a layout the server has moved away from"
+            );
+            return;
+        }
+    }
+
     let mut schemas = recover(schemas);
     let Some(stored) = schemas.get_mut(&channel_id) else {
         return;
@@ -1383,10 +1406,6 @@ fn adopt_config(schemas: &ChannelSchemas, channel_id: u32, config: &FeedConfigMe
             continue;
         };
         if known == fields {
-            continue;
-        }
-        if let Err(e) = check_identifiable(event_type, channel_id, fields) {
-            debug!("Ignoring an unusable {event_type} layout on channel {channel_id}: {e}");
             continue;
         }
         info!(

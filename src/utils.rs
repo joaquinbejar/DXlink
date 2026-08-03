@@ -272,10 +272,23 @@ fn decode(
             );
         };
 
-        // The negotiated list wins; the requested one is the fallback.
-        let negotiated = layout.and_then(|layout| layout.get(header.as_str()));
-        let fields: Vec<&str> = match negotiated {
-            Some(fields) => fields.iter().map(String::as_str).collect(),
+        // The negotiated list wins. When a channel supplied one, a type missing
+        // from it is refused rather than falling back to what this client
+        // asked for: the fallback is the positional read that caused #63, and
+        // guessing here would decode against a layout nobody agreed to.
+        let fields: Vec<&str> = match layout {
+            Some(layout) => match layout.get(header.as_str()) {
+                Some(fields) => fields.iter().map(String::as_str).collect(),
+                None => {
+                    return (
+                        events,
+                        Some(DXLinkError::Protocol(format!(
+                            "event type `{header}` is not in the layout this channel \
+                             negotiated, so there is nothing to read its rows against"
+                        ))),
+                    );
+                }
+            },
             None => match event_type.compact_fields() {
                 Some(fields) => fields.to_vec(),
                 None => {
