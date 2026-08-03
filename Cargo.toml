@@ -35,7 +35,7 @@ tracing = "0.1"
 [dev-dependencies]
 # test-util drives virtual time so the keepalive test does not spend 20 real seconds.
 tokio = { version = "1.53", features = ["full", "test-util"] }
-tracing-subscriber = { version = "0.3", features = ["fmt"] }
+tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
 
 [[test]]
 name = "tests"

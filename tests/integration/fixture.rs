@@ -525,10 +525,10 @@ fn field_value(field: &str, event_type: &str, symbol: &str) -> Value {
         "dayHighPrice" => json!(152.0),
         "dayLowPrice" => json!(148.0),
         "prevDayClosePrice" => json!(147.75),
-        "dayId" => json!(20240119i64),
+        "dayId" => json!(20100i64),
         "dayClosePrice" => json!(150.75),
         "dayClosePriceType" => json!("Final"),
-        "prevDayId" => json!(20240118i64),
+        "prevDayId" => json!(20099i64),
         "prevDayClosePriceType" => json!("Final"),
         "prevDayVolume" => json!(58_000_000.0),
         "openInterest" => json!(4_200.0),
@@ -560,7 +560,7 @@ fn field_value(field: &str, event_type: &str, symbol: &str) -> Value {
         "earningsPerShare" => json!(6.13),
         "dividendFrequency" => json!(4.0),
         "exDividendAmount" => json!(0.24),
-        "exDividendDayId" => json!(20240209i64),
+        "exDividendDayId" => json!(20050i64),
         "shares" => json!(15_552_800_000.0),
         "freeFloat" => json!(15_461_900_000.0),
         // Underlying (volatility is shared with Greeks)
@@ -621,13 +621,13 @@ pub mod expected {
     pub const ASK_VOLUME: f64 = 634_000.0;
     pub const IMP_VOLATILITY: f64 = 0.31;
     pub const OPEN_INTEREST: f64 = 4_200.0;
-    pub const DAY_ID: i64 = 20240119;
+    pub const DAY_ID: i64 = 20100;
     pub const DAY_OPEN_PRICE: f64 = 149.5;
     pub const DAY_HIGH_PRICE: f64 = 152.0;
     pub const DAY_LOW_PRICE: f64 = 148.0;
     pub const DAY_CLOSE_PRICE: f64 = 150.75;
     pub const DAY_CLOSE_PRICE_TYPE: &str = "Final";
-    pub const PREV_DAY_ID: i64 = 20240118;
+    pub const PREV_DAY_ID: i64 = 20099;
     pub const PREV_DAY_CLOSE_PRICE: f64 = 147.75;
     pub const PREV_DAY_CLOSE_PRICE_TYPE: &str = "Final";
     pub const PREV_DAY_VOLUME: f64 = 58_000_000.0;
@@ -656,7 +656,7 @@ pub mod expected {
     pub const EARNINGS_PER_SHARE: f64 = 6.13;
     pub const DIVIDEND_FREQUENCY: f64 = 4.0;
     pub const EX_DIVIDEND_AMOUNT: f64 = 0.24;
-    pub const EX_DIVIDEND_DAY_ID: i64 = 20240209;
+    pub const EX_DIVIDEND_DAY_ID: i64 = 20050;
     pub const SHARES: f64 = 15_552_800_000.0;
     pub const FREE_FLOAT: f64 = 15_461_900_000.0;
     pub const FRONT_VOLATILITY: f64 = 0.28;
