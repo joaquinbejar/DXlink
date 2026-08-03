@@ -636,6 +636,10 @@ fn field_value(field: &str, event_type: &str, symbol: &str) -> Value {
         "change" => json!(-1.25),
         "dayTurnover" => json!(3_417_052_245.055_67),
         "tickDirection" => json!("UP"),
+        // Series (volatility, callVolume, putVolume and putCallRatio are shared
+        // with Underlying; dividend and interest with TheoPrice)
+        "expiration" => json!(21533i64),
+        "forwardPrice" => json!(335.174_395_879_884),
         // Greeks
         "delta" => json!(0.65),
         "gamma" => json!(0.05),
@@ -733,6 +737,8 @@ pub mod expected {
     pub const CHANGE: f64 = -1.25;
     pub const DAY_TURNOVER: f64 = 3_417_052_245.055_67;
     pub const TICK_DIRECTION: &str = "UP";
+    pub const EXPIRATION: i64 = 21533;
+    pub const FORWARD_PRICE: f64 = 335.174_395_879_884;
 }
 
 /// Convenience predicates for `wait_for`.

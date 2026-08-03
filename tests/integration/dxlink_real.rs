@@ -78,6 +78,7 @@ const DECODED: &[EventType] = &[
     EventType::Underlying,
     EventType::TheoPrice,
     EventType::TradeETH,
+    EventType::Series,
 ];
 
 /// Turns on tracing when `RUST_LOG` asks for it.
@@ -305,6 +306,35 @@ fn validate(event: &MarketEvent) -> &'static str {
             plausible_size(surface.put_volume, "putVolume", symbol);
             "Underlying"
         }
+        MarketEvent::Series(series) => {
+            let symbol = &series.event_symbol;
+            plausible_time(series.time, "time", symbol);
+            // A snapshot ends with a marker row rather than an expiration: the
+            // real feed sends eventFlags 10 with index, expiration and every
+            // value zeroed or NaN. Requiring a day id unconditionally fails on
+            // it, so the assertion is that a zero expiration only ever comes
+            // with flags set — which still catches a genuinely shifted column.
+            if series.expiration == 0 {
+                assert_ne!(
+                    series.event_flags, 0,
+                    "{symbol}: expiration 0 on a row with no flags is a shifted column, \
+                     not a snapshot marker"
+                );
+            } else {
+                plausible_day_id(series.expiration, "expiration", symbol);
+            }
+            assert!(
+                series.volatility.is_nan() || (0.0..10.0).contains(&series.volatility),
+                "{symbol}: volatility is {}, which is not a volatility",
+                series.volatility
+            );
+            plausible_size(series.call_volume, "callVolume", symbol);
+            plausible_size(series.put_volume, "putVolume", symbol);
+            if series.event_flags == 0 {
+                plausible_price(series.forward_price, "forwardPrice", symbol);
+            }
+            "Series"
+        }
         MarketEvent::TradeETH(print) => {
             let symbol = &print.event_symbol;
             plausible_time(print.time, "time", symbol);
@@ -419,6 +449,7 @@ async fn test_real_server_delivers_well_formed_events() {
         "TimeAndSale",
         "Underlying",
         "TradeETH",
+        "Series",
     ] {
         subscriptions.push(subscription(event_type, EQUITY));
     }

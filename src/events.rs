@@ -259,6 +259,23 @@ impl EventType {
                 "shares",
                 "freeFloat",
             ]),
+            EventType::Series => Some(&[
+                "eventType",
+                "eventSymbol",
+                "eventTime",
+                "eventFlags",
+                "index",
+                "time",
+                "sequence",
+                "expiration",
+                "volatility",
+                "callVolume",
+                "putVolume",
+                "putCallRatio",
+                "forwardPrice",
+                "dividend",
+                "interest",
+            ]),
             EventType::TradeETH => Some(&[
                 "eventType",
                 "eventSymbol",
@@ -343,7 +360,6 @@ impl EventType {
             // Declared by the protocol, not decoded here.
             EventType::Order
             | EventType::SpreadOrder
-            | EventType::Series
             | EventType::Configuration
             | EventType::Message => None,
         }
@@ -881,6 +897,92 @@ pub struct TimeAndSaleEvent {
     pub seller: String,
 }
 
+/// One option expiration's computed values for an underlying.
+///
+/// The streaming counterpart to polling a REST option chain: a subscription
+/// replays one of these per expiration as a snapshot, delimited by
+/// `event_flags`, and updates them as the surface moves.
+///
+/// Every field the dxFeed AsyncAPI schema defines for it, confirmed against the
+/// `FEED_CONFIG` the server returns and against a captured row, rather than
+/// extrapolated from [`UnderlyingEvent`] or [`TheoPriceEvent`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SeriesEvent {
+    /// The type of the event, `Series`.
+    #[serde(rename = "eventType")]
+    pub event_type: String,
+
+    /// The underlying the expiration belongs to.
+    #[serde(rename = "eventSymbol")]
+    pub event_symbol: String,
+
+    /// When the server emitted the event, as epoch milliseconds.
+    ///
+    /// A live feed sends `0` here when it did not populate it.
+    #[serde(rename = "eventTime")]
+    pub event_time: i64,
+
+    /// Transactional and snapshot bits.
+    ///
+    /// A subscription replays every expiration as one snapshot, and these
+    /// delimit it. **The last row of that snapshot is a marker, not an
+    /// expiration**: a real feed ends a 24-row AAPL chain with `event_flags`
+    /// 10 and `index`, `expiration`, `volatility` and `forward_price` all
+    /// zeroed or `NaN`. A consumer that reads it as data gets a phantom
+    /// expiration 0. The first row carries 4.
+    ///
+    /// **Non-zero flags do not mean "marker"** — that first row has them and is
+    /// real data, so filtering on them drops an expiration. What identifies the
+    /// marker is [`expiration`](Self::expiration) being zero, which only ever
+    /// happens with flags set. The spec does not document what the individual
+    /// bits mean, so this describes what a real feed was observed to send.
+    #[serde(rename = "eventFlags")]
+    pub event_flags: i64,
+
+    /// Unique index of the record, ordering it within the stream.
+    pub index: i64,
+
+    /// When the values were computed, as epoch milliseconds.
+    pub time: i64,
+
+    /// Sequence number, separating records that share a millisecond.
+    pub sequence: i64,
+
+    /// The expiration this record is for, as **days since the Unix epoch**
+    /// rather than `yyyymmdd`. A real feed sends 21533 for 2028-12-15.
+    ///
+    /// Zero on the snapshot marker row — see [`event_flags`](Self::event_flags).
+    pub expiration: i64,
+
+    /// Implied volatility for this expiration, as a fraction.
+    #[serde(with = "json_double")]
+    pub volatility: f64,
+
+    /// Call option volume for the day, at this expiration.
+    #[serde(rename = "callVolume", with = "json_double")]
+    pub call_volume: f64,
+
+    /// Put option volume for the day, at this expiration.
+    #[serde(rename = "putVolume", with = "json_double")]
+    pub put_volume: f64,
+
+    /// Put volume over call volume.
+    #[serde(rename = "putCallRatio", with = "json_double")]
+    pub put_call_ratio: f64,
+
+    /// Implied forward price of the underlying at this expiration.
+    #[serde(rename = "forwardPrice", with = "json_double")]
+    pub forward_price: f64,
+
+    /// Dividend rate used as an input.
+    #[serde(with = "json_double")]
+    pub dividend: f64,
+
+    /// Interest rate used as an input.
+    #[serde(with = "json_double")]
+    pub interest: f64,
+}
+
 /// One extended-hours print: the last trade of the pre- or post-market session.
 ///
 /// The counterpart to [`TradeEvent`], and not a curiosity on a US feed: between
@@ -1163,6 +1265,13 @@ pub enum MarketEvent {
     Profile(ProfileEvent),
     /// The option surface over an underlying: implied volatility and volumes.
     Underlying(UnderlyingEvent),
+    /// One option expiration's computed values for an underlying.
+    ///
+    /// Appended, which is the ordinary case: no existing variant's fields are
+    /// a subset of this one, so nothing already in the list can claim a
+    /// `Series` payload. `UnderlyingEvent` comes closest and still needs
+    /// `frontVolatility`, which is not here.
+    Series(SeriesEvent),
     /// A theoretical option price with the inputs it was computed from.
     ///
     /// `MarketEvent` is `#[serde(untagged)]`, so serde tries the variants in
@@ -1938,6 +2047,32 @@ mod event_serde_tests {
         }
     }
 
+    /// Values from a real row the demo server sent for AAPL.
+    fn series() -> SeriesEvent {
+        SeriesEvent {
+            event_type: "Series".to_string(),
+            event_symbol: "AAPL".to_string(),
+            event_time: 0,
+            event_flags: 4,
+            index: 23,
+            time: 1_785_542_361_974,
+            sequence: 0,
+            expiration: 21533,
+            volatility: 0.3188,
+            call_volume: 8526.0,
+            put_volume: 1899.0,
+            put_call_ratio: 0.222_730_471_498_944_4,
+            forward_price: 335.174_395_879_884,
+            dividend: 0.0,
+            interest: 0.0,
+        }
+    }
+
+    #[test]
+    fn test_series_serde_names_match_its_layout() {
+        assert_wire_contract(&series(), EventType::Series);
+    }
+
     #[test]
     fn test_trade_eth_serde_names_match_its_layout() {
         assert_wire_contract(&trade_eth(), EventType::TradeETH);
@@ -2012,6 +2147,7 @@ mod event_serde_tests {
             MarketEvent::Underlying(underlying()),
             MarketEvent::TheoPrice(theo_price()),
             MarketEvent::TradeETH(trade_eth()),
+            MarketEvent::Series(series()),
         ] {
             let serialized = to_string(&event).expect("serialize");
             let back: MarketEvent = from_str(&serialized).expect("round trip");
