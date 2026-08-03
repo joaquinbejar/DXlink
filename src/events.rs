@@ -69,8 +69,9 @@ impl fmt::Display for EventType {
 /// **This conversion loses information and should not be used on a protocol
 /// path.** A typo such as `"Qutoe"` becomes `Quote`, so the client records a
 /// subscription it never made while sending the misspelling to the server.
-/// Use [`EventType::from_str`] or [`EventType::from_wire_name`] instead, both
-/// of which say they do not know the name.
+/// Use [`str::parse`] (via the [`FromStr`](std::str::FromStr) impl) or
+/// [`EventType::from_wire_name`] instead, both of which say they do not know
+/// the name.
 ///
 /// It is kept for source compatibility and is scheduled for removal in the
 /// next minor release of the 0.x line; nothing inside this crate uses it.
@@ -188,7 +189,7 @@ impl EventType {
     /// apart.
     ///
     /// `None` means this client has no decoder for the type: it can be named,
-    /// but no row can be turned into a [`MarketEvent`](crate::MarketEvent).
+    /// but no row can be turned into a [`MarketEvent`].
     pub fn compact_fields(&self) -> Option<&'static [&'static str]> {
         match self {
             EventType::Quote => Some(&[

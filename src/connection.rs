@@ -445,13 +445,18 @@ mod frame_tests {
     /// Starts a server that reports every text message it receives and forwards
     /// anything pushed into the returned sender back to the client.
     ///
-    /// Returns `(url, received, to_client)`.
-    #[allow(clippy::type_complexity)]
-    async fn serve_recording() -> (
-        String,
-        tokio::sync::mpsc::Receiver<String>,
-        tokio::sync::mpsc::Sender<String>,
-    ) {
+    /// A running recording server: where to reach it, what it heard, and a way
+    /// to push text back.
+    ///
+    /// Named rather than a bare triple, so a caller cannot silently swap the
+    /// two channels — they are both `String` channels pointing opposite ways.
+    struct Recording {
+        url: String,
+        received: tokio::sync::mpsc::Receiver<String>,
+        to_client: tokio::sync::mpsc::Sender<String>,
+    }
+
+    async fn serve_recording() -> Recording {
         let listener = TcpListener::bind(("127.0.0.1", 0))
             .await
             .expect("failed to bind test server");
@@ -482,7 +487,11 @@ mod frame_tests {
             }
         });
 
-        (format!("ws://{}", addr), received_rx, outbound_tx)
+        Recording {
+            url: format!("ws://{}", addr),
+            received: received_rx,
+            to_client: outbound_tx,
+        }
     }
 
     /// Waits for the next message the server recorded, or fails the test.
@@ -495,7 +504,11 @@ mod frame_tests {
 
     #[tokio::test]
     async fn test_send_and_receive_round_trip() {
-        let (url, mut received, to_client) = serve_recording().await;
+        let Recording {
+            url,
+            mut received,
+            to_client,
+        } = serve_recording().await;
 
         let connection = WebSocketConnection::connect(&url)
             .await
@@ -537,7 +550,11 @@ mod frame_tests {
 
     #[tokio::test]
     async fn test_clone_shares_the_underlying_stream() {
-        let (url, _received, to_client) = serve_recording().await;
+        let Recording {
+            url,
+            received: _received,
+            to_client,
+        } = serve_recording().await;
 
         let connection = WebSocketConnection::connect(&url)
             .await
@@ -564,7 +581,11 @@ mod frame_tests {
 
     #[tokio::test]
     async fn test_keepalive_sender_targets_the_requested_channel() {
-        let (url, mut received, _to_client) = serve_recording().await;
+        let Recording {
+            url,
+            mut received,
+            to_client: _to_client,
+        } = serve_recording().await;
 
         let connection = WebSocketConnection::connect(&url)
             .await

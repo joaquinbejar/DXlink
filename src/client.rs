@@ -116,8 +116,10 @@ enum ResponseType {
     /// so the caller can pick the right `DXLinkError` from the code instead of
     /// having to parse it back out of a sentence.
     Error(String, String),
-    /// A generic response type for other cases. The `String` value contains the response data.  This variant is currently unused (`#[allow(dead_code)]`).
-    #[allow(dead_code)]
+    /// Any other message that satisfied a waiter, carried through verbatim.
+    ///
+    /// The router builds this for a reply whose type nobody models yet, so the
+    /// caller sees the raw text rather than a timeout.
     Other(String),
 }
 
@@ -314,13 +316,12 @@ fn spawn_reader(setup: ReaderSetup) -> JoinHandle<()> {
     } = setup;
 
     tokio::spawn(async move {
-        // Set only where the session is actually over, which is not every error
-        // the loop can see: a malformed frame is not a dead socket.
-        #[allow(unused_assignments)]
-        let mut terminal_reason: Option<String> = None;
         let mut dropped_events: u64 = 0;
 
-        loop {
+        // The loop yields the reason it ended for, so there is no initial value
+        // to be overwritten unread. Only the paths where the session is
+        // actually over produce one: a malformed frame is not a dead socket.
+        let terminal_reason: Option<String> = loop {
             let received = match connection.receive_with_timeout(receive_deadline).await {
                 Ok(Some(msg)) => Ok(msg),
                 Ok(None) => {
@@ -336,8 +337,7 @@ fn spawn_reader(setup: ReaderSetup) -> JoinHandle<()> {
                     ));
                     error!("{}", reason);
                     record_reason(&disconnect_reason, &reason);
-                    terminal_reason = Some(reason.to_string());
-                    break;
+                    break Some(reason.to_string());
                 }
                 Err(e) => Err(e),
             };
@@ -550,8 +550,7 @@ fn spawn_reader(setup: ReaderSetup) -> JoinHandle<()> {
                 Err(e) if e.is_terminal() => {
                     error!("Connection lost, stopping message processing: {}", e);
                     record_reason(&disconnect_reason, &e);
-                    terminal_reason = Some(e.to_string());
-                    break;
+                    break Some(e.to_string());
                 }
                 Err(e) => {
                     error!("Error receiving message: {}", e);
@@ -559,7 +558,7 @@ fn spawn_reader(setup: ReaderSetup) -> JoinHandle<()> {
                     tokio::time::sleep(Duration::from_millis(100)).await;
                 }
             }
-        }
+        };
 
         // This task only ever exits because the session is dead, so the
         // socket is gone: stop writing to it as well.
@@ -576,6 +575,18 @@ fn spawn_reader(setup: ReaderSetup) -> JoinHandle<()> {
     })
 }
 
+/// What a request needs to reach the wire and be matched to its answer.
+///
+/// Grouped rather than passed loose: three `Arc`-ish handles in a row is how a
+/// swapped pair becomes a silent routing bug instead of a type error, and it
+/// keeps [`request_response`] inside a readable argument count.
+#[derive(Clone, Copy)]
+struct Responder<'a> {
+    connection: &'a WebSocketConnection,
+    requests: &'a Arc<Mutex<Vec<ResponseRequest>>>,
+    next_id: &'a Arc<Mutex<u64>>,
+}
+
 /// Sends `message` and waits for `expected_type` on `channel`, cleaning the
 /// registration up on every exit path.
 ///
@@ -586,17 +597,20 @@ fn spawn_reader(setup: ReaderSetup) -> JoinHandle<()> {
 ///
 /// Free-standing so a reconnect can rebuild a session — reopen channels,
 /// reconfigure feeds, replay subscriptions — without a `&self` it does not have.
-#[allow(clippy::too_many_arguments)]
 async fn request_response<T: serde::Serialize>(
-    connection: &WebSocketConnection,
-    response_requests: &Arc<Mutex<Vec<ResponseRequest>>>,
-    next_request_id: &Arc<Mutex<u64>>,
+    responder: Responder<'_>,
     message: &T,
     operation: &str,
     expected_type: &str,
     channel: u32,
     wait: Duration,
 ) -> DXLinkResult<ResponseType> {
+    let Responder {
+        connection,
+        requests: response_requests,
+        next_id: next_request_id,
+    } = responder;
+
     let (tx, rx) = oneshot::channel();
 
     let id = {
@@ -894,9 +908,11 @@ async fn replay_session(ctx: &ReconnectContext) -> DXLinkResult<()> {
         };
 
         match request_response(
-            &connection,
-            &ctx.response_requests,
-            &ctx.next_request_id,
+            Responder {
+                connection: &connection,
+                requests: &ctx.response_requests,
+                next_id: &ctx.next_request_id,
+            },
             &channel_request,
             "reconnect: reopen channel",
             "CHANNEL_OPENED",
@@ -951,9 +967,11 @@ async fn replay_session(ctx: &ReconnectContext) -> DXLinkResult<()> {
         recover(&ctx.channel_schemas).remove(&channel_id);
 
         match request_response(
-            &connection,
-            &ctx.response_requests,
-            &ctx.next_request_id,
+            Responder {
+                connection: &connection,
+                requests: &ctx.response_requests,
+                next_id: &ctx.next_request_id,
+            },
             &feed_setup,
             "reconnect: reconfigure feed",
             "FEED_CONFIG",
@@ -1105,6 +1123,24 @@ fn worth_retrying(error: &DXLinkError) -> bool {
         | DXLinkError::Serialization(_)
         | DXLinkError::UnexpectedMessage(_)
         | DXLinkError::Unknown(_) => false,
+    }
+}
+
+/// Turns a reply that arrived where another was expected into an error that
+/// says what arrived.
+///
+/// The bare "Unexpected response type" this replaces gave a caller nothing to
+/// act on, and left [`ResponseType::Other`]'s payload unread — a message the
+/// router had gone to the trouble of carrying through.
+fn unexpected_response(response: ResponseType) -> DXLinkError {
+    match response {
+        ResponseType::Other(raw) => DXLinkError::UnexpectedMessage(format!(
+            "the server answered with a message this client does not model: {}",
+            sanitize_server_text(&raw)
+        )),
+        other => DXLinkError::Protocol(format!(
+            "the server answered with a {other:?} where that is not a valid reply"
+        )),
     }
 }
 
@@ -1713,9 +1749,11 @@ impl DXLinkClient {
         wait: Duration,
     ) -> DXLinkResult<ResponseType> {
         request_response(
-            &self.get_connection()?,
-            &self.response_requests,
-            &self.next_request_id,
+            Responder {
+                connection: &self.get_connection()?,
+                requests: &self.response_requests,
+                next_id: &self.next_request_id,
+            },
             message,
             operation,
             expected_type,
@@ -2395,9 +2433,7 @@ impl DXLinkClient {
             ResponseType::Error(code, message) => Err(DXLinkError::Protocol(format!(
                 "server returned {code}: {message}"
             ))),
-            _ => Err(DXLinkError::Protocol(
-                "Unexpected response type".to_string(),
-            )),
+            other => Err(unexpected_response(other)),
         }
     }
 
@@ -2492,9 +2528,7 @@ impl DXLinkClient {
             ResponseType::Error(code, message) => Err(DXLinkError::Protocol(format!(
                 "server returned {code}: {message}"
             ))),
-            _ => Err(DXLinkError::Protocol(
-                "Unexpected response type".to_string(),
-            )),
+            other => Err(unexpected_response(other)),
         }
     }
 
@@ -2684,9 +2718,7 @@ impl DXLinkClient {
             ResponseType::Error(code, message) => Err(DXLinkError::Protocol(format!(
                 "server returned {code}: {message}"
             ))),
-            _ => Err(DXLinkError::Protocol(
-                "Unexpected response type".to_string(),
-            )),
+            other => Err(unexpected_response(other)),
         }
     }
 
