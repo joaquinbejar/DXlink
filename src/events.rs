@@ -259,6 +259,23 @@ impl EventType {
                 "shares",
                 "freeFloat",
             ]),
+            EventType::TradeETH => Some(&[
+                "eventType",
+                "eventSymbol",
+                "eventTime",
+                "time",
+                "timeNanoPart",
+                "sequence",
+                "exchangeCode",
+                "price",
+                "change",
+                "size",
+                "dayId",
+                "dayVolume",
+                "dayTurnover",
+                "tickDirection",
+                "extendedTradingHours",
+            ]),
             EventType::TimeAndSale => Some(&[
                 "eventType",
                 "eventSymbol",
@@ -325,7 +342,6 @@ impl EventType {
             ]),
             // Declared by the protocol, not decoded here.
             EventType::Order
-            | EventType::TradeETH
             | EventType::SpreadOrder
             | EventType::Series
             | EventType::Configuration
@@ -865,6 +881,85 @@ pub struct TimeAndSaleEvent {
     pub seller: String,
 }
 
+/// One extended-hours print: the last trade of the pre- or post-market session.
+///
+/// The counterpart to [`TradeEvent`], and not a curiosity on a US feed: between
+/// 04:00 and 09:30 and again from 16:00 to 20:00 ET, `Trade` is silent and this
+/// is the only print there is.
+///
+/// Every field the dxFeed AsyncAPI schema defines for it, confirmed against the
+/// `FEED_CONFIG` the server actually returns rather than copied from `Trade`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TradeETHEvent {
+    /// The type of the event, `TradeETH`.
+    #[serde(rename = "eventType")]
+    pub event_type: String,
+
+    /// The symbol that traded.
+    #[serde(rename = "eventSymbol")]
+    pub event_symbol: String,
+
+    /// When the server emitted the event, as epoch milliseconds.
+    ///
+    /// A live feed sends `0` here when it did not populate it.
+    #[serde(rename = "eventTime")]
+    pub event_time: i64,
+
+    /// When the print happened, as epoch milliseconds.
+    pub time: i64,
+
+    /// Sub-millisecond part of `time`, in nanoseconds.
+    #[serde(rename = "timeNanoPart")]
+    pub time_nano_part: i64,
+
+    /// Sequence number, separating prints that share a millisecond.
+    pub sequence: i64,
+
+    /// Exchange the print came from, as its single-character code.
+    #[serde(rename = "exchangeCode")]
+    pub exchange_code: String,
+
+    /// Execution price.
+    #[serde(with = "json_double")]
+    pub price: f64,
+
+    /// Change against the previous close, `NaN` when the venue does not compute
+    /// it — which on a delayed feed is the usual answer.
+    #[serde(with = "json_double")]
+    pub change: f64,
+
+    /// Executed size.
+    #[serde(with = "json_double")]
+    pub size: f64,
+
+    /// The trading day this print belongs to, as **days since the Unix epoch**
+    /// rather than `yyyymmdd`.
+    #[serde(rename = "dayId")]
+    pub day_id: i64,
+
+    /// Cumulative volume for the day, extended hours included.
+    #[serde(rename = "dayVolume", with = "json_double")]
+    pub day_volume: f64,
+
+    /// Cumulative turnover for the day, price times size summed.
+    #[serde(rename = "dayTurnover", with = "json_double")]
+    pub day_turnover: f64,
+
+    /// Which way the price moved against the previous print: `UP`, `DOWN`,
+    /// `ZERO`, `ZERO_UP`, `ZERO_DOWN` or `UNDEFINED`.
+    ///
+    /// A delayed feed sends `UNDEFINED` for most prints.
+    #[serde(rename = "tickDirection")]
+    pub tick_direction: String,
+
+    /// Whether the print happened outside regular trading hours.
+    ///
+    /// The reason this event type exists, and `true` on every row a real
+    /// extended-hours session produces.
+    #[serde(rename = "extendedTradingHours")]
+    pub extended_trading_hours: bool,
+}
+
 /// The option surface over an underlying: implied volatility and the call/put
 /// balance.
 ///
@@ -1043,6 +1138,16 @@ pub enum MarketEvent {
     /// which contains details about a specific quote event, including the type of event,
     /// the symbol it relates to, and the bid and ask prices and sizes.
     Quote(QuoteEvent),
+    /// One extended-hours print: the last trade of the pre- or post-market
+    /// session.
+    ///
+    /// **Ahead of `Trade` on purpose, against the usual rule of appending.**
+    /// Every field `TradeEvent` declares is also in this one, so an untagged
+    /// match tries `Trade` first and succeeds, and a `TradeETH` payload comes
+    /// back as a `Trade` with its extended-hours flag and session volume
+    /// silently gone. The more specific variant has to be tried first.
+    /// `test_each_new_type_round_trips_as_its_own_variant` fails if this moves.
+    TradeETH(TradeETHEvent),
     /// Represents a Trade event. This is typically a market trade that has occurred.
     Trade(TradeEvent),
     /// Represents a Greeks event, containing Greek values (delta, gamma, theta, vega, rho)
@@ -1060,11 +1165,20 @@ pub enum MarketEvent {
     Underlying(UnderlyingEvent),
     /// A theoretical option price with the inputs it was computed from.
     ///
-    /// New variants go last on purpose: `MarketEvent` is `#[serde(untagged)]`,
-    /// so serde tries them in declaration order and keeps the first that
-    /// deserializes. Appending leaves every variant already in the list
-    /// matching exactly as it did. Each type has a round-trip test that would
-    /// catch one variant stealing another's payload.
+    /// `MarketEvent` is `#[serde(untagged)]`, so serde tries the variants in
+    /// declaration order and keeps the first that deserializes — and it
+    /// deserializes as long as every field *that variant* declares is present,
+    /// ignoring any extras.
+    ///
+    /// So the rule is **most specific first**, not simply "append". Appending
+    /// is right whenever the new type is not a superset of an existing one,
+    /// which is the common case. When it is a superset, the existing variant
+    /// matches first and quietly drops the extra fields: see `TradeETH`, which
+    /// contains all of `Trade` and therefore sits ahead of it.
+    ///
+    /// Each type has a round-trip test, and
+    /// `test_each_new_type_round_trips_as_its_own_variant` is what catches a
+    /// variant stealing another's payload.
     TheoPrice(TheoPriceEvent),
 }
 
@@ -1803,6 +1917,32 @@ mod event_serde_tests {
         }
     }
 
+    /// Values from a real row the demo server sent for AAPL.
+    fn trade_eth() -> TradeETHEvent {
+        TradeETHEvent {
+            event_type: "TradeETH".to_string(),
+            event_symbol: "AAPL".to_string(),
+            event_time: 0,
+            time: 1_785_542_396_498,
+            time_nano_part: 0,
+            sequence: 3_009_441,
+            exchange_code: "D".to_string(),
+            price: 307.3554,
+            change: f64::NAN,
+            size: 600.0,
+            day_id: 20665,
+            day_volume: 11_085_372.061_196,
+            day_turnover: 3_417_052_245.055_67,
+            tick_direction: "UNDEFINED".to_string(),
+            extended_trading_hours: true,
+        }
+    }
+
+    #[test]
+    fn test_trade_eth_serde_names_match_its_layout() {
+        assert_wire_contract(&trade_eth(), EventType::TradeETH);
+    }
+
     #[test]
     fn test_theo_price_serde_names_match_its_layout() {
         assert_wire_contract(&theo_price(), EventType::TheoPrice);
@@ -1871,6 +2011,7 @@ mod event_serde_tests {
             MarketEvent::Profile(profile()),
             MarketEvent::Underlying(underlying()),
             MarketEvent::TheoPrice(theo_price()),
+            MarketEvent::TradeETH(trade_eth()),
         ] {
             let serialized = to_string(&event).expect("serialize");
             let back: MarketEvent = from_str(&serialized).expect("round trip");

@@ -631,6 +631,11 @@ fn field_value(field: &str, event_type: &str, symbol: &str) -> Value {
         "underlyingPrice" => json!(152.4),
         "dividend" => json!(0.55),
         "interest" => json!(4.75),
+        // TradeETH (time, price, size, dayVolume, exchangeCode, dayId and
+        // extendedTradingHours are shared with the events above)
+        "change" => json!(-1.25),
+        "dayTurnover" => json!(3_417_052_245.055_67),
+        "tickDirection" => json!("UP"),
         // Greeks
         "delta" => json!(0.65),
         "gamma" => json!(0.05),
@@ -725,6 +730,9 @@ pub mod expected {
     pub const UNDERLYING_PRICE: f64 = 152.4;
     pub const DIVIDEND: f64 = 0.55;
     pub const INTEREST: f64 = 4.75;
+    pub const CHANGE: f64 = -1.25;
+    pub const DAY_TURNOVER: f64 = 3_417_052_245.055_67;
+    pub const TICK_DIRECTION: &str = "UP";
 }
 
 /// Convenience predicates for `wait_for`.

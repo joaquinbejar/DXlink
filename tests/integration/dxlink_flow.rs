@@ -1047,3 +1047,91 @@ async fn test_theo_prices_reach_the_stream_and_the_callback() {
 
     client.disconnect().await.expect("failed to disconnect");
 }
+
+/// Issue #66: extended-hours prints reach both delivery paths.
+#[tokio::test]
+async fn test_extended_hours_prints_reach_the_stream_and_the_callback() {
+    let server = MockServer::start(Behaviour::Normal).await;
+
+    let mut client = DXLinkClient::new(&server.url(), "test-token");
+    let mut event_stream = client.connect().await.expect("failed to connect");
+
+    let channel_id = client
+        .create_feed_channel("AUTO")
+        .await
+        .expect("failed to create feed channel");
+    client
+        .setup_feed(channel_id, &[EventType::TradeETH])
+        .await
+        .expect("failed to set up feed");
+
+    let delivered = Arc::new(Mutex::new(Vec::new()));
+    let sink = delivered.clone();
+    client.on_event("AAPL", move |event| {
+        sink.lock().expect("callback lock poisoned").push(event);
+    });
+
+    client
+        .subscribe(
+            channel_id,
+            vec![
+                FeedSubscription {
+                    event_type: "TradeETH".to_string(),
+                    symbol: "AAPL".to_string(),
+                    from_time: None,
+                    source: None,
+                },
+                FeedSubscription {
+                    event_type: "TradeETH".to_string(),
+                    symbol: "MSFT".to_string(),
+                    from_time: None,
+                    source: None,
+                },
+            ],
+        )
+        .await
+        .expect("failed to subscribe");
+
+    let events = collect_events(&mut event_stream, 2).await;
+    assert_eq!(events.len(), 2, "expected two prints, got {events:?}");
+
+    let print = events
+        .iter()
+        .find_map(|event| match event {
+            MarketEvent::TradeETH(print) if print.event_symbol == "AAPL" => Some(print),
+            _ => None,
+        })
+        .expect("no TradeETH for AAPL reached the stream");
+
+    assert_eq!(print.event_type, "TradeETH");
+    assert_eq!(print.time, expected::TIME);
+    assert_eq!(print.exchange_code, expected::EXCHANGE_CODE);
+    assert_eq!(print.price, expected::PRICE);
+    assert_eq!(print.change, expected::CHANGE);
+    assert_eq!(print.size, expected::SIZE);
+    assert_eq!(print.day_id, expected::DAY_ID);
+    assert_eq!(print.day_volume, expected::DAY_VOLUME);
+    assert_eq!(print.day_turnover, expected::DAY_TURNOVER);
+    assert_eq!(print.tick_direction, expected::TICK_DIRECTION);
+    assert_eq!(
+        print.extended_trading_hours,
+        expected::EXTENDED_TRADING_HOURS
+    );
+
+    // The callback routes through symbol_of, which needed a new arm.
+    let seen: Vec<MarketEvent> = {
+        let events = delivered.lock().expect("callback lock poisoned");
+        events.clone()
+    };
+    match seen.as_slice() {
+        [MarketEvent::TradeETH(print)] => {
+            assert_eq!(print.event_symbol, "AAPL");
+            // A consumer acting on an extended-hours last price reads this
+            // before it moves anything.
+            assert!(print.extended_trading_hours);
+        }
+        other => panic!("the callback for AAPL should have received one print, got {other:?}"),
+    }
+
+    client.disconnect().await.expect("failed to disconnect");
+}
