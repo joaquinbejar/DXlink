@@ -6,8 +6,8 @@
 use crate::MarketEvent;
 use crate::error::{DXLinkError, DXLinkResult};
 use crate::events::{
-    CandleEvent, CompactData, EventType, GreeksEvent, ProfileEvent, QuoteEvent, SummaryEvent,
-    TheoPriceEvent, TimeAndSaleEvent, TradeETHEvent, TradeEvent, UnderlyingEvent,
+    CandleEvent, CompactData, EventType, GreeksEvent, ProfileEvent, QuoteEvent, SeriesEvent,
+    SummaryEvent, TheoPriceEvent, TimeAndSaleEvent, TradeETHEvent, TradeEvent, UnderlyingEvent,
 };
 use serde_json::Value;
 use std::collections::HashMap;
@@ -519,6 +519,23 @@ fn build_event(event_type: EventType, row: &Row<'_>) -> DXLinkResult<MarketEvent
             dividend: row.double("dividend")?,
             interest: row.double("interest")?,
         }),
+        EventType::Series => MarketEvent::Series(SeriesEvent {
+            event_type: event_type_name,
+            event_symbol: symbol,
+            event_time: row.int("eventTime")?,
+            event_flags: row.int("eventFlags")?,
+            index: row.int("index")?,
+            time: row.int("time")?,
+            sequence: row.int("sequence")?,
+            expiration: row.int("expiration")?,
+            volatility: row.double("volatility")?,
+            call_volume: row.double("callVolume")?,
+            put_volume: row.double("putVolume")?,
+            put_call_ratio: row.double("putCallRatio")?,
+            forward_price: row.double("forwardPrice")?,
+            dividend: row.double("dividend")?,
+            interest: row.double("interest")?,
+        }),
         EventType::TradeETH => MarketEvent::TradeETH(TradeETHEvent {
             event_type: event_type_name,
             event_symbol: symbol,
@@ -840,11 +857,21 @@ mod strict_tests {
 
     #[test]
     fn test_an_undecodable_event_type_is_reported() {
-        // Series is deliberately chosen: it is not on the roadmap of types
-        // gaining decoders, so this test stops needing an edit each time one
-        // does.
-        let error = try_parse_compact_data(&batch("Series", vec![json!("Series"), json!("AAPL")]))
-            .expect_err("Series has no decoder");
+        // Whichever type still has no decoder, rather than a name hardcoded
+        // here. The previous version named Series and had to be edited the day
+        // Series gained one, which is the wrong thing to spend an edit on.
+        let Some(undecodable) = crate::events::ALL_EVENT_TYPES
+            .iter()
+            .find(|event_type| event_type.compact_fields().is_none())
+        else {
+            // Every declared type decodes. Nothing left to report, and this
+            // test has nothing to say until the protocol adds one.
+            return;
+        };
+
+        let name = undecodable.to_string();
+        let error = try_parse_compact_data(&batch(&name, vec![json!(name.clone())]))
+            .expect_err("a type with no decoder must be reported, not skipped");
         assert!(error.to_string().contains("no decoder"), "{error}");
     }
 
@@ -2041,5 +2068,215 @@ mod trade_eth_tests {
         let mut values = print_row("AAPL");
         values.pop();
         assert!(try_parse_compact_data(&batch(values)).is_err());
+    }
+}
+
+#[cfg(test)]
+mod series_tests {
+    use super::*;
+    use serde_json::json;
+
+    /// One expiration exactly as the demo server sent it for AAPL. Captured
+    /// rather than invented: the issue asks for the layout to be confirmed
+    /// against a real row, not extrapolated from Underlying or TheoPrice.
+    fn series_row(symbol: &str, expiration: i64) -> Vec<Value> {
+        vec![
+            json!("Series"),                // 0 eventType
+            json!(symbol),                  // 1 eventSymbol
+            json!(0i64),                    // 2 eventTime, sent as 0 by a live feed
+            json!(4i64),                    // 3 eventFlags, the snapshot bit
+            json!(23i64),                   // 4 index
+            json!(1_785_542_361_974i64),    // 5 time
+            json!(0i64),                    // 6 sequence
+            json!(expiration),              // 7 expiration
+            json!(0.3188),                  // 8 volatility
+            json!(8526.0),                  // 9 callVolume
+            json!(1899.0),                  // 10 putVolume
+            json!(0.222_730_471_498_944_4), // 11 putCallRatio
+            json!(335.174_395_879_884),     // 12 forwardPrice
+            json!(0.0),                     // 13 dividend
+            json!(0.0),                     // 14 interest
+        ]
+    }
+
+    fn batch(values: Vec<Value>) -> Vec<CompactData> {
+        vec![
+            CompactData::EventType("Series".to_string()),
+            CompactData::Values(values),
+        ]
+    }
+
+    #[test]
+    fn test_the_field_list_matches_the_decoder_stride() {
+        let fields = EventType::Series
+            .compact_fields()
+            .expect("Series has a decoder");
+        assert_eq!(fields.len(), 15, "the layout the server confirmed is 15");
+        assert_eq!(fields.len(), series_row("AAPL", 21533).len());
+    }
+
+    #[test]
+    fn test_a_real_row_decodes_field_for_field() {
+        let events =
+            try_parse_compact_data(&batch(series_row("AAPL", 21533))).expect("well formed");
+        match &events[0] {
+            MarketEvent::Series(series) => {
+                assert_eq!(series.event_symbol, "AAPL");
+                assert_eq!(series.event_time, 0);
+                assert_eq!(series.event_flags, 4);
+                assert_eq!(series.index, 23);
+                assert_eq!(series.time, 1_785_542_361_974);
+                assert_eq!(series.sequence, 0);
+                // Days since the epoch, 2028-12-15. Not yyyymmdd.
+                assert_eq!(series.expiration, 21533);
+                assert_eq!(series.volatility, 0.3188);
+                assert_eq!(series.call_volume, 8526.0);
+                assert_eq!(series.put_volume, 1899.0);
+                assert_eq!(series.put_call_ratio, 0.222_730_471_498_944_4);
+                assert_eq!(series.forward_price, 335.174_395_879_884);
+                assert_eq!(series.dividend, 0.0);
+                assert_eq!(series.interest, 0.0);
+            }
+            other => panic!("expected a series, got {other:?}"),
+        }
+    }
+
+    /// A subscription replays the whole chain in one batch, one row per
+    /// expiration, which is how the real server sends it.
+    #[test]
+    fn test_a_whole_chain_decodes_expiration_by_expiration() {
+        let mut values = series_row("AAPL", 21533);
+        values.extend(series_row("AAPL", 21260));
+        values.extend(series_row("AAPL", 21204));
+
+        let events = try_parse_compact_data(&batch(values)).expect("well formed");
+        assert_eq!(events.len(), 3);
+
+        let expirations: Vec<i64> = events
+            .iter()
+            .map(|event| match event {
+                MarketEvent::Series(series) => series.expiration,
+                other => panic!("expected a series, got {other:?}"),
+            })
+            .collect();
+        // The stride of fifteen is what keeps these distinct.
+        assert_eq!(expirations, [21533, 21260, 21204]);
+    }
+
+    /// The point of issue #67: an undecodable type does not merely go missing,
+    /// it abandons the rest of the batch it appears in.
+    #[test]
+    fn test_a_batch_mixing_series_and_quote_decodes_whole() {
+        let mut data = batch(series_row("AAPL", 21533));
+        data.push(CompactData::EventType("Quote".to_string()));
+        data.push(CompactData::Values(vec![
+            json!("Quote"),
+            json!("AAPL"),
+            json!(307.33),
+            json!(307.35),
+            json!(2160.0),
+            json!(80.0),
+        ]));
+
+        let events = try_parse_compact_data(&data).expect("both types decode now");
+        assert_eq!(
+            events.len(),
+            2,
+            "a Series row used to abort the batch and take the Quote with it"
+        );
+        assert!(matches!(events[0], MarketEvent::Series(_)));
+        assert!(matches!(events[1], MarketEvent::Quote(_)));
+    }
+
+    #[test]
+    fn test_an_expiration_with_no_options_traded_decodes() {
+        // No volume on either side leaves the ratio undefined, and the protocol
+        // sends NaN rather than omitting the column.
+        let mut values = series_row("AAPL", 21533);
+        values[9] = json!(0.0);
+        values[10] = json!(0.0);
+        values[11] = json!("NaN");
+
+        let events = try_parse_compact_data(&batch(values)).expect("NaN is a value");
+        match &events[0] {
+            MarketEvent::Series(series) => {
+                assert_eq!(series.call_volume, 0.0);
+                assert!(series.put_call_ratio.is_nan());
+            }
+            other => panic!("expected a series, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_a_fractional_expiration_is_rejected() {
+        let mut values = series_row("AAPL", 21533);
+        values[7] = json!(21533.5);
+
+        let error =
+            try_parse_compact_data(&batch(values)).expect_err("a day count is a whole number");
+        assert!(
+            error.to_string().contains("expiration"),
+            "the field is missing: {error}"
+        );
+    }
+
+    #[test]
+    fn test_a_truncated_series_row_is_rejected() {
+        let mut values = series_row("AAPL", 21533);
+        values.pop();
+        assert!(try_parse_compact_data(&batch(values)).is_err());
+    }
+}
+
+#[cfg(test)]
+mod series_snapshot_tests {
+    use super::*;
+    use serde_json::json;
+
+    /// The row a real feed ends a Series snapshot with: flags set, everything
+    /// else zeroed or NaN. Captured from the demo server, which closes a
+    /// 24-row AAPL chain exactly like this.
+    fn marker_row() -> Vec<Value> {
+        vec![
+            json!("Series"),
+            json!("AAPL"),
+            json!(0i64),
+            json!(10i64), // eventFlags: the snapshot terminator
+            json!(0i64),
+            json!(1_785_542_361_974i64),
+            json!(0i64),
+            json!(0i64), // expiration: not an expiration at all
+            json!("NaN"),
+            json!("NaN"),
+            json!("NaN"),
+            json!("NaN"),
+            json!("NaN"),
+            json!("NaN"),
+            json!("NaN"),
+        ]
+    }
+
+    #[test]
+    fn test_the_snapshot_marker_decodes_and_is_distinguishable() {
+        let events = try_parse_compact_data(&[
+            CompactData::EventType("Series".to_string()),
+            CompactData::Values(marker_row()),
+        ])
+        .expect("the marker is a well formed row and must not error");
+
+        match &events[0] {
+            MarketEvent::Series(series) => {
+                // It has to decode, because erroring here would abandon the
+                // rest of the batch it closes.
+                assert_eq!(series.expiration, 0);
+                assert!(series.volatility.is_nan());
+                // And a consumer has to be able to tell it apart from data.
+                assert_ne!(
+                    series.event_flags, 0,
+                    "the marker is only distinguishable by its flags"
+                );
+            }
+            other => panic!("expected a series, got {other:?}"),
+        }
     }
 }

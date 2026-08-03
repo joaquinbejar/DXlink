@@ -796,9 +796,9 @@ async fn test_setup_feed_refuses_a_type_it_cannot_decode() {
         .await
         .expect("failed to create feed channel");
 
-    match client.setup_feed(channel_id, &[EventType::Series]).await {
+    match client.setup_feed(channel_id, &[EventType::Order]).await {
         Err(DXLinkError::Protocol(msg)) => {
-            assert!(msg.contains("Series"), "the type is missing: {msg}");
+            assert!(msg.contains("Order"), "the type is missing: {msg}");
             // The error has to say what does work, or it is a dead end.
             assert!(msg.contains("Quote"), "the usable types are missing: {msg}");
         }
@@ -839,7 +839,7 @@ async fn test_subscribe_refuses_a_type_it_cannot_decode() {
         .subscribe(
             channel_id,
             vec![FeedSubscription {
-                event_type: "Series".to_string(),
+                event_type: "Order".to_string(),
                 symbol: "AAPL".to_string(),
                 from_time: None,
                 source: None,
@@ -849,7 +849,7 @@ async fn test_subscribe_refuses_a_type_it_cannot_decode() {
 
     match result {
         Err(DXLinkError::Protocol(msg)) => {
-            assert!(msg.contains("Series"), "the type is missing: {msg}");
+            assert!(msg.contains("Order"), "the type is missing: {msg}");
             assert!(msg.contains("AAPL"), "the symbol is missing: {msg}");
         }
         other => panic!("an undecodable subscription must be refused, got: {other:?}"),
