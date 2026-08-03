@@ -931,7 +931,11 @@ pub struct SeriesEvent {
     /// zeroed or `NaN`. A consumer that reads it as data gets a phantom
     /// expiration 0. The first row carries 4.
     ///
-    /// Filter on this being non-zero before treating a row as an expiration.
+    /// **Non-zero flags do not mean "marker"** — that first row has them and is
+    /// real data, so filtering on them drops an expiration. What identifies the
+    /// marker is [`expiration`](Self::expiration) being zero, which only ever
+    /// happens with flags set. The spec does not document what the individual
+    /// bits mean, so this describes what a real feed was observed to send.
     #[serde(rename = "eventFlags")]
     pub event_flags: i64,
 
