@@ -946,7 +946,9 @@ pub struct TradeETHEvent {
     pub day_turnover: f64,
 
     /// Which way the price moved against the previous print: `UP`, `DOWN`,
-    /// `ZERO_UP`, `ZERO_DOWN` or `UNDEFINED`.
+    /// `ZERO`, `ZERO_UP`, `ZERO_DOWN` or `UNDEFINED`.
+    ///
+    /// A delayed feed sends `UNDEFINED` for most prints.
     #[serde(rename = "tickDirection")]
     pub tick_direction: String,
 
