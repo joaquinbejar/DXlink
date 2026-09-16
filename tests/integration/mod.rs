@@ -5,6 +5,7 @@
 ******************************************************************************/
 mod fixture;
 
+mod dxlink_backpressure;
 mod dxlink_extra;
 mod dxlink_flow;
 mod dxlink_real;
