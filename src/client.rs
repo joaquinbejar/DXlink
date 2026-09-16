@@ -91,6 +91,30 @@ const DEFAULT_EVENT_BUFFER: usize = 8192;
 // A day of 1-minute bars is the workload the default exists for.
 const _: () = assert!(DEFAULT_EVENT_BUFFER >= 1440);
 
+/// What the delivery worker does when the consumer's event stream is full.
+///
+/// Chosen with [`DXLinkClient::with_overflow_policy`]. `Drop` is the default
+/// and the behaviour the library always had: market data is only useful while
+/// it is current, and a stalled consumer must not hold anything else up.
+/// `Block` is for consumers that would rather wait than lose, a history replay
+/// being persisted for instance, and it is opt-in because the library does not
+/// make that trade on the consumer's behalf.
+///
+/// Marked `#[non_exhaustive]`: a later policy (a bounded wait, say) must not
+/// break downstream matches.
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum OverflowPolicy {
+    /// Discard the event, count it in [`DXLinkClient::dropped_event_count`]
+    /// and log it. Never waits.
+    #[default]
+    Drop,
+    /// Wait for the consumer to make room. Only the delivery worker waits; the
+    /// socket reader keeps routing protocol traffic and its own queue still
+    /// drops on overflow, see [`DXLinkClient::with_overflow_policy`].
+    Block,
+}
+
 /// The shortest a reconnect will ever wait between attempts.
 ///
 /// A policy may legitimately ask for a very short delay, but zero with
@@ -1680,6 +1704,8 @@ pub struct DXLinkClient {
     /// Capacity of the event stream handed to the consumer, in events. Also the
     /// floor for the reader-to-worker queue, see `DELIVERY_QUEUE_CAPACITY`.
     event_buffer: usize,
+    /// What the delivery worker does with an event the stream has no room for.
+    overflow_policy: OverflowPolicy,
     /// Events that never reached the consumer, from either queue, since this
     /// client was created. Shared with every reader and the delivery worker.
     dropped_events: Arc<AtomicU64>,
@@ -1758,6 +1784,7 @@ impl DXLinkClient {
             delivery_handle: None,
             event_stream_taken: false,
             event_buffer: DEFAULT_EVENT_BUFFER,
+            overflow_policy: OverflowPolicy::default(),
             dropped_events: Arc::new(AtomicU64::new(0)),
             disconnect_reason: Arc::new(Mutex::new(None)),
             response_requests: Arc::new(Mutex::new(Vec::new())),
@@ -1869,13 +1896,14 @@ impl DXLinkClient {
 
         let callbacks = self.callbacks.clone();
         let dropped_events = self.dropped_events.clone();
+        let overflow_policy = self.overflow_policy;
         // Taken, not cloned: the worker becomes the only owner, so when it ends
         // the channel closes and the consumer's recv() returns None. That is the
-        // signal that the session is over.
-        let event_sender = self.event_sender.take();
+        // signal that the session is over. Mutable because it is forgotten once
+        // the consumer drops its receiver.
+        let mut event_sender = self.event_sender.take();
 
         let handle = tokio::spawn(async move {
-            let mut stream_closed_reported = false;
             // Paces the log line; the shared counter is the consumer's view.
             let mut dropped_here: u64 = 0;
 
@@ -1904,40 +1932,48 @@ impl DXLinkClient {
                     }
                 }
 
-                if let Some(tx) = &event_sender {
-                    match tx.try_send(event) {
-                        Ok(()) => {}
-                        Err(mpsc::error::TrySendError::Full(returned)) => {
-                            // Counted and warned like the reader's queue: a
-                            // per-event debug line was invisible in practice,
-                            // and a history replay losing its tail here is a
-                            // consumer waiting forever for a snapshot end that
-                            // was decoded and then thrown away.
-                            dropped_here += 1;
-                            dropped_events.fetch_add(1, Ordering::Relaxed);
-                            if dropped_here.is_power_of_two() {
-                                // try_send hands the event back, so the symbol
-                                // is still available without a clone up front.
-                                warn!(
-                                    "Event stream full, {} event(s) dropped so far (latest for {}); \
-                                     the consumer is not draining event_stream()",
-                                    dropped_here,
-                                    symbol_of(&returned)
-                                );
+                let stream_closed = match &event_sender {
+                    None => false,
+                    Some(tx) => match overflow_policy {
+                        OverflowPolicy::Drop => match tx.try_send(event) {
+                            Ok(()) => false,
+                            Err(mpsc::error::TrySendError::Full(returned)) => {
+                                // Counted and warned like the reader's queue:
+                                // a per-event debug line was invisible in
+                                // practice, and a history replay losing its
+                                // tail here is a consumer waiting forever for
+                                // a snapshot end that was decoded and then
+                                // thrown away.
+                                dropped_here += 1;
+                                dropped_events.fetch_add(1, Ordering::Relaxed);
+                                if dropped_here.is_power_of_two() {
+                                    // try_send hands the event back, so the
+                                    // symbol is still available without a
+                                    // clone up front.
+                                    warn!(
+                                        "Event stream full, {} event(s) dropped so far (latest for {}); \
+                                         the consumer is not draining event_stream()",
+                                        dropped_here,
+                                        symbol_of(&returned)
+                                    );
+                                }
+                                false
                             }
-                        }
-                        Err(mpsc::error::TrySendError::Closed(_)) => {
-                            // The consumer dropped its receiver. Callbacks still
-                            // fire; the stream cannot be re-taken, which is what
-                            // event_stream documents.
-                            if !stream_closed_reported {
-                                debug!(
-                                    "Event stream receiver dropped; delivering to callbacks only"
-                                );
-                                stream_closed_reported = true;
-                            }
-                        }
-                    }
+                            Err(mpsc::error::TrySendError::Closed(_)) => true,
+                        },
+                        // Waits for the consumer. Only this worker waits: the
+                        // reader keeps routing protocol traffic behind its own
+                        // queue, which is where a consumer that stalls for
+                        // longer than that queue's slack loses events instead.
+                        OverflowPolicy::Block => tx.send(event).await.is_err(),
+                    },
+                };
+                if stream_closed {
+                    // The consumer dropped its receiver. Callbacks still fire;
+                    // the stream cannot be re-taken, which is what event_stream
+                    // documents. Forgotten rather than retried per event.
+                    debug!("Event stream receiver dropped; delivering to callbacks only");
+                    event_sender = None;
                 }
             }
 
@@ -2104,6 +2140,44 @@ impl DXLinkClient {
         }
         self.event_buffer = capacity;
         Ok(self)
+    }
+
+    /// Chooses what the delivery worker does when the stream returned by
+    /// [`connect`](Self::connect) is full.
+    ///
+    /// The default, [`OverflowPolicy::Drop`], discards the event, counts it in
+    /// [`dropped_event_count`](Self::dropped_event_count) and logs it. With
+    /// [`OverflowPolicy::Block`] the worker waits for the consumer to make room
+    /// instead, so nothing is lost at this stage. The socket reader is not
+    /// behind that wait, only the delivery of the next event is, so protocol
+    /// operations keep completing while the consumer catches up.
+    ///
+    /// Two things follow from "only the worker waits". First, callbacks
+    /// registered with [`on_event`](Self::on_event) are delivered by the same
+    /// worker, so a consumer that keeps the receiver bound but never reads it
+    /// stalls its own callbacks once the buffer fills: drop the receiver you do
+    /// not read, or stay on `Drop`. Second, the reader hands events to the
+    /// worker through its own bounded queue, which still drops on overflow so
+    /// the reader never blocks; `Block` is lossless as long as the consumer
+    /// keeps up within that queue's slack (at least 1024 events, or the buffer
+    /// size if larger), and anything beyond it is counted exactly as before.
+    ///
+    /// Read when the worker is spawned by [`connect`](Self::connect); a value
+    /// set later applies to the next session.
+    ///
+    /// Additive: a new method, no existing signature changes.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use dxlink::{DXLinkClient, OverflowPolicy};
+    ///
+    /// let client = DXLinkClient::new("wss://example.com", "token")
+    ///     .with_overflow_policy(OverflowPolicy::Block);
+    /// ```
+    pub fn with_overflow_policy(mut self, policy: OverflowPolicy) -> Self {
+        self.overflow_policy = policy;
+        self
     }
 
     /// The interval at which maintenance is sent, derived from the negotiated
@@ -2927,6 +3001,11 @@ impl DXLinkClient {
     /// with a running total, so a loss is never silent. If you cannot afford to
     /// miss events, size the buffer for your largest replay or drain this
     /// receiver into your own unbounded buffer as soon as it yields.
+    ///
+    /// Dropping is a policy, not a law:
+    /// [`with_overflow_policy`](Self::with_overflow_policy) switches this stage
+    /// to [`OverflowPolicy::Block`], where the worker waits for room instead.
+    /// Read its caveats before opting in.
     pub fn event_stream(&mut self) -> DXLinkResult<Receiver<MarketEvent>> {
         if self.event_stream_taken {
             return Err(DXLinkError::Protocol(
@@ -3049,6 +3128,7 @@ impl fmt::Debug for DXLinkClient {
         debug_struct.field("subscription_count", &subscription_count);
         debug_struct.field("has_event_sender", &self.event_sender.is_some());
         debug_struct.field("event_buffer", &self.event_buffer);
+        debug_struct.field("overflow_policy", &self.overflow_policy);
         debug_struct.field("dropped_events", &self.dropped_event_count());
         debug_struct.field(
             "keepalive_active",
@@ -3289,6 +3369,21 @@ mod tests {
             Ok(_) => panic!("resizing an existing stream must be rejected"),
             Err(other) => panic!("expected a Protocol error, got {other:?}"),
         }
+    }
+
+    /// Drop is the behaviour the library always had; Block is the opt-in.
+    #[test]
+    fn test_overflow_policy_defaults_to_drop() {
+        let client = DXLinkClient::new("wss://test.url", "test_token");
+        assert_eq!(client.overflow_policy, OverflowPolicy::Drop);
+        assert_eq!(OverflowPolicy::default(), OverflowPolicy::Drop);
+    }
+
+    #[test]
+    fn test_with_overflow_policy_is_stored() {
+        let client = DXLinkClient::new("wss://test.url", "test_token")
+            .with_overflow_policy(OverflowPolicy::Block);
+        assert_eq!(client.overflow_policy, OverflowPolicy::Block);
     }
 
     #[test]

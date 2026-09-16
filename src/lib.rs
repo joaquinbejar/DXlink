@@ -414,7 +414,7 @@ pub mod messages;
 /// - Supporting efficient event processing
 mod utils;
 
-pub use client::{ConnectionState, DXLinkClient, ReconnectPolicy};
+pub use client::{ConnectionState, DXLinkClient, OverflowPolicy, ReconnectPolicy};
 pub use error::DXLinkError;
 pub use events::{ALL_EVENT_TYPES, EventType, MarketEvent};
 pub use messages::FeedSubscription;
