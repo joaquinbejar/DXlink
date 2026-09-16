@@ -30,7 +30,7 @@ use tokio_tungstenite::tungstenite::Message;
 /// How long a `wait_for` may block before the test is declared failed.
 const WAIT_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// Bars in a `HistoryBurst` reply: about a day of 5-minute bars, and more than
+/// Bars in a `HistoryBurst` reply: about a day of 1-minute bars, and more than
 /// both the 100-event stream the client used to hand out and the 1024-event
 /// reader queue, so a test proves the whole path rather than one stage of it.
 pub const HISTORY_BURST_BARS: usize = 1500;
@@ -125,6 +125,11 @@ pub enum Behaviour {
     /// on the first and `SNAPSHOT_END` on the last. What the venue does for a
     /// `fromTime` subscription, and what issue #71 is about.
     HistoryBurst,
+    /// `HistoryBurst` on every session, and like `DropFirstSession` hang up
+    /// once the first session is subscribed. The replayed subscription draws a
+    /// second burst from the rebuilt session, which is how a test proves the
+    /// drop counter is one total across reconnects.
+    HistoryBurstDroppingFirstSession,
 }
 
 pub struct MockServer {
@@ -428,7 +433,11 @@ impl MockServer {
                                             "eventFields": { event_type: order.clone() }
                                         }));
                                     }
-                                    let row: Vec<Value> = if behaviour == Behaviour::HistoryBurst {
+                                    let row: Vec<Value> = if matches!(
+                                        behaviour,
+                                        Behaviour::HistoryBurst
+                                            | Behaviour::HistoryBurstDroppingFirstSession
+                                    ) {
                                         history_burst(order, event_type, symbol)
                                     } else {
                                         order
@@ -451,6 +460,7 @@ impl MockServer {
                                         | Behaviour::SilentOnReconnect
                                         | Behaviour::IgnoreFeedSetupOnReconnect
                                         | Behaviour::RefuseAfterFirstSession
+                                        | Behaviour::HistoryBurstDroppingFirstSession
                                 ) && sessions_served == 1);
                         }
                         "CHANNEL_CANCEL" => responses.push(json!({
