@@ -22,7 +22,12 @@
 //!   The stream is bounded, 8192 events by default and sized with
 //!   [`DXLinkClient::with_event_buffer`]; when it overflows the library drops
 //!   rather than blocks, counts every loss in
-//!   [`DXLinkClient::dropped_event_count`] and logs it at `warn`.
+//!   [`DXLinkClient::dropped_event_count`] and logs it at `warn`. Consumers
+//!   that would rather wait than lose opt in with
+//!   [`DXLinkClient::with_overflow_policy`] and [`OverflowPolicy::Block`]: the
+//!   delivery worker then waits for room while the socket reader keeps
+//!   routing protocol traffic behind its own bounded queue, so it is lossless
+//!   as long as the consumer keeps up within that queue's slack.
 //! - Historical data via `from_time` on a `Candle` subscription, decoded into
 //!   OHLC bars.
 //! - Typed errors ([`DXLinkError`]) with [`DXLinkError::is_terminal`] to tell a
@@ -193,8 +198,9 @@
 //! before the read loop starts. The stream buffers 8192 events by default, so
 //! that fits; for larger windows or many symbols size it with
 //! [`DXLinkClient::with_event_buffer`] before connecting, or take the stream
-//! and start reading before subscribing. A burst larger than the buffer loses
-//! its **tail**, and the tail is where the snapshot terminator lives.
+//! and start reading before subscribing. Under the default policy a burst
+//! larger than the buffer loses its **tail**, and the tail is where the
+//! snapshot terminator lives.
 //!
 //! The bars carry dxFeed's `IndexedEvent` flags in
 //! [`CandleEvent::event_flags`](events::CandleEvent::event_flags): `0x04`
@@ -203,7 +209,11 @@
 //! [`DXLinkClient::dropped_event_count`] is cumulative, so sample it before
 //! subscribing and again once the terminator is in: an unchanged count means
 //! nothing overflowed during the replay, and the terminator is what says the
-//! replay is complete.
+//! replay is complete. A replay that must be complete can also opt into
+//! [`OverflowPolicy::Block`] with [`DXLinkClient::with_overflow_policy`], where
+//! the worker waits for the consumer instead of dropping; read that method's
+//! caveats first, in particular that a receiver you do not read must be
+//! dropped, since callbacks are delivered by the same worker.
 //!
 //! ## Error Handling
 //!
@@ -414,7 +424,7 @@ pub mod messages;
 /// - Supporting efficient event processing
 mod utils;
 
-pub use client::{ConnectionState, DXLinkClient, ReconnectPolicy};
+pub use client::{ConnectionState, DXLinkClient, OverflowPolicy, ReconnectPolicy};
 pub use error::DXLinkError;
 pub use events::{ALL_EVENT_TYPES, EventType, MarketEvent};
 pub use messages::FeedSubscription;
