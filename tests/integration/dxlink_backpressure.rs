@@ -10,7 +10,8 @@
 //! one reports exactly what it lost.
 
 use dxlink::{
-    ConnectionState, DXLinkClient, EventType, FeedSubscription, MarketEvent, ReconnectPolicy,
+    ConnectionState, DXLinkClient, EventType, FeedSubscription, MarketEvent, OverflowPolicy,
+    ReconnectPolicy,
 };
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -18,7 +19,10 @@ use std::time::Duration;
 use tokio::sync::broadcast;
 use tokio::sync::mpsc::Receiver;
 
-use crate::fixture::{Behaviour, HISTORY_BURST_BARS, MockServer, SNAPSHOT_BEGIN, SNAPSHOT_END};
+use crate::fixture::{
+    Behaviour, HISTORY_BURST_BARS, MockServer, SMALL_HISTORY_BURST_BARS, SNAPSHOT_BEGIN,
+    SNAPSHOT_END,
+};
 
 const SYMBOL: &str = "AAPL{=5m}";
 const WAIT: Duration = Duration::from_secs(5);
@@ -272,6 +276,150 @@ async fn test_the_drop_count_is_cumulative_across_a_reconnect() {
         2 * HISTORY_BURST_BARS as u64,
         "two bursts, one total: delivered plus dropped covers both sessions"
     );
+
+    client.disconnect().await.expect("failed to disconnect");
+}
+
+/// `Block` mode, the burst fits the reader queue but not a 16-slot stream, and
+/// nobody reads until the worker is parked on the seventeenth bar. Nothing may
+/// be lost, and a protocol operation issued while the worker is parked must
+/// still complete: the reader is not behind that wait.
+#[tokio::test]
+async fn test_block_mode_holds_a_burst_until_the_consumer_reads() {
+    const CAPACITY: usize = 16;
+
+    let server = MockServer::start(Behaviour::SmallHistoryBurst).await;
+    let mut client = DXLinkClient::new(&server.url(), "test-token")
+        .with_event_buffer(CAPACITY)
+        .expect("a non-zero capacity is valid")
+        .with_overflow_policy(OverflowPolicy::Block);
+    let (mut stream, channel_id) = open_candle_feed(&mut client).await;
+    let seen = subscribe_to_history(&mut client, channel_id).await;
+
+    // The callback runs before the hand-off, so a tally of capacity plus one
+    // means the stream is full and the worker is waiting on it.
+    wait_until("the worker to park on a full stream", || {
+        seen.load(Ordering::SeqCst) == CAPACITY + 1
+    })
+    .await;
+
+    // While it waits, the protocol must not.
+    let started = std::time::Instant::now();
+    let second = tokio::time::timeout(Duration::from_secs(3), client.create_feed_channel("AUTO"))
+        .await
+        .expect("a channel operation was blocked by a parked delivery worker");
+    assert!(second.is_ok(), "channel operation failed: {second:?}");
+    assert!(
+        started.elapsed() < Duration::from_secs(3),
+        "channel operation took {:?}, it was waiting on the consumer",
+        started.elapsed()
+    );
+
+    let events = drain(&mut stream).await;
+    assert_eq!(
+        events.len(),
+        SMALL_HISTORY_BURST_BARS,
+        "Block must hand over every bar the reader queue held"
+    );
+    assert_eq!(
+        client.dropped_event_count(),
+        0,
+        "nothing may be counted as lost"
+    );
+    assert_eq!(
+        flags_of(events.last().expect("at least one bar")),
+        SNAPSHOT_END,
+        "the terminator arrives, which is the point of waiting"
+    );
+
+    client.disconnect().await.expect("failed to disconnect");
+}
+
+/// The documented limit of `Block`: the reader never waits, so a burst larger
+/// than its queue loses exactly the overflow of that queue, counted, and the
+/// worker then hands over everything the queue did hold.
+#[tokio::test]
+async fn test_block_mode_loses_only_what_the_reader_queue_cannot_hold() {
+    const CAPACITY: usize = 16;
+    const READER_QUEUE: usize = 1024;
+    let reader_overflow = (HISTORY_BURST_BARS - READER_QUEUE) as u64;
+
+    let server = MockServer::start(Behaviour::HistoryBurst).await;
+    let mut client = DXLinkClient::new(&server.url(), "test-token")
+        .with_event_buffer(CAPACITY)
+        .expect("a non-zero capacity is valid")
+        .with_overflow_policy(OverflowPolicy::Block);
+    let (mut stream, channel_id) = open_candle_feed(&mut client).await;
+    subscribe_to_history(&mut client, channel_id).await;
+
+    wait_until("the reader queue's overflow to be counted", || {
+        client.dropped_event_count() == reader_overflow
+    })
+    .await;
+
+    let events = drain(&mut stream).await;
+    assert_eq!(
+        events.len(),
+        READER_QUEUE,
+        "everything the reader queue held is delivered once the consumer reads"
+    );
+    assert_eq!(
+        events.len() as u64 + client.dropped_event_count(),
+        HISTORY_BURST_BARS as u64,
+        "delivered plus dropped still covers the whole burst"
+    );
+
+    client.disconnect().await.expect("failed to disconnect");
+}
+
+/// A consumer on `Block` that drops the receiver is a callbacks-only consumer,
+/// same as on `Drop`: the worker must notice and carry on rather than wait on
+/// a channel nobody will ever read.
+#[tokio::test]
+async fn test_block_mode_falls_back_to_callbacks_when_the_receiver_is_dropped() {
+    let server = MockServer::start(Behaviour::Normal).await;
+    let mut client =
+        DXLinkClient::new(&server.url(), "test-token").with_overflow_policy(OverflowPolicy::Block);
+    let stream = client.connect().await.expect("failed to connect");
+    drop(stream);
+
+    let channel_id = client
+        .create_feed_channel("AUTO")
+        .await
+        .expect("failed to create feed channel");
+    client
+        .setup_feed(channel_id, &[EventType::Quote])
+        .await
+        .expect("failed to set up feed");
+
+    let seen = Arc::new(AtomicUsize::new(0));
+    for symbol in ["AAPL", "MSFT"] {
+        let tally = seen.clone();
+        client.on_event(symbol, move |_| {
+            tally.fetch_add(1, Ordering::SeqCst);
+        });
+    }
+
+    // Two subscriptions, two events, one after the other: the second only
+    // arrives if the worker did not park on the first.
+    for symbol in ["AAPL", "MSFT"] {
+        client
+            .subscribe(
+                channel_id,
+                vec![FeedSubscription {
+                    event_type: "Quote".to_string(),
+                    symbol: symbol.to_string(),
+                    from_time: None,
+                    source: None,
+                }],
+            )
+            .await
+            .expect("failed to subscribe");
+    }
+    wait_until("both callbacks to fire with the stream gone", || {
+        seen.load(Ordering::SeqCst) == 2
+    })
+    .await;
 
     client.disconnect().await.expect("failed to disconnect");
 }

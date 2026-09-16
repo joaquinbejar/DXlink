@@ -35,6 +35,12 @@ const WAIT_TIMEOUT: Duration = Duration::from_secs(5);
 /// reader queue, so a test proves the whole path rather than one stage of it.
 pub const HISTORY_BURST_BARS: usize = 1500;
 
+/// Bars in a `SmallHistoryBurst` reply: fits the 1024-event reader queue with
+/// room to spare, does not fit a small consumer buffer. The shape that tells a
+/// blocking hand-off apart from a dropping one without the reader stage
+/// getting a say.
+pub const SMALL_HISTORY_BURST_BARS: usize = 300;
+
 /// dxFeed `IndexedEvent` flag on the first event of a snapshot.
 pub const SNAPSHOT_BEGIN: i64 = 0x04;
 
@@ -130,6 +136,8 @@ pub enum Behaviour {
     /// second burst from the rebuilt session, which is how a test proves the
     /// drop counter is one total across reconnects.
     HistoryBurstDroppingFirstSession,
+    /// `HistoryBurst` with `SMALL_HISTORY_BURST_BARS` bars instead.
+    SmallHistoryBurst,
 }
 
 pub struct MockServer {
@@ -438,7 +446,14 @@ impl MockServer {
                                         Behaviour::HistoryBurst
                                             | Behaviour::HistoryBurstDroppingFirstSession
                                     ) {
-                                        history_burst(order, event_type, symbol)
+                                        history_burst(order, event_type, symbol, HISTORY_BURST_BARS)
+                                    } else if behaviour == Behaviour::SmallHistoryBurst {
+                                        history_burst(
+                                            order,
+                                            event_type,
+                                            symbol,
+                                            SMALL_HISTORY_BURST_BARS,
+                                        )
                                     } else {
                                         order
                                             .iter()
@@ -580,15 +595,15 @@ fn redacted(mut messages: Vec<Value>) -> Vec<Value> {
 }
 
 /// One flat COMPACT row holding a whole history snapshot, the way the venue
-/// answers a subscription with `fromTime`: `HISTORY_BURST_BARS` events, newest
-/// first, `SNAPSHOT_BEGIN` on the first and `SNAPSHOT_END` on the last. Every
-/// column other than the flags, `index` and `time` is the usual fixture value.
-fn history_burst(order: &[String], event_type: &str, symbol: &str) -> Vec<Value> {
-    let mut row = Vec::with_capacity(order.len() * HISTORY_BURST_BARS);
-    for position in 0..HISTORY_BURST_BARS {
+/// answers a subscription with `fromTime`: `bars` events, newest first,
+/// `SNAPSHOT_BEGIN` on the first and `SNAPSHOT_END` on the last. Every column
+/// other than the flags, `index` and `time` is the usual fixture value.
+fn history_burst(order: &[String], event_type: &str, symbol: &str, bars: usize) -> Vec<Value> {
+    let mut row = Vec::with_capacity(order.len() * bars);
+    for position in 0..bars {
         let flags = if position == 0 {
             SNAPSHOT_BEGIN
-        } else if position + 1 == HISTORY_BURST_BARS {
+        } else if position + 1 == bars {
             SNAPSHOT_END
         } else {
             0
