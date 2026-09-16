@@ -1836,8 +1836,9 @@ impl DXLinkClient {
     /// Cumulative, so read it as a delta: sample it before a history replay
     /// and again once the `SNAPSHOT_END` marker has arrived. An unchanged
     /// count means nothing overflowed in between, and the marker itself is
-    /// what says the replay is complete. A count that moved means bars were
-    /// lost, and the marker may be among them: size the buffer with
+    /// what says the replay is complete. A count that moved means events were
+    /// lost somewhere on this client, the counter is not per subscription, and
+    /// the marker may be among them: size the buffer with
     /// [`with_event_buffer`](Self::with_event_buffer) and read the stream
     /// sooner.
     ///
