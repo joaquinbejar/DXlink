@@ -2167,8 +2167,10 @@ impl DXLinkClient {
     /// keeps up within that queue's slack (at least 1024 events, or the buffer
     /// size if larger), and anything beyond it is counted exactly as before.
     ///
-    /// Read when the worker is spawned by [`connect`](Self::connect); a value
-    /// set later applies to the next session.
+    /// Read once, when [`connect`](Self::connect) spawns the delivery worker.
+    /// Automatic reconnects keep that worker, since it owns the consumer's
+    /// stream, so a value set after connecting takes effect only after an
+    /// explicit [`disconnect`](Self::disconnect) and a new `connect`.
     ///
     /// Additive: a new method, no existing signature changes.
     ///
