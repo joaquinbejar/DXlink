@@ -1983,15 +1983,11 @@ impl DXLinkClient {
         self.reconnect = Some(policy);
         // Opened here rather than in `connect`, so `connection_states` works the
         // moment a policy exists. A `&self` accessor that answered `None` until
-        // some other call had happened would be a trap.
+        // some other call had happened would be a trap. Only if absent: a
+        // second call must not close the receivers the first one handed out.
         if self.state_sender.is_none() {
-            // Normally already open, from `with_reconnect`. This covers a
-            // reconnect after a `disconnect`, which drops the old one.
-            if self.state_sender.is_none() {
-                let (state_tx, _) =
-                    broadcast::channel::<ConnectionState>(CONNECTION_STATE_CAPACITY);
-                self.state_sender = Some(state_tx);
-            }
+            let (state_tx, _) = broadcast::channel::<ConnectionState>(CONNECTION_STATE_CAPACITY);
+            self.state_sender = Some(state_tx);
         }
     }
 
@@ -2173,8 +2169,17 @@ impl DXLinkClient {
             let (lost_tx, lost_rx) = mpsc::channel::<String>(1);
             self.session_lost_sender = Some(lost_tx);
             self.session_lost_receiver = Some(lost_rx);
-            let (state_tx, _) = broadcast::channel::<ConnectionState>(CONNECTION_STATE_CAPACITY);
-            self.state_sender = Some(state_tx);
+            // Only if `with_reconnect` did not already open it. Replacing it
+            // here dropped the sender behind every receiver taken between
+            // installing the policy and connecting, the very order the docs
+            // recommend, so those receivers saw `Closed` and the session's
+            // states went to a channel nobody held (issue #74). `disconnect`
+            // drops the sender, so a later connect still gets a fresh one.
+            if self.state_sender.is_none() {
+                let (state_tx, _) =
+                    broadcast::channel::<ConnectionState>(CONNECTION_STATE_CAPACITY);
+                self.state_sender = Some(state_tx);
+            }
         }
 
         // Keepalive first: it owns the shutdown channel the reader needs in

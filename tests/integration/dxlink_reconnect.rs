@@ -678,3 +678,74 @@ async fn test_a_slow_consumer_loses_the_middle_not_the_end() {
         seen.len()
     );
 }
+
+/// The documented order is policy, then state stream, then connect. `connect`
+/// used to replace the broadcast sender the policy had opened, so a receiver
+/// taken in that order saw `Closed` and the whole session's states went to a
+/// channel nobody held (issue #74).
+#[tokio::test]
+async fn test_a_state_receiver_taken_before_connect_sees_the_reconnect() {
+    let server = MockServer::start(Behaviour::DropFirstSession).await;
+    let mut client = DXLinkClient::new(&server.url(), "test-token");
+    client.with_reconnect(prompt_policy());
+    // Before connect, as the docs recommend for catching every state.
+    let mut states = client
+        .connection_states()
+        .expect("a policy means a state stream");
+
+    let _stream = client.connect().await.expect("failed to connect");
+    let channel_id = client
+        .create_feed_channel("AUTO")
+        .await
+        .expect("failed to create feed channel");
+    client
+        .setup_feed(channel_id, &[EventType::Quote])
+        .await
+        .expect("failed to set up feed");
+    client
+        .subscribe(channel_id, vec![quote_sub("AAPL")])
+        .await
+        .expect("failed to subscribe");
+
+    wait_for_state(&mut states, "the session to be reported lost", |state| {
+        matches!(state, ConnectionState::Lost { .. })
+    })
+    .await;
+    wait_for_state(&mut states, "the reconnect to complete", |state| {
+        matches!(state, ConnectionState::Reconnected)
+    })
+    .await;
+
+    client.disconnect().await.expect("failed to disconnect");
+}
+
+/// `disconnect` closes the state stream on purpose. A later `connect` on the
+/// same client has to open a new one rather than leave the accessor answering
+/// `None` or handing out a receiver whose sender is gone.
+#[tokio::test]
+async fn test_the_state_stream_reopens_after_a_disconnect_and_connect() {
+    let server = MockServer::start(Behaviour::Normal).await;
+    let mut client = DXLinkClient::new(&server.url(), "test-token");
+    client.with_reconnect(prompt_policy());
+
+    let _first = client.connect().await.expect("failed to connect");
+    client.disconnect().await.expect("failed to disconnect");
+    assert!(
+        client.connection_states().is_none(),
+        "the state stream ends with the session"
+    );
+
+    let _second = client.connect().await.expect("failed to reconnect");
+    let mut states = client
+        .connection_states()
+        .expect("a connect after a disconnect reopens the state stream");
+    assert!(
+        matches!(
+            states.try_recv(),
+            Err(broadcast::error::TryRecvError::Empty)
+        ),
+        "the new stream must be live, not closed"
+    );
+
+    client.disconnect().await.expect("failed to disconnect");
+}
