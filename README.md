@@ -202,8 +202,10 @@ The bars carry dxFeed's `IndexedEvent` flags in
 [`CandleEvent::event_flags`](events::CandleEvent::event_flags): `0x04`
 (`SNAPSHOT_BEGIN`) on the first bar and `0x08` (`SNAPSHOT_END`) on the last,
 which is how a consumer tells a finished replay from one still loading.
-Check [`DXLinkClient::dropped_event_count`] once the terminator is in: zero
-means the replay is complete.
+[`DXLinkClient::dropped_event_count`] is cumulative, so sample it before
+subscribing and again once the terminator is in: an unchanged count means
+nothing overflowed during the replay, and the terminator is what says the
+replay is complete.
 
 ### Error Handling
 

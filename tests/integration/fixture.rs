@@ -569,11 +569,6 @@ fn redacted(mut messages: Vec<Value>) -> Vec<Value> {
     messages
 }
 
-/// The value the server reports for one COMPACT column.
-///
-/// Keyed by wire field name so the row can be assembled in whatever order the
-/// client requested. An unrecognised column panics here rather than being
-/// filled in: see the arm at the bottom for why.
 /// One flat COMPACT row holding a whole history snapshot, the way the venue
 /// answers a subscription with `fromTime`: `HISTORY_BURST_BARS` events, newest
 /// first, `SNAPSHOT_BEGIN` on the first and `SNAPSHOT_END` on the last. Every
@@ -602,6 +597,11 @@ fn history_burst(order: &[String], event_type: &str, symbol: &str) -> Vec<Value>
     row
 }
 
+/// The value the server reports for one COMPACT column.
+///
+/// Keyed by wire field name so the row can be assembled in whatever order the
+/// client requested. An unrecognised column panics here rather than being
+/// filled in: see the arm at the bottom for why.
 fn field_value(field: &str, event_type: &str, symbol: &str) -> Value {
     match field {
         "eventType" => json!(event_type),
