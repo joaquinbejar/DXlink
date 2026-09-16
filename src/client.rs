@@ -1833,9 +1833,11 @@ impl DXLinkClient {
     /// rather than stall the reader, see [`event_stream`](Self::event_stream).
     /// A reconnect keeps adding to the same total.
     ///
-    /// Zero means every decoded event was handed to the consumer. Anything
-    /// else after a history replay means the replay is incomplete, and its
-    /// `SNAPSHOT_END` marker may be among the missing: size the buffer with
+    /// Cumulative, so read it as a delta: sample it before a history replay
+    /// and again once the `SNAPSHOT_END` marker has arrived. An unchanged
+    /// count means nothing overflowed in between, and the marker itself is
+    /// what says the replay is complete. A count that moved means bars were
+    /// lost, and the marker may be among them: size the buffer with
     /// [`with_event_buffer`](Self::with_event_buffer) and read the stream
     /// sooner.
     ///
@@ -2061,8 +2063,13 @@ impl DXLinkClient {
     /// sized to at least this value, so a burst that fits the stream is not
     /// lost upstream of it. Memory is allocated as events arrive, not up front.
     ///
-    /// Must be called before [`connect`](Self::connect); afterwards it has no
-    /// effect on the running session. A zero is rejected.
+    /// Must be called before the stream exists, that is before
+    /// [`connect`](Self::connect) or an explicit
+    /// [`event_stream`](Self::event_stream) call; once the channel has been
+    /// created a new size is refused rather than silently ignored. Zero and
+    /// anything above tokio's channel limit
+    /// ([`Semaphore::MAX_PERMITS`](tokio::sync::Semaphore::MAX_PERMITS)) are
+    /// rejected here instead of panicking later.
     ///
     /// Additive: a new method, no existing signature changes.
     ///
@@ -2080,6 +2087,22 @@ impl DXLinkClient {
         if capacity == 0 {
             return Err(DXLinkError::Protocol(
                 "event buffer capacity must be greater than zero".to_string(),
+            ));
+        }
+        // tokio's bounded channel sits on a semaphore with a hard ceiling and
+        // panics above it. A fallible builder must not defer that to the
+        // moment the stream is created.
+        if capacity > tokio::sync::Semaphore::MAX_PERMITS {
+            return Err(DXLinkError::Protocol(format!(
+                "event buffer capacity must be at most {}",
+                tokio::sync::Semaphore::MAX_PERMITS
+            )));
+        }
+        // The channel is built when the stream is taken, so a size set after
+        // that would be accepted and never applied.
+        if self.event_stream_taken {
+            return Err(DXLinkError::Protocol(
+                "event buffer capacity must be set before the event stream is created".to_string(),
             ));
         }
         self.event_buffer = capacity;
@@ -3230,6 +3253,36 @@ mod tests {
 
         let stream = client.event_stream().expect("first take succeeds");
         assert_eq!(stream.max_capacity(), 16);
+    }
+
+    /// tokio panics on a capacity above its semaphore ceiling; a fallible
+    /// builder has to refuse it up front rather than defer the panic to
+    /// `event_stream()`.
+    #[test]
+    fn test_with_event_buffer_rejects_a_capacity_tokio_cannot_allocate() {
+        let result =
+            DXLinkClient::new("wss://test.url", "test_token").with_event_buffer(usize::MAX);
+        match result {
+            Err(DXLinkError::Protocol(msg)) => assert!(msg.contains("at most")),
+            Ok(_) => panic!("a capacity above tokio's limit must be rejected"),
+            Err(other) => panic!("expected a Protocol error, got {other:?}"),
+        }
+    }
+
+    /// The channel is built when the stream is taken, so a size set after that
+    /// would be accepted and never applied. Refusing it is the honest answer.
+    #[test]
+    fn test_with_event_buffer_is_refused_once_the_stream_exists() {
+        let mut client = DXLinkClient::new("wss://test.url", "test_token");
+        let _stream = client.event_stream().expect("first take succeeds");
+
+        match client.with_event_buffer(16) {
+            Err(DXLinkError::Protocol(msg)) => {
+                assert!(msg.contains("before the event stream"))
+            }
+            Ok(_) => panic!("resizing an existing stream must be rejected"),
+            Err(other) => panic!("expected a Protocol error, got {other:?}"),
+        }
     }
 
     #[test]
