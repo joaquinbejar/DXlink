@@ -30,6 +30,22 @@ use tokio_tungstenite::tungstenite::Message;
 /// How long a `wait_for` may block before the test is declared failed.
 const WAIT_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// Bars in a `HistoryBurst` reply: about a day of 1-minute bars, and more than
+/// both the 100-event stream the client used to hand out and the 1024-event
+/// reader queue, so a test proves the whole path rather than one stage of it.
+pub const HISTORY_BURST_BARS: usize = 1500;
+
+/// dxFeed `IndexedEvent` flag on the first event of a snapshot.
+pub const SNAPSHOT_BEGIN: i64 = 0x04;
+
+/// dxFeed `IndexedEvent` flag on the last event of a snapshot. Losing the event
+/// that carries it leaves a consumer unable to tell a finished replay from one
+/// still loading.
+pub const SNAPSHOT_END: i64 = 0x08;
+
+/// Milliseconds between two consecutive bars of a `HistoryBurst`.
+const HISTORY_BURST_PERIOD_MS: i64 = 5 * 60 * 1000;
+
 /// What the server does beyond answering the protocol normally.
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub enum Behaviour {
@@ -104,6 +120,16 @@ pub enum Behaviour {
     /// to assume. Lets a test prove the negotiated value is honoured without
     /// waiting a minute for it.
     ShortKeepalive,
+    /// Answer every subscription with a whole history snapshot in one
+    /// `FEED_DATA`: `HISTORY_BURST_BARS` bars, newest first, `SNAPSHOT_BEGIN`
+    /// on the first and `SNAPSHOT_END` on the last. What the venue does for a
+    /// `fromTime` subscription, and what issue #71 is about.
+    HistoryBurst,
+    /// `HistoryBurst` on every session, and like `DropFirstSession` hang up
+    /// once the first session is subscribed. The replayed subscription draws a
+    /// second burst from the rebuilt session, which is how a test proves the
+    /// drop counter is one total across reconnects.
+    HistoryBurstDroppingFirstSession,
 }
 
 pub struct MockServer {
@@ -407,10 +433,18 @@ impl MockServer {
                                             "eventFields": { event_type: order.clone() }
                                         }));
                                     }
-                                    let row: Vec<Value> = order
-                                        .iter()
-                                        .map(|field| field_value(field, event_type, symbol))
-                                        .collect();
+                                    let row: Vec<Value> = if matches!(
+                                        behaviour,
+                                        Behaviour::HistoryBurst
+                                            | Behaviour::HistoryBurstDroppingFirstSession
+                                    ) {
+                                        history_burst(order, event_type, symbol)
+                                    } else {
+                                        order
+                                            .iter()
+                                            .map(|field| field_value(field, event_type, symbol))
+                                            .collect()
+                                    };
                                     responses.push(json!({
                                         "channel": channel,
                                         "type": "FEED_DATA",
@@ -426,6 +460,7 @@ impl MockServer {
                                         | Behaviour::SilentOnReconnect
                                         | Behaviour::IgnoreFeedSetupOnReconnect
                                         | Behaviour::RefuseAfterFirstSession
+                                        | Behaviour::HistoryBurstDroppingFirstSession
                                 ) && sessions_served == 1);
                         }
                         "CHANNEL_CANCEL" => responses.push(json!({
@@ -542,6 +577,34 @@ fn redacted(mut messages: Vec<Value>) -> Vec<Value> {
 
     messages.iter_mut().for_each(mask);
     messages
+}
+
+/// One flat COMPACT row holding a whole history snapshot, the way the venue
+/// answers a subscription with `fromTime`: `HISTORY_BURST_BARS` events, newest
+/// first, `SNAPSHOT_BEGIN` on the first and `SNAPSHOT_END` on the last. Every
+/// column other than the flags, `index` and `time` is the usual fixture value.
+fn history_burst(order: &[String], event_type: &str, symbol: &str) -> Vec<Value> {
+    let mut row = Vec::with_capacity(order.len() * HISTORY_BURST_BARS);
+    for position in 0..HISTORY_BURST_BARS {
+        let flags = if position == 0 {
+            SNAPSHOT_BEGIN
+        } else if position + 1 == HISTORY_BURST_BARS {
+            SNAPSHOT_END
+        } else {
+            0
+        };
+        // Descending: time series snapshots replay from the newest bar back.
+        let time = expected::TIME - position as i64 * HISTORY_BURST_PERIOD_MS;
+        for field in order {
+            row.push(match field.as_str() {
+                "eventFlags" => json!(flags),
+                "index" => json!(time),
+                "time" => json!(time),
+                other => field_value(other, event_type, symbol),
+            });
+        }
+    }
+    row
 }
 
 /// The value the server reports for one COMPACT column.

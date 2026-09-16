@@ -16,6 +16,7 @@ use crate::utils::try_parse_negotiated;
 
 use std::collections::HashMap;
 use std::fmt;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::broadcast;
@@ -63,13 +64,32 @@ const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 /// How long shutdown waits for a cooperative step before forcing it.
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
 
-/// Capacity of the queue between the socket reader and the delivery worker.
+/// Floor for the capacity of the queue between the socket reader and the
+/// delivery worker.
 ///
-/// Generous: it only has to absorb a burst while the worker is inside a user
-/// callback. When it does fill, events are dropped rather than blocking the
-/// reader, because a blocked reader stops answering protocol traffic and makes
-/// unrelated channel operations time out.
+/// It only has to absorb a burst while the worker is inside a user callback.
+/// When it does fill, events are dropped rather than blocking the reader,
+/// because a blocked reader stops answering protocol traffic and makes
+/// unrelated channel operations time out. The queue is never smaller than the
+/// consumer's stream: the reader hands a whole decoded `FEED_DATA` batch over
+/// without yielding, so a burst that fits the stream must fit here first or it
+/// is lost before the consumer had any say.
 const DELIVERY_QUEUE_CAPACITY: usize = 1024;
+
+/// Default capacity of the consumer's event stream, in events.
+///
+/// Sized for a history replay, not for live ticks. The venue answers a Candle
+/// subscription with `fromTime` in one burst: a 24-hour window of 1-minute bars
+/// is 1440 events per symbol, and a consumer that subscribes several
+/// symbols in sequence has the first replays land before its read loop starts.
+/// The previous 100 lost the tail of any such burst, and the tail is where the
+/// `SNAPSHOT_END` marker lives, so the consumer could never tell a finished
+/// replay from one still loading. Configurable with
+/// [`DXLinkClient::with_event_buffer`].
+const DEFAULT_EVENT_BUFFER: usize = 8192;
+
+// A day of 1-minute bars is the workload the default exists for.
+const _: () = assert!(DEFAULT_EVENT_BUFFER >= 1440);
 
 /// The shortest a reconnect will ever wait between attempts.
 ///
@@ -297,6 +317,9 @@ struct ReaderSetup {
     /// default behaviour exactly as it was: the task exits and nothing tries to
     /// rebuild anything.
     session_lost: Option<mpsc::Sender<String>>,
+    /// Every event that never reached the consumer, shared with the client so
+    /// [`DXLinkClient::dropped_event_count`] can report it.
+    dropped_events: Arc<AtomicU64>,
 }
 
 /// Spawns the task that reads the socket and routes protocol traffic.
@@ -313,10 +336,13 @@ fn spawn_reader(setup: ReaderSetup) -> JoinHandle<()> {
         channel_schemas,
         receive_deadline,
         session_lost,
+        dropped_events,
     } = setup;
 
     tokio::spawn(async move {
-        let mut dropped_events: u64 = 0;
+        // This reader's own tally, for pacing the log line. The shared counter
+        // is what the consumer reads, and it outlives any one reader.
+        let mut dropped_here: u64 = 0;
 
         // The loop yields the reason it ended for, so there is no initial value
         // to be overwritten unread. Only the paths where the session is
@@ -504,12 +530,13 @@ fn spawn_reader(setup: ReaderSetup) -> JoinHandle<()> {
                                         match delivery_tx.try_send(event) {
                                             Ok(()) => {}
                                             Err(mpsc::error::TrySendError::Full(_)) => {
-                                                dropped_events += 1;
-                                                if dropped_events.is_power_of_two() {
+                                                dropped_here += 1;
+                                                dropped_events.fetch_add(1, Ordering::Relaxed);
+                                                if dropped_here.is_power_of_two() {
                                                     warn!(
                                                         "Delivery queue full, {} event(s) dropped so far; \
                                                              the consumer is slower than the feed",
-                                                        dropped_events
+                                                        dropped_here
                                                     );
                                                 }
                                             }
@@ -866,6 +893,9 @@ struct ReconnectContext {
     /// The slots the rebuilt session's tasks go into, so `disconnect` owns them
     /// rather than the supervisor detaching them.
     session_tasks: SessionTasks,
+    /// The client's drop counter, so a rebuilt reader keeps adding to the same
+    /// total the consumer is reading.
+    dropped_events: Arc<AtomicU64>,
 }
 
 /// Rebuilds a session on the connection that is already installed: reopens
@@ -1040,6 +1070,7 @@ async fn reconnect_once(
         channel_schemas: ctx.channel_schemas.clone(),
         receive_deadline: Duration::from_secs(u64::from(ctx.keepalive_timeout)),
         session_lost: Some(session_lost),
+        dropped_events: ctx.dropped_events.clone(),
     });
 
     match replay_session(ctx).await {
@@ -1646,6 +1677,12 @@ pub struct DXLinkClient {
     /// Set once the event stream has been handed out, so it cannot be taken
     /// twice even after the sender has moved into the delivery worker.
     event_stream_taken: bool,
+    /// Capacity of the event stream handed to the consumer, in events. Also the
+    /// floor for the reader-to-worker queue, see `DELIVERY_QUEUE_CAPACITY`.
+    event_buffer: usize,
+    /// Events that never reached the consumer, from either queue, since this
+    /// client was created. Shared with every reader and the delivery worker.
+    dropped_events: Arc<AtomicU64>,
     /// Why the session ended, once it has. Shared with the reader, which is
     /// where the terminal error is observed.
     disconnect_reason: Arc<Mutex<Option<String>>>,
@@ -1720,6 +1757,8 @@ impl DXLinkClient {
             session_tasks: SessionTasks::default(),
             delivery_handle: None,
             event_stream_taken: false,
+            event_buffer: DEFAULT_EVENT_BUFFER,
+            dropped_events: Arc::new(AtomicU64::new(0)),
             disconnect_reason: Arc::new(Mutex::new(None)),
             response_requests: Arc::new(Mutex::new(Vec::new())),
             next_request_id: Arc::new(Mutex::new(0)),
@@ -1785,6 +1824,29 @@ impl DXLinkClient {
             .unwrap_or(0)
     }
 
+    /// How many events were dropped instead of reaching the consumer, since
+    /// this client was created.
+    ///
+    /// Counts both places an event can be lost: the queue between the socket
+    /// reader and the delivery worker, and the stream returned by
+    /// [`connect`](Self::connect). Both are bounded and both drop on overflow
+    /// rather than stall the reader, see [`event_stream`](Self::event_stream).
+    /// A reconnect keeps adding to the same total.
+    ///
+    /// Cumulative, so read it as a delta: sample it before a history replay
+    /// and again once the `SNAPSHOT_END` marker has arrived. An unchanged
+    /// count means nothing overflowed in between, and the marker itself is
+    /// what says the replay is complete. A count that moved means events were
+    /// lost somewhere on this client, the counter is not per subscription, and
+    /// the marker may be among them: size the buffer with
+    /// [`with_event_buffer`](Self::with_event_buffer) and read the stream
+    /// sooner.
+    ///
+    /// Additive: a new method, no existing signature changes.
+    pub fn dropped_event_count(&self) -> u64 {
+        self.dropped_events.load(Ordering::Relaxed)
+    }
+
     /// Spawns the worker that runs consumer callbacks and feeds the event
     /// stream, and returns the queue the socket reader hands events to.
     ///
@@ -1799,9 +1861,14 @@ impl DXLinkClient {
     /// it is current, so blocking the reader to preserve a stale quote is the
     /// wrong trade.
     fn start_event_delivery(&mut self) -> Sender<MarketEvent> {
-        let (delivery_tx, mut delivery_rx) = mpsc::channel::<MarketEvent>(DELIVERY_QUEUE_CAPACITY);
+        // At least as deep as the consumer's stream: the reader pushes a whole
+        // decoded batch here without yielding, so a burst the consumer asked
+        // to buffer has to fit at this stage too or it never gets that far.
+        let (delivery_tx, mut delivery_rx) =
+            mpsc::channel::<MarketEvent>(DELIVERY_QUEUE_CAPACITY.max(self.event_buffer));
 
         let callbacks = self.callbacks.clone();
+        let dropped_events = self.dropped_events.clone();
         // Taken, not cloned: the worker becomes the only owner, so when it ends
         // the channel closes and the consumer's recv() returns None. That is the
         // signal that the session is over.
@@ -1809,6 +1876,8 @@ impl DXLinkClient {
 
         let handle = tokio::spawn(async move {
             let mut stream_closed_reported = false;
+            // Paces the log line; the shared counter is the consumer's view.
+            let mut dropped_here: u64 = 0;
 
             while let Some(event) = delivery_rx.recv().await {
                 // Borrowed, not cloned: this runs per event on a hot path.
@@ -1839,12 +1908,23 @@ impl DXLinkClient {
                     match tx.try_send(event) {
                         Ok(()) => {}
                         Err(mpsc::error::TrySendError::Full(returned)) => {
-                            // try_send hands the event back, so the symbol is
-                            // still available without having cloned it up front.
-                            debug!(
-                                "Event stream full, dropping an event for {}",
-                                symbol_of(&returned)
-                            );
+                            // Counted and warned like the reader's queue: a
+                            // per-event debug line was invisible in practice,
+                            // and a history replay losing its tail here is a
+                            // consumer waiting forever for a snapshot end that
+                            // was decoded and then thrown away.
+                            dropped_here += 1;
+                            dropped_events.fetch_add(1, Ordering::Relaxed);
+                            if dropped_here.is_power_of_two() {
+                                // try_send hands the event back, so the symbol
+                                // is still available without a clone up front.
+                                warn!(
+                                    "Event stream full, {} event(s) dropped so far (latest for {}); \
+                                     the consumer is not draining event_stream()",
+                                    dropped_here,
+                                    symbol_of(&returned)
+                                );
+                            }
                         }
                         Err(mpsc::error::TrySendError::Closed(_)) => {
                             // The consumer dropped its receiver. Callbacks still
@@ -1965,6 +2045,68 @@ impl DXLinkClient {
             ));
         }
         self.keepalive_timeout = seconds;
+        Ok(self)
+    }
+
+    /// Sets how many events the stream returned by [`connect`](Self::connect)
+    /// buffers ahead of the consumer.
+    ///
+    /// The default, 8192, absorbs a typical history replay: a 24-hour window of
+    /// 1-minute Candle bars is 1440 events per symbol, delivered as one
+    /// burst the moment the subscription is accepted, often before the
+    /// consumer's read loop has started. When the buffer is full the library
+    /// **drops** rather than blocks, so a burst larger than the buffer loses
+    /// its tail, and with it the `SNAPSHOT_END` marker. Size it for the largest
+    /// replay you subscribe to, or read the stream before subscribing. Loss is
+    /// reported by [`dropped_event_count`](Self::dropped_event_count).
+    ///
+    /// The internal queue between the socket reader and the delivery worker is
+    /// sized to at least this value, so a burst that fits the stream is not
+    /// lost upstream of it. Memory is allocated as events arrive, not up front.
+    ///
+    /// Must be called before the stream exists, that is before
+    /// [`connect`](Self::connect) or an explicit
+    /// [`event_stream`](Self::event_stream) call; once the channel has been
+    /// created a new size is refused rather than silently ignored. Zero and
+    /// anything above tokio's channel limit
+    /// ([`Semaphore::MAX_PERMITS`](tokio::sync::Semaphore::MAX_PERMITS)) are
+    /// rejected here instead of panicking later.
+    ///
+    /// Additive: a new method, no existing signature changes.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use dxlink::DXLinkClient;
+    ///
+    /// // Room for a week of 1-minute bars on a couple of symbols.
+    /// let client = DXLinkClient::new("wss://example.com", "token")
+    ///     .with_event_buffer(32_768)
+    ///     .expect("a non-zero capacity is valid");
+    /// ```
+    pub fn with_event_buffer(mut self, capacity: usize) -> DXLinkResult<Self> {
+        if capacity == 0 {
+            return Err(DXLinkError::Protocol(
+                "event buffer capacity must be greater than zero".to_string(),
+            ));
+        }
+        // tokio's bounded channel sits on a semaphore with a hard ceiling and
+        // panics above it. A fallible builder must not defer that to the
+        // moment the stream is created.
+        if capacity > tokio::sync::Semaphore::MAX_PERMITS {
+            return Err(DXLinkError::Protocol(format!(
+                "event buffer capacity must be at most {}",
+                tokio::sync::Semaphore::MAX_PERMITS
+            )));
+        }
+        // The channel is built when the stream is taken, so a size set after
+        // that would be accepted and never applied.
+        if self.event_stream_taken {
+            return Err(DXLinkError::Protocol(
+                "event buffer capacity must be set before the event stream is created".to_string(),
+            ));
+        }
+        self.event_buffer = capacity;
         Ok(self)
     }
 
@@ -2118,6 +2260,7 @@ impl DXLinkClient {
             // Only when a supervisor is going to listen. A sender with no
             // receiver would make the reader do work for nobody.
             session_lost: self.session_lost_sender.clone(),
+            dropped_events: self.dropped_events.clone(),
         });
         *recover(&self.session_tasks.reader) = Some(reader);
 
@@ -2161,6 +2304,7 @@ impl DXLinkClient {
             disconnect_reason: self.disconnect_reason.clone(),
             delivery_tx,
             session_tasks: self.session_tasks.clone(),
+            dropped_events: self.dropped_events.clone(),
         };
 
         // Cloned, not taken: a consumer can subscribe at any time, so the client
@@ -2767,16 +2911,24 @@ impl DXLinkClient {
     /// behind**, rather than the library blocking to preserve them. A blocked
     /// consumer would otherwise stall the socket reader and make unrelated
     /// channel operations time out, and a quote that arrives late is worth less
-    /// than the connection staying responsive. Drops are logged. If you cannot
-    /// afford to miss events, drain this receiver into your own unbounded
-    /// buffer as soon as it yields.
+    /// than the connection staying responsive.
+    ///
+    /// The bound is 8192 events by default and set with
+    /// [`with_event_buffer`](Self::with_event_buffer). It matters most for
+    /// history replays, which arrive as one burst before most consumers start
+    /// reading: a burst larger than the buffer loses its tail, and the tail
+    /// carries the `SNAPSHOT_END` marker. Every drop is counted in
+    /// [`dropped_event_count`](Self::dropped_event_count) and logged at `warn`
+    /// with a running total, so a loss is never silent. If you cannot afford to
+    /// miss events, size the buffer for your largest replay or drain this
+    /// receiver into your own unbounded buffer as soon as it yields.
     pub fn event_stream(&mut self) -> DXLinkResult<Receiver<MarketEvent>> {
         if self.event_stream_taken {
             return Err(DXLinkError::Protocol(
                 "Event stream already created".to_string(),
             ));
         }
-        let (tx, rx) = mpsc::channel(100); // Buffer of 100 events
+        let (tx, rx) = mpsc::channel(self.event_buffer);
         self.event_sender = Some(tx);
         self.event_stream_taken = true;
         Ok(rx)
@@ -2891,6 +3043,8 @@ impl fmt::Debug for DXLinkClient {
         };
         debug_struct.field("subscription_count", &subscription_count);
         debug_struct.field("has_event_sender", &self.event_sender.is_some());
+        debug_struct.field("event_buffer", &self.event_buffer);
+        debug_struct.field("dropped_events", &self.dropped_event_count());
         debug_struct.field(
             "keepalive_active",
             &recover(&self.session_tasks.keepalive).is_some(),
@@ -3077,6 +3231,68 @@ mod tests {
                 assert!(msg.contains("Event stream already created"));
             }
             _ => panic!("Expected Protocol error"),
+        }
+    }
+
+    /// The default has to hold a history replay: the old 100 lost the tail of
+    /// a 24-hour, 1-minute Candle window (issue #71).
+    #[test]
+    fn test_event_stream_uses_the_default_buffer() {
+        let mut client = DXLinkClient::new("wss://test.url", "test_token");
+        assert_eq!(client.event_buffer, DEFAULT_EVENT_BUFFER);
+
+        let stream = client.event_stream().expect("first take succeeds");
+        assert_eq!(stream.max_capacity(), DEFAULT_EVENT_BUFFER);
+        assert_eq!(client.dropped_event_count(), 0);
+    }
+
+    #[test]
+    fn test_with_event_buffer_sizes_the_stream() {
+        let mut client = DXLinkClient::new("wss://test.url", "test_token")
+            .with_event_buffer(16)
+            .expect("a non-zero capacity is valid");
+
+        let stream = client.event_stream().expect("first take succeeds");
+        assert_eq!(stream.max_capacity(), 16);
+    }
+
+    /// tokio panics on a capacity above its semaphore ceiling; a fallible
+    /// builder has to refuse it up front rather than defer the panic to
+    /// `event_stream()`.
+    #[test]
+    fn test_with_event_buffer_rejects_a_capacity_tokio_cannot_allocate() {
+        let result =
+            DXLinkClient::new("wss://test.url", "test_token").with_event_buffer(usize::MAX);
+        match result {
+            Err(DXLinkError::Protocol(msg)) => assert!(msg.contains("at most")),
+            Ok(_) => panic!("a capacity above tokio's limit must be rejected"),
+            Err(other) => panic!("expected a Protocol error, got {other:?}"),
+        }
+    }
+
+    /// The channel is built when the stream is taken, so a size set after that
+    /// would be accepted and never applied. Refusing it is the honest answer.
+    #[test]
+    fn test_with_event_buffer_is_refused_once_the_stream_exists() {
+        let mut client = DXLinkClient::new("wss://test.url", "test_token");
+        let _stream = client.event_stream().expect("first take succeeds");
+
+        match client.with_event_buffer(16) {
+            Err(DXLinkError::Protocol(msg)) => {
+                assert!(msg.contains("before the event stream"))
+            }
+            Ok(_) => panic!("resizing an existing stream must be rejected"),
+            Err(other) => panic!("expected a Protocol error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_with_event_buffer_rejects_zero() {
+        let result = DXLinkClient::new("wss://test.url", "test_token").with_event_buffer(0);
+        match result {
+            Err(DXLinkError::Protocol(msg)) => assert!(msg.contains("greater than zero")),
+            Ok(_) => panic!("a zero-capacity stream must be rejected"),
+            Err(other) => panic!("expected a Protocol error, got {other:?}"),
         }
     }
 
