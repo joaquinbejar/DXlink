@@ -21,6 +21,10 @@ to DXLink servers, subscribing to market events, and processing real-time market
   `TheoPrice`, `TradeETH` and `Series`**, each with the full field set the
   dxFeed schema defines for it.
 - Both delivery styles: a per-symbol callback and a single event stream.
+  The stream is bounded, 8192 events by default and sized with
+  [`DXLinkClient::with_event_buffer`]; when it overflows the library drops
+  rather than blocks, counts every loss in
+  [`DXLinkClient::dropped_event_count`] and logs it at `warn`.
 - Historical data via `from_time` on a `Candle` subscription, decoded into
   OHLC bars.
 - Typed errors ([`DXLinkError`]) with [`DXLinkError::is_terminal`] to tell a
@@ -184,6 +188,22 @@ let candle_subscription = FeedSubscription {
     source: None,
 };
 ```
+
+A history replay arrives as **one burst** the moment the subscription is
+accepted: a 24-hour window of 5-minute bars is about 1440 events per symbol,
+and subscribing several symbols in sequence has the first replays land
+before the read loop starts. The stream buffers 8192 events by default, so
+that fits; for larger windows or many symbols size it with
+[`DXLinkClient::with_event_buffer`] before connecting, or take the stream
+and start reading before subscribing. A burst larger than the buffer loses
+its **tail**, and the tail is where the snapshot terminator lives.
+
+The bars carry dxFeed's `IndexedEvent` flags in
+[`CandleEvent::event_flags`](events::CandleEvent::event_flags): `0x04`
+(`SNAPSHOT_BEGIN`) on the first bar and `0x08` (`SNAPSHOT_END`) on the last,
+which is how a consumer tells a finished replay from one still loading.
+Check [`DXLinkClient::dropped_event_count`] once the terminator is in: zero
+means the replay is complete.
 
 ### Error Handling
 
