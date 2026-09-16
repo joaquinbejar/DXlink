@@ -352,6 +352,10 @@ async fn test_block_mode_loses_only_what_the_reader_queue_cannot_hold() {
     let (mut stream, channel_id) = open_candle_feed(&mut client).await;
     subscribe_to_history(&mut client, channel_id).await;
 
+    // Exact, not a bound: this is a current-thread runtime and the reader
+    // hands a decoded batch over without yielding, so all 1500 try_sends run
+    // before the worker gets to pull anything out of the queue. The queue
+    // keeps its first 1024 and the rest are counted right there.
     wait_until("the reader queue's overflow to be counted", || {
         client.dropped_event_count() == reader_overflow
     })

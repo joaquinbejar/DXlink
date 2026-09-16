@@ -707,8 +707,14 @@ async fn test_a_state_receiver_taken_before_connect_sees_the_reconnect() {
         .await
         .expect("failed to subscribe");
 
+    // The whole sequence, in order: a receiver that only got the ends would
+    // still have missed a state on the way.
     wait_for_state(&mut states, "the session to be reported lost", |state| {
         matches!(state, ConnectionState::Lost { .. })
+    })
+    .await;
+    wait_for_state(&mut states, "the first attempt to be announced", |state| {
+        matches!(state, ConnectionState::Reconnecting { attempt: 1, .. })
     })
     .await;
     wait_for_state(&mut states, "the reconnect to complete", |state| {

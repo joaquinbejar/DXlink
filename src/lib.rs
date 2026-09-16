@@ -198,8 +198,9 @@
 //! before the read loop starts. The stream buffers 8192 events by default, so
 //! that fits; for larger windows or many symbols size it with
 //! [`DXLinkClient::with_event_buffer`] before connecting, or take the stream
-//! and start reading before subscribing. A burst larger than the buffer loses
-//! its **tail**, and the tail is where the snapshot terminator lives.
+//! and start reading before subscribing. Under the default policy a burst
+//! larger than the buffer loses its **tail**, and the tail is where the
+//! snapshot terminator lives.
 //!
 //! The bars carry dxFeed's `IndexedEvent` flags in
 //! [`CandleEvent::event_flags`](events::CandleEvent::event_flags): `0x04`

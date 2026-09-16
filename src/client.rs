@@ -1855,9 +1855,11 @@ impl DXLinkClient {
     /// this client was created.
     ///
     /// Counts both places an event can be lost: the queue between the socket
-    /// reader and the delivery worker, and the stream returned by
-    /// [`connect`](Self::connect). Both are bounded and both drop on overflow
-    /// rather than stall the reader, see [`event_stream`](Self::event_stream).
+    /// reader and the delivery worker, which always drops on overflow rather
+    /// than stall the reader, and the stream returned by
+    /// [`connect`](Self::connect), which drops under the default
+    /// [`OverflowPolicy::Drop`] and waits instead under
+    /// [`OverflowPolicy::Block`], see [`event_stream`](Self::event_stream).
     /// A reconnect keeps adding to the same total.
     ///
     /// Cumulative, so read it as a delta: sample it before a history replay
@@ -2086,11 +2088,14 @@ impl DXLinkClient {
     /// The default, 8192, absorbs a typical history replay: a 24-hour window of
     /// 1-minute Candle bars is 1440 events per symbol, delivered as one
     /// burst the moment the subscription is accepted, often before the
-    /// consumer's read loop has started. When the buffer is full the library
-    /// **drops** rather than blocks, so a burst larger than the buffer loses
-    /// its tail, and with it the `SNAPSHOT_END` marker. Size it for the largest
-    /// replay you subscribe to, or read the stream before subscribing. Loss is
-    /// reported by [`dropped_event_count`](Self::dropped_event_count).
+    /// consumer's read loop has started. Under the default
+    /// [`OverflowPolicy::Drop`] a full buffer **drops** rather than blocks, so a
+    /// burst larger than the buffer loses its tail, and with it the
+    /// `SNAPSHOT_END` marker. Size it for the largest replay you subscribe to,
+    /// or read the stream before subscribing. Loss is reported by
+    /// [`dropped_event_count`](Self::dropped_event_count). Under
+    /// [`OverflowPolicy::Block`] the buffer only decides how far the worker
+    /// gets ahead before it waits.
     ///
     /// The internal queue between the socket reader and the delivery worker is
     /// sized to at least this value, so a burst that fits the stream is not
@@ -2986,11 +2991,12 @@ impl DXLinkClient {
     ///
     /// # Backpressure
     ///
-    /// The stream is bounded and **events are dropped when the consumer falls
-    /// behind**, rather than the library blocking to preserve them. A blocked
-    /// consumer would otherwise stall the socket reader and make unrelated
-    /// channel operations time out, and a quote that arrives late is worth less
-    /// than the connection staying responsive.
+    /// The stream is bounded and, under the default [`OverflowPolicy::Drop`],
+    /// **events are dropped when the consumer falls behind** rather than the
+    /// library blocking to preserve them. A blocked consumer would otherwise
+    /// stall the socket reader and make unrelated channel operations time out,
+    /// and a quote that arrives late is worth less than the connection staying
+    /// responsive.
     ///
     /// The bound is 8192 events by default and set with
     /// [`with_event_buffer`](Self::with_event_buffer). It matters most for
@@ -3004,8 +3010,13 @@ impl DXLinkClient {
     ///
     /// Dropping is a policy, not a law:
     /// [`with_overflow_policy`](Self::with_overflow_policy) switches this stage
-    /// to [`OverflowPolicy::Block`], where the worker waits for room instead.
-    /// Read its caveats before opting in.
+    /// to [`OverflowPolicy::Block`], where the delivery worker waits for room
+    /// instead. The socket reader still never waits, so protocol operations
+    /// keep completing, but callbacks registered with
+    /// [`on_event`](Self::on_event) are delivered by that same worker: a
+    /// consumer on `Block` that keeps this receiver alive without reading it
+    /// parks the worker once the buffer is full and its callbacks stop with it.
+    /// Drop the receiver you do not read, or stay on `Drop`.
     pub fn event_stream(&mut self) -> DXLinkResult<Receiver<MarketEvent>> {
         if self.event_stream_taken {
             return Err(DXLinkError::Protocol(
