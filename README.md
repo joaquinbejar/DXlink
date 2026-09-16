@@ -190,7 +190,7 @@ let candle_subscription = FeedSubscription {
 ```
 
 A history replay arrives as **one burst** the moment the subscription is
-accepted: a 24-hour window of 5-minute bars is about 1440 events per symbol,
+accepted: a 24-hour window of 1-minute bars is 1440 events per symbol,
 and subscribing several symbols in sequence has the first replays land
 before the read loop starts. The stream buffers 8192 events by default, so
 that fits; for larger windows or many symbols size it with

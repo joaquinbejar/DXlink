@@ -79,8 +79,8 @@ const DELIVERY_QUEUE_CAPACITY: usize = 1024;
 /// Default capacity of the consumer's event stream, in events.
 ///
 /// Sized for a history replay, not for live ticks. The venue answers a Candle
-/// subscription with `fromTime` in one burst: a 24-hour window of 5-minute bars
-/// is about 1440 events per symbol, and a consumer that subscribes several
+/// subscription with `fromTime` in one burst: a 24-hour window of 1-minute bars
+/// is 1440 events per symbol, and a consumer that subscribes several
 /// symbols in sequence has the first replays land before its read loop starts.
 /// The previous 100 lost the tail of any such burst, and the tail is where the
 /// `SNAPSHOT_END` marker lives, so the consumer could never tell a finished
@@ -88,7 +88,7 @@ const DELIVERY_QUEUE_CAPACITY: usize = 1024;
 /// [`DXLinkClient::with_event_buffer`].
 const DEFAULT_EVENT_BUFFER: usize = 8192;
 
-// A day of 5-minute bars is the workload the default exists for.
+// A day of 1-minute bars is the workload the default exists for.
 const _: () = assert!(DEFAULT_EVENT_BUFFER >= 1440);
 
 /// The shortest a reconnect will ever wait between attempts.
@@ -2051,7 +2051,7 @@ impl DXLinkClient {
     /// buffers ahead of the consumer.
     ///
     /// The default, 8192, absorbs a typical history replay: a 24-hour window of
-    /// 5-minute Candle bars is about 1440 events per symbol, delivered as one
+    /// 1-minute Candle bars is 1440 events per symbol, delivered as one
     /// burst the moment the subscription is accepted, often before the
     /// consumer's read loop has started. When the buffer is full the library
     /// **drops** rather than blocks, so a burst larger than the buffer loses
@@ -3234,7 +3234,7 @@ mod tests {
     }
 
     /// The default has to hold a history replay: the old 100 lost the tail of
-    /// a 24-hour, 5-minute Candle window (issue #71).
+    /// a 24-hour, 1-minute Candle window (issue #71).
     #[test]
     fn test_event_stream_uses_the_default_buffer() {
         let mut client = DXLinkClient::new("wss://test.url", "test_token");
