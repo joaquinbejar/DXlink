@@ -98,9 +98,10 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      # Pinned so a tarpaulin release cannot change coverage numbers on its own.
+      # Minimum version: releases older than 0.37.5 cannot read the coverage
+      # data written by Rust 1.99+. Keep in step with TARPAULIN_VERSION in the Makefile.
       - name: Install cargo-tarpaulin
-        run: cargo install --locked cargo-tarpaulin --version ^0.32
+        run: cargo install cargo-tarpaulin --locked --version '>=0.37.5'
       - name: Measure coverage
         env:
           LOGLEVEL: WARN
