@@ -89,16 +89,19 @@ publish: readme coverage
 	cargo package
 	cargo publish
 
-# Pinned to the same range CI uses. Checking only for the binary's presence let a
-# stale local tarpaulin report different numbers than CI, which defeats the point
-# of pinning it there.
-TARPAULIN_VERSION := 0.32
+# Minimum version, kept in step with CI. Checking only for the binary's presence
+# let a stale local tarpaulin report different numbers than CI; releases older
+# than 0.37.5 also cannot read the coverage data written by Rust 1.99+. Reinstall
+# when the local binary is missing or older than this.
+TARPAULIN_VERSION := 0.37.5
 
 .PHONY: check-cargo-tarpaulin
 check-cargo-tarpaulin:
-	@cargo tarpaulin --version 2>/dev/null | grep -q "$(TARPAULIN_VERSION)" || \
-		(echo "Installing cargo-tarpaulin $(TARPAULIN_VERSION).x..."; \
-		 cargo install --locked cargo-tarpaulin --version '^$(TARPAULIN_VERSION)')
+	@v=$$(cargo tarpaulin --version 2>/dev/null | awk '{print $$NF}'); \
+	if [ -z "$$v" ] || [ "$$(printf '%s\n%s\n' '$(TARPAULIN_VERSION)' "$$v" | sort -V | head -n1)" != '$(TARPAULIN_VERSION)' ]; then \
+		echo "Installing cargo-tarpaulin >= $(TARPAULIN_VERSION) (found: $${v:-none})"; \
+		cargo install cargo-tarpaulin --locked --version '>=$(TARPAULIN_VERSION)'; \
+	fi
 
 .PHONY: coverage
 coverage: check-cargo-tarpaulin
