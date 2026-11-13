@@ -353,9 +353,12 @@ This project is licensed under the MIT License. See the LICENSE file for details
 
  If you have any questions, issues, or would like to provide feedback, please feel free to contact the project maintainer:
 
- **Joaquín Béjar García**
- - Email: jb@taunais.com
- - GitHub: [joaquinbejar](https://github.com/joaquinbejar)
+ ### **Contact Information**
+ - **Author**: Joaquín Béjar García
+ - **Email**: jb@taunais.com
+ - **Telegram**: [@joaquin_bejar](https://t.me/joaquin_bejar)
+ - **Repository**: <https://github.com/joaquinbejar/DXlink>
+ - **Documentation**: <https://docs.rs/dxlink>
 
  We appreciate your interest and look forward to your contributions!
 
@@ -371,7 +374,7 @@ Repositories by the same author that this project depends on, and repositories t
 
 | Repository | Description |
 |------------|-------------|
-| [ChainView](https://github.com/joaquinbejar/ChainView) | Terminal UI for option chains, Greeks and volatility, real-time and backtest replay. |
-| [tastytrade](https://github.com/joaquinbejar/tastytrade) · [crates.io](https://crates.io/crates/tastytrade) | Rust library for trading through the tastytrade API. |
+| [ChainView](https://github.com/joaquinbejar/ChainView) | Terminal UI for option chains, Greeks and volatility; uses dxlink to stream real-time tastytrade market data. |
+| [tastytrade](https://github.com/joaquinbejar/tastytrade) | Rust library for trading through the tastytrade API; uses dxlink for its real-time market data streaming. |
 
 <!-- related-projects:end -->
